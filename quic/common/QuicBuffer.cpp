@@ -83,6 +83,52 @@ std::unique_ptr<QuicBuffer> QuicBuffer::wrapBuffer(
       capacity, (uint8_t*)buf, (uint8_t*)buf, capacity, nullptr));
 }
 
+std::unique_ptr<QuicBuffer> QuicBuffer::takeOwnership(
+    void* buf,
+    std::size_t capacity,
+    FreeFunction freeFn,
+    void* userData) {
+  // If userData is provided without a freeFn, match IOBuf semantics by using
+  // free(). However, in folly::IOBuf this is DCHECKed; we will DCHECK as well.
+  DCHECK(!userData || (userData && freeFn));
+
+  // Build a shared_ptr that owns the buffer and will free it appropriately.
+  std::shared_ptr<uint8_t[]> shared{
+      static_cast<uint8_t*>(buf), [freeFn, userData](uint8_t* p) {
+        if (!p) {
+          return;
+        }
+        if (freeFn) {
+          freeFn(static_cast<void*>(p), userData);
+        } else {
+          // Default to free() if no custom free function is provided.
+          free(static_cast<void*>(p));
+        }
+      }};
+
+  return std::unique_ptr<QuicBuffer>(new (std::nothrow) QuicBuffer(
+      capacity,
+      static_cast<uint8_t*>(buf),
+      static_cast<uint8_t*>(buf),
+      capacity,
+      std::move(shared)));
+}
+
+std::unique_ptr<QuicBuffer> QuicBuffer::fromString(
+    std::unique_ptr<std::string> ptr) {
+  // Take ownership of the string's underlying buffer and ensure the
+  // std::string is deleted when the QuicBuffer is freed.
+  auto ret = takeOwnership(
+      static_cast<void*>(ptr->data()),
+      ptr->size(),
+      [](void*, void* userData) { delete static_cast<std::string*>(userData); },
+      static_cast<void*>(ptr.get()));
+  // Release ownership of the std::string from the unique_ptr, since the
+  // QuicBuffer now owns its lifetime via the custom deleter.
+  std::ignore = ptr.release();
+  return ret;
+}
+
 std::unique_ptr<QuicBuffer> QuicBuffer::wrapBuffer(ByteRange range) {
   return wrapBuffer((void*)range.data(), range.size());
 }
@@ -172,6 +218,38 @@ std::unique_ptr<QuicBuffer> QuicBuffer::clone() const {
   }
 
   return tmp;
+}
+
+std::unique_ptr<QuicBuffer> QuicBuffer::cloneCoalesced() const {
+  // Calculate the total length of data across the entire chain
+  const std::size_t totalLength = computeChainDataLength();
+
+  // Get headroom from first buffer (this) and tailroom from last buffer
+  const std::size_t newHeadroom = headroom();
+  const std::size_t newTailroom = prev()->tailroom();
+
+  // Create new buffer with capacity for headroom + data + tailroom
+  const std::size_t newCapacity = newHeadroom + totalLength + newTailroom;
+  auto newBuffer = create(newCapacity);
+  if (!newBuffer) {
+    return nullptr;
+  }
+
+  // Advance to leave headroom space
+  newBuffer->advance(newHeadroom);
+
+  // Copy data from all buffers in the chain
+  const QuicBuffer* current = this;
+  do {
+    if (current->length() > 0) {
+      std::memcpy(
+          newBuffer->writableTail(), current->data(), current->length());
+      newBuffer->append(current->length());
+    }
+    current = current->next();
+  } while (current != this);
+
+  return newBuffer;
 }
 
 ByteRange QuicBuffer::coalesce() {

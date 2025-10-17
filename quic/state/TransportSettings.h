@@ -126,10 +126,19 @@ struct CongestionControlConfig {
 };
 
 struct DatagramConfig {
+  enum class CongestionControlMode : uint8_t {
+    // DATAGRAM-only packets are constrained but not tracked (legacy behavior)
+    Constrained = 0,
+    // DATAGRAM-only packets are both constrained and tracked in outstandings
+    ConstrainedAndTracked = 1
+  };
+
   bool enabled{false};
   bool framePerPacket{true};
   bool recvDropOldDataFirst{false};
   bool sendDropOldDataFirst{false};
+  // Mode for tracking DATAGRAM-only packets in bytes-in-flight
+  CongestionControlMode trackingMode{CongestionControlMode::Constrained};
   uint32_t readBufSize{kDefaultMaxDatagramsBuffered};
   uint32_t writeBufSize{kDefaultMaxDatagramsBuffered};
 };
@@ -193,8 +202,6 @@ struct TransportSettings {
   bool connectUDP{false};
   // Maximum number of consecutive PTOs before the connection is torn down.
   uint16_t maxNumPTOs{kDefaultMaxNumPTO};
-  // Maximum number of connection ids to issue to peer
-  uint16_t maxNumMigrationsAllowed{kMaxNumMigrationsAllowed};
   // Whether to listen to socket error
   bool enableSocketErrMsgCallback{true};
   // Whether pacing is enabled.
@@ -504,6 +511,9 @@ struct TransportSettings {
 
   // Whether a ConnectionClose frame should be sent on IdleTimeout
   bool alwaysSendConnectionCloseOnIdleTimeout{false};
+
+  // TODO(T239869314): Remove this after experiment is done.
+  std::chrono::milliseconds keepAliveTimeout{0};
 };
 
 } // namespace quic

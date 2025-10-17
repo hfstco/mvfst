@@ -75,6 +75,16 @@ QuicTransportBaseLite::QuicTransportBaseLite(
           [this]() { invokePeekDataAndCallbacks(); },
           LooperType::PeekLooper)) {}
 
+QuicTransportBaseLite::~QuicTransportBaseLite() {
+  resetConnectionCallbacks();
+  cancelTimeout(&drainTimeout_);
+
+  // closeImpl and closeUdpSocket should have been triggered by destructor of
+  // derived class to ensure that observers are properly notified
+  DCHECK_NE(CloseState::OPEN, closeState_);
+  DCHECK(!socket_.get()); // should be no socket
+}
+
 void QuicTransportBaseLite::onNetworkData(
     const folly::SocketAddress& localAddress,
     NetworkData&& networkData,
@@ -1331,6 +1341,15 @@ quic::Expected<void, QuicError> QuicTransportBaseLite::writeSocketData() {
         conn_->outstandings.numOutstanding();
 
     updatePacketProcessorsPrewriteRequests();
+    // postwrites should be called in all cases if prewrites were
+    // successfully (did not throw) called. Since there are multiple
+    // exit branches for this function, the easiest way to do this
+    // is via SCOPE_EXIT registration after prewrite return.
+    SCOPE_EXIT {
+      for (const auto& pp : conn_->packetProcessors) {
+        pp->postwrite();
+      }
+    };
 
     // if we're starting to write from app limited, notify observers
     if (conn_->appLimitedTracker.isAppLimited() &&
@@ -1572,6 +1591,9 @@ void QuicTransportBaseLite::closeImpl(
   readLooper_->stop();
   peekLooper_->stop();
   writeLooper_->stop();
+
+  // Drop any alternate paths
+  conn_->pathManager->dropAllSockets();
 
   cancelAllAppCallbacks(cancelCode);
 
@@ -2314,19 +2336,22 @@ void QuicTransportBaseLite::idleTimeoutExpired(bool drain) noexcept {
   // idle timeout is expired, just close the connection and drain or
   // send connection close immediately depending on 'drain'
   DCHECK_NE(closeState_, CloseState::CLOSED);
-  uint64_t numOpenStreans = conn_->streamManager->streamCount();
   auto localError =
       drain ? LocalErrorCode::IDLE_TIMEOUT : LocalErrorCode::SHUTTING_DOWN;
   auto sendCloseImmediately =
       conn_->transportSettings.alwaysSendConnectionCloseOnIdleTimeout ? true
                                                                       : !drain;
+
+  auto localIdleTimeout = conn_->transportSettings.idleTimeout;
+  auto peerIdleTimeout =
+      conn_->peerIdleTimeout > 0ms ? conn_->peerIdleTimeout : localIdleTimeout;
+  auto idleTimeout = timeMin(localIdleTimeout, peerIdleTimeout);
+  auto idleTimeoutCount = idleTimeout.count();
   closeImpl(
       quic::QuicError(
           QuicErrorCode(localError),
           fmt::format(
-              "{}, num non control streams: {}",
-              toString(localError),
-              numOpenStreans - conn_->streamManager->numControlStreams())),
+              "{}: {} seconds", toString(localError), idleTimeoutCount / 1000)),
       drain /* drainConnection */,
       sendCloseImmediately);
 }
@@ -2346,20 +2371,11 @@ void QuicTransportBaseLite::ackTimeoutExpired() noexcept {
 }
 
 void QuicTransportBaseLite::pathValidationTimeoutExpired() noexcept {
-  CHECK(conn_->outstandingPathValidation);
-
-  conn_->pendingEvents.schedulePathValidationTimeout = false;
-  conn_->outstandingPathValidation.reset();
-  if (conn_->qLogger) {
-    conn_->qLogger->addPathValidationEvent(false);
-  }
-
-  // TODO junqiw probing is not supported, so pathValidation==connMigration
-  // We decide to close conn when pathValidation to migrated path fails.
+  // Pass the signal to the path manager. Responding to the result of the path
+  // validation is handled in the path validation callback in the client/server
+  // transport.
   [[maybe_unused]] auto self = sharedGuard();
-  closeImpl(QuicError(
-      QuicErrorCode(TransportErrorCode::INVALID_MIGRATION),
-      std::string("Path validation timed out")));
+  conn_->pathManager->onPathValidationTimeoutExpired();
 }
 
 void QuicTransportBaseLite::drainTimeoutExpired() noexcept {
@@ -2959,9 +2975,13 @@ void QuicTransportBaseLite::setIdleTimer() {
   scheduleTimeout(&idleTimeout_, idleTimeout);
   auto idleTimeoutCount = idleTimeout.count();
   if (conn_->transportSettings.enableKeepalive) {
-    std::chrono::milliseconds keepaliveTimeout = std::chrono::milliseconds(
-        idleTimeoutCount - static_cast<int64_t>(idleTimeoutCount * .15));
-    scheduleTimeout(&keepaliveTimeout_, keepaliveTimeout);
+    auto keepAliveTimeout = conn_->transportSettings.keepAliveTimeout;
+    if (keepAliveTimeout == 0ms) {
+      keepAliveTimeout = std::chrono::milliseconds(
+          idleTimeoutCount - static_cast<int64_t>(idleTimeoutCount * .15));
+    }
+
+    scheduleTimeout(&keepaliveTimeout_, keepAliveTimeout);
   }
 }
 
@@ -3308,16 +3328,16 @@ void QuicTransportBaseLite::schedulePathValidationTimeout() {
       cancelTimeout(&pathValidationTimeout_);
     }
   } else if (!isTimeoutScheduled(&pathValidationTimeout_)) {
-    auto pto = conn_->lossState.srtt +
-        std::max(4 * conn_->lossState.rttvar, kGranularity) +
-        conn_->lossState.maxAckDelay;
-
-    auto validationTimeout =
-        std::max(3 * pto, 6 * conn_->transportSettings.initialRtt);
-    auto timeoutMs =
-        folly::chrono::ceil<std::chrono::milliseconds>(validationTimeout);
-    VLOG(10) << __func__ << " timeout=" << timeoutMs.count() << "ms " << *this;
-    scheduleTimeout(&pathValidationTimeout_, timeoutMs);
+    auto nextTimeout = conn_->pathManager->getEarliestChallengeTimeout();
+    if (nextTimeout.has_value()) {
+      auto timeoutMs = *nextTimeout > Clock::now()
+          ? std::chrono::ceil<std::chrono::milliseconds>(
+                *nextTimeout - Clock::now())
+          : 0ms;
+      VLOG(10) << __func__ << " timeout=" << timeoutMs.count() << "ms "
+               << *this;
+      scheduleTimeout(&pathValidationTimeout_, timeoutMs);
+    }
   }
 }
 

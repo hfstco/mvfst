@@ -143,6 +143,138 @@ TEST(QuicBufferTest, TestClone) {
   }
 }
 
+TEST(QuicBufferTest, TestCloneCoalescedSingle) {
+  // Test cloneCoalesced on a single buffer (should behave like cloneOne)
+  const std::string testData = "hello world";
+  auto buffer =
+      QuicBuffer::copyBuffer(testData, 10, 20); // 10 headroom, 20 tailroom
+
+  auto coalesced = buffer->cloneCoalesced();
+
+  // Should not be chained
+  EXPECT_FALSE(coalesced->isChained());
+  EXPECT_EQ(coalesced->next(), coalesced.get());
+  EXPECT_EQ(coalesced->prev(), coalesced.get());
+
+  // Data should be identical
+  EXPECT_EQ(coalesced->length(), buffer->length());
+  EXPECT_EQ(
+      toString(ByteRange(coalesced->data(), coalesced->length())), testData);
+
+  // Should preserve headroom and tailroom
+  EXPECT_EQ(coalesced->headroom(), buffer->headroom());
+  EXPECT_EQ(coalesced->tailroom(), buffer->tailroom());
+
+  // Should be memory isolated (different buffer)
+  EXPECT_NE(coalesced->data(), buffer->data());
+}
+
+TEST(QuicBufferTest, TestCloneCoalescedChain) {
+  // Create a chain of 3 buffers with different data
+  auto buffer1 =
+      QuicBuffer::copyBuffer(std::string("hello"), 5, 10); // 5 headroom
+  auto buffer2 = QuicBuffer::copyBuffer(std::string(" world"), 0, 0);
+  auto buffer3 =
+      QuicBuffer::copyBuffer(std::string("!!!"), 0, 15); // 15 tailroom
+
+  buffer1->appendToChain(std::move(buffer2));
+  buffer1->appendToChain(std::move(buffer3));
+
+  // Total data should be "hello world!!!"
+  EXPECT_EQ(buffer1->computeChainDataLength(), 14);
+
+  auto coalesced = buffer1->cloneCoalesced();
+
+  // Should not be chained
+  EXPECT_FALSE(coalesced->isChained());
+  EXPECT_EQ(coalesced->next(), coalesced.get());
+
+  // Should contain all data coalesced
+  EXPECT_EQ(coalesced->length(), 14);
+  EXPECT_EQ(
+      toString(ByteRange(coalesced->data(), coalesced->length())),
+      "hello world!!!");
+
+  // Should preserve headroom from first buffer and tailroom from last buffer
+  EXPECT_EQ(coalesced->headroom(), 5); // from buffer1
+  EXPECT_EQ(coalesced->tailroom(), 15); // from buffer3
+
+  // Original chain should be unchanged
+  EXPECT_TRUE(buffer1->isChained());
+  EXPECT_EQ(buffer1->computeChainDataLength(), 14);
+}
+
+TEST(QuicBufferTest, TestCloneCoalescedWithEmptyBuffers) {
+  // Create a chain with some empty buffers
+  auto buffer1 =
+      QuicBuffer::copyBuffer(std::string("hello"), 8, 0); // 8 headroom
+  auto buffer2 = QuicBuffer::create(50); // empty buffer
+  auto buffer3 = QuicBuffer::copyBuffer(std::string(" world"), 0, 0);
+  auto buffer4 = QuicBuffer::create(50); // empty buffer
+  auto buffer5 = QuicBuffer::copyBuffer(std::string("!"), 0, 12); // 12 tailroom
+
+  buffer1->appendToChain(std::move(buffer2));
+  buffer1->appendToChain(std::move(buffer3));
+  buffer1->appendToChain(std::move(buffer4));
+  buffer1->appendToChain(std::move(buffer5));
+
+  auto coalesced = buffer1->cloneCoalesced();
+
+  // Should not be chained
+  EXPECT_FALSE(coalesced->isChained());
+
+  // Should contain only non-empty data
+  EXPECT_EQ(coalesced->length(), 12); // "hello world!"
+  EXPECT_EQ(
+      toString(ByteRange(coalesced->data(), coalesced->length())),
+      "hello world!");
+
+  // Should preserve headroom from first and tailroom from last
+  EXPECT_EQ(coalesced->headroom(), 8); // from buffer1
+  EXPECT_EQ(coalesced->tailroom(), 12); // from buffer5
+}
+
+TEST(QuicBufferTest, TestCloneCoalescedIsolation) {
+  // Test that modifications to original don't affect cloned buffer
+  auto buffer1 = QuicBuffer::copyBuffer(std::string("hello"), 0, 0);
+  auto buffer2 = QuicBuffer::copyBuffer(std::string(" world"), 0, 0);
+
+  buffer1->appendToChain(std::move(buffer2));
+
+  auto coalesced = buffer1->cloneCoalesced();
+
+  // Modify original data
+  memcpy(buffer1->writableData(), "HELLO", 5);
+
+  // Coalesced should be unaffected
+  EXPECT_EQ(
+      toString(ByteRange(coalesced->data(), coalesced->length())),
+      "hello world");
+  EXPECT_EQ(toString(ByteRange(buffer1->data(), buffer1->length())), "HELLO");
+}
+
+TEST(QuicBufferTest, TestCloneCoalescedAllEmpty) {
+  // Test chain of all empty buffers
+  auto buffer1 = QuicBuffer::create(50); // empty, some headroom by default
+  auto buffer2 = QuicBuffer::create(50); // empty
+  auto buffer3 = QuicBuffer::create(50); // empty
+
+  buffer1->appendToChain(std::move(buffer2));
+  buffer1->appendToChain(std::move(buffer3));
+
+  auto coalesced = buffer1->cloneCoalesced();
+
+  // Should not be chained
+  EXPECT_FALSE(coalesced->isChained());
+
+  // Should be empty
+  EXPECT_EQ(coalesced->length(), 0);
+
+  // Should still preserve headroom/tailroom structure
+  EXPECT_GE(
+      coalesced->capacity(), coalesced->headroom() + coalesced->tailroom());
+}
+
 TEST(QuicBufferTest, TestAdvance) {
   const uint8_t* data = (const uint8_t*)"hello";
   auto quicBuffer1 = QuicBuffer::create(100);
@@ -616,6 +748,115 @@ TEST(QuicBufferTest, TestEqualsNullPointers) {
   auto buffer = QuicBuffer::copyBuffer("hello", 5);
   EXPECT_FALSE(equalTo(buffer.get(), nullptr));
   EXPECT_FALSE(equalTo(nullptr, buffer.get()));
+}
+
+} // namespace quic
+
+namespace quic {
+
+TEST(QuicBufferTest, TestTakeOwnershipBasic) {
+  // Allocate a raw buffer
+  std::size_t cap = 16;
+  void* raw = malloc(cap);
+  ASSERT_NE(raw, nullptr);
+  // Fill with pattern
+  memset(raw, 0xAB, cap);
+
+  auto buf = QuicBuffer::takeOwnership(raw, cap);
+  EXPECT_EQ(buf->capacity(), cap);
+  EXPECT_EQ(buf->length(), cap);
+  EXPECT_EQ(buf->headroom(), 0);
+  EXPECT_EQ(buf->tailroom(), 0);
+  EXPECT_EQ(buf->data(), raw);
+  // Verify content
+  for (size_t i = 0; i < cap; ++i) {
+    EXPECT_EQ(buf->data()[i], (uint8_t)0xAB);
+  }
+}
+
+namespace {
+struct FreeFnState {
+  int frees{0};
+  void* lastPtr{nullptr};
+};
+
+static void testFreeFn(void* p, void* user) {
+  auto* st = static_cast<FreeFnState*>(user);
+  st->frees++;
+  st->lastPtr = p;
+  free(p);
+}
+} // namespace
+
+TEST(QuicBufferTest, TestTakeOwnershipCustomFreeFn) {
+  std::size_t cap = 8;
+  void* raw = malloc(cap);
+  ASSERT_NE(raw, nullptr);
+  FreeFnState state;
+  auto buf = QuicBuffer::takeOwnership(raw, cap, &testFreeFn, &state);
+  // Destroy buffer and ensure free function called exactly once
+  buf.reset();
+  EXPECT_EQ(state.frees, 1);
+  EXPECT_EQ(state.lastPtr, raw);
+}
+
+TEST(QuicBufferTest, TestTakeOwnershipCloneSharing) {
+  std::size_t cap = 4;
+  void* raw = malloc(cap);
+  ASSERT_NE(raw, nullptr);
+  memset(raw, 0xCD, cap);
+
+  FreeFnState state;
+  {
+    auto buf = QuicBuffer::takeOwnership(raw, cap, &testFreeFn, &state);
+    EXPECT_FALSE(buf->isSharedOne());
+    auto clone = buf->cloneOne();
+    EXPECT_TRUE(buf->isSharedOne());
+    EXPECT_TRUE(clone->isSharedOne());
+    // Both go out of scope here
+  }
+  EXPECT_EQ(state.frees, 1);
+  EXPECT_EQ(state.lastPtr, raw);
+}
+
+} // namespace quic
+
+namespace quic {
+
+TEST(QuicBufferTest, TestFromStringBasic) {
+  auto buf = QuicBuffer::fromString(std::string("hello"));
+  EXPECT_EQ(buf->length(), 5);
+  EXPECT_EQ(buf->capacity(), 5);
+  EXPECT_EQ(buf->headroom(), 0);
+  EXPECT_EQ(buf->tailroom(), 0);
+  EXPECT_EQ(memcmp(buf->data(), "hello", 5), 0);
+  EXPECT_FALSE(buf->isSharedOne());
+  auto clone = buf->cloneOne();
+  EXPECT_TRUE(buf->isSharedOne());
+  EXPECT_TRUE(clone->isSharedOne());
+}
+
+TEST(QuicBufferTest, TestFromStringUniquePtr) {
+  auto s = std::make_unique<std::string>("abc");
+  auto buf = QuicBuffer::fromString(std::move(s));
+  EXPECT_EQ(buf->length(), 3);
+  EXPECT_EQ(buf->capacity(), 3);
+  EXPECT_EQ(buf->headroom(), 0);
+  EXPECT_EQ(buf->tailroom(), 0);
+  EXPECT_EQ(memcmp(buf->data(), "abc", 3), 0);
+  EXPECT_FALSE(buf->isSharedOne());
+  auto clone = buf->cloneOne();
+  EXPECT_TRUE(buf->isSharedOne());
+  EXPECT_TRUE(clone->isSharedOne());
+}
+
+TEST(QuicBufferTest, TestFromStringEmpty) {
+  auto buf = QuicBuffer::fromString(std::string());
+  EXPECT_EQ(buf->length(), 0);
+  EXPECT_EQ(buf->capacity(), 0);
+  EXPECT_EQ(buf->headroom(), 0);
+  EXPECT_EQ(buf->tailroom(), 0);
+  EXPECT_TRUE(buf->empty());
 }
 
 } // namespace quic

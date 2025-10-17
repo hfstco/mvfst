@@ -11,17 +11,11 @@
 #include <folly/io/IOBuf.h>
 #include <quic/QuicConstants.h>
 #include <quic/api/QuicSocketLite.h>
-#include <quic/codec/Types.h>
 #include <quic/common/Optional.h>
 #include <quic/common/events/QuicEventBase.h>
-#include <quic/congestion_control/Bandwidth.h>
 #include <quic/observer/SocketObserverContainer.h>
-#include <quic/observer/SocketObserverTypes.h>
 #include <quic/priority/PriorityQueue.h>
-#include <quic/state/QuicConnectionStats.h>
 #include <quic/state/QuicStreamGroupRetransmissionPolicy.h>
-#include <quic/state/QuicStreamUtilities.h>
-#include <quic/state/StateData.h>
 
 #include <folly/Portability.h>
 #include <chrono>

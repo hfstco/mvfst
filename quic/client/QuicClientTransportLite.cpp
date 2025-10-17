@@ -724,10 +724,15 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacketData(
         pktHasRetransmittableData = true;
         auto updateResult = updateSimpleFrameOnPacketReceived(
             *conn_,
+            conn_->currentPathId,
             simpleFrame,
-            longHeader ? longHeader->getDestinationConnId()
-                       : shortHeader->getConnectionId(),
-            false);
+            longHeader
+                ? longHeader->getDestinationConnId()
+                : shortHeader
+                      ->getConnectionId()); // TODO: fail if get packets from a
+                                            // different server address
+                                            // TODO: JBESHAY MIGRATION - ^^ This
+                                            // client logic needs fixing
         if (!updateResult.has_value()) {
           return quic::make_unexpected(updateResult.error());
         }
@@ -1911,6 +1916,15 @@ void QuicClientTransportLite::start(
     return;
   }
 
+  CHECK(socket_->address().has_value());
+  auto addPathRes = clientConn_->pathManager->addValidatedPath(
+      *socket_->address(), conn_->peerAddress);
+  if (addPathRes.hasError()) {
+    asyncClose(addPathRes.error());
+    return;
+  }
+  conn_->currentPathId = addPathRes.value();
+
   auto handshakeResult = startCryptoHandshake();
   if (!handshakeResult.has_value()) {
     asyncClose(handshakeResult.error());
@@ -1921,6 +1935,17 @@ void QuicClientTransportLite::start(
 void QuicClientTransportLite::addNewPeerAddress(
     folly::SocketAddress peerAddress) {
   CHECK(peerAddress.isInitialized());
+
+  if (peerAddress.getIPAddress().isZero()) {
+    // Using the wildcard address as the peer address is a special case which is
+    // interpreted as pointing to localhost since the address cannot appear on
+    // the wire. We update the peer address here to keep the connection
+    // state consistent with what will actually be in the IP headers.
+    peerAddress = folly::SocketAddress(
+        peerAddress.getFamily() == AF_INET6 ? folly::IPAddress("::1")
+                                            : folly::IPAddress("127.0.0.1"),
+        peerAddress.getPort());
+  }
 
   if (happyEyeballsEnabled_) {
     conn_->udpSendPacketLen = std::min(
@@ -2262,6 +2287,14 @@ QuicClientTransportLite::getPeerCertificate() const {
     return clientHandshakeLayer->getPeerCertificate();
   }
   return nullptr;
+}
+
+Optional<Handshake::TLSSummary> QuicClientTransportLite::getTLSSummary() const {
+  const auto clientHandshakeLayer = clientConn_->clientHandshakeLayer;
+  if (clientHandshakeLayer) {
+    return clientHandshakeLayer->getTLSSummary();
+  }
+  return std::nullopt;
 }
 
 } // namespace quic

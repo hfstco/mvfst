@@ -7,7 +7,6 @@
 
 #include <fmt/format.h>
 #include <folly/chrono/Conv.h>
-#include <folly/io/Cursor.h>
 #include <folly/io/SocketOptionMap.h>
 #include <folly/io/async/AsyncUDPSocket.h>
 #include <folly/system/ThreadId.h>
@@ -1163,10 +1162,16 @@ void QuicServerWorker::sendRetryPacket(
   FizzRetryIntegrityTagGenerator fizzRetryIntegrityTagGenerator;
   auto integrityTagBuf = fizzRetryIntegrityTagGenerator.getRetryIntegrityTag(
       QuicVersion::MVFST_INVALID, pseudoRetryPacketBuf.get());
-  Cursor cursor{integrityTagBuf.get()};
+  integrityTagBuf->coalesce();
+  ContiguousReadCursor cursor(
+      integrityTagBuf->data(), integrityTagBuf->length());
 
   RetryPacket::IntegrityTagType integrityTag = {0};
-  cursor.pull(integrityTag.data(), integrityTag.size());
+  // The reason we expect this to succeed is that the
+  // FizzRetryIntegrityTagGenerator creates an AES-GCM-128 AEAD and the tag
+  // length for that cipher is 16 bytes, which is the same as the size of the
+  // integrityTag variable.
+  CHECK(cursor.tryPull(integrityTag.data(), integrityTag.size()));
 
   // Create the actual retry packet
   RetryPacketBuilder builder(

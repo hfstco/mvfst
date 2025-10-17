@@ -9,13 +9,17 @@
 
 #include <folly/portability/SysUio.h>
 #include <quic/common/QuicRange.h>
+#include <cstddef>
 #include <cstring>
 #include <memory>
+#include <string>
 
 namespace quic {
 
 class QuicBuffer {
  public:
+  using FreeFunction = void (*)(void* buf, void* userData);
+
   enum CreateOp {
     CREATE = 0,
   };
@@ -61,7 +65,25 @@ class QuicBuffer {
       void* buf,
       std::size_t capacity);
 
+  // Create a QuicBuffer from a std::string without copying the contents.
+  // The returned QuicBuffer will take ownership of the string's storage
+  // and delete the std::string when the buffer is freed, mirroring
+  // folly::IOBuf::fromString semantics.
+  static std::unique_ptr<QuicBuffer> fromString(std::unique_ptr<std::string>);
+
+  static std::unique_ptr<QuicBuffer> fromString(std::string s) {
+    return fromString(std::make_unique<std::string>(std::move(s)));
+  }
+
   static std::unique_ptr<QuicBuffer> wrapBuffer(ByteRange range);
+
+  // Take ownership of an external buffer and free it using freeFn(userData)
+  // semantics matching folly::IOBuf::takeOwnership.
+  static std::unique_ptr<QuicBuffer> takeOwnership(
+      void* buf,
+      std::size_t capacity,
+      FreeFunction freeFn = nullptr,
+      void* userData = nullptr);
 
   static QuicBuffer wrapBufferAsValue(
       const void* buf,
@@ -164,6 +186,21 @@ class QuicBuffer {
   std::unique_ptr<QuicBuffer> cloneOne() const {
     return cloneOneImpl();
   }
+
+  /**
+   * Copy a QuicBuffer chain into a single buffer.
+   *
+   * Semantically similar to .clone().coalesce(), but without the intermediate
+   * allocations.
+   *
+   * The new QuicBuffer will have at least as much headroom as the first
+   * QuicBuffer in the chain, and at least as much tailroom as the last
+   * QuicBuffer in the chain.
+   *
+   * @return  A QuicBuffer for which isChained() == false, and whose data is the
+   *          same as coalesce(). Returns nullptr if we fail to allocate memory.
+   */
+  std::unique_ptr<QuicBuffer> cloneCoalesced() const;
 
   ByteRange coalesce();
 
@@ -309,6 +346,17 @@ class QuicBufferEqualTo {
  public:
   [[nodiscard]] bool operator()(const QuicBuffer* a, const QuicBuffer* b)
       const noexcept;
+
+  [[nodiscard]] bool operator()(
+      const std::unique_ptr<QuicBuffer>& a,
+      const std::unique_ptr<QuicBuffer>& b) const noexcept {
+    return operator()(a.get(), b.get());
+  }
+
+  [[nodiscard]] bool operator()(const QuicBuffer& a, const QuicBuffer& b)
+      const noexcept {
+    return operator()(&a, &b);
+  }
 };
 
 } // namespace quic

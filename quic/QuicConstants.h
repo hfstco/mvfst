@@ -664,7 +664,8 @@ constexpr std::chrono::seconds kTimeToRetainZeroRttKeys = 20s;
 
 constexpr std::chrono::seconds kTimeToRetainLastCongestionAndRttState = 60s;
 
-constexpr uint16_t kMaxNumMigrationsAllowed = 6;
+constexpr std::chrono::seconds kTimeToRetainUnusedPaths =
+    kTimeToRetainLastCongestionAndRttState;
 
 constexpr auto kMinimumNumOfParamsInTheTicket = 8;
 
@@ -759,7 +760,7 @@ enum class WriteDataReason {
   CONN_WINDOW_UPDATE,
   SIMPLE,
   RESET,
-  PATHCHALLENGE,
+  PATH_VALIDATION,
   PING,
   DATAGRAM,
   BUFFERED_WRITE,

@@ -386,6 +386,7 @@ uint64_t maximumConnectionIdsToIssue(const QuicConnectionStateBase& conn) {
   // Return a min of what peer supports and hardcoded max limit.
   const uint64_t maximumIdsToIssue =
       std::min(conn.peerActiveConnectionIdLimit, kMaxActiveConnectionIdLimit);
+
   return maximumIdsToIssue;
 }
 

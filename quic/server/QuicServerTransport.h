@@ -16,6 +16,7 @@
 #include <quic/common/events/FollyQuicEventBase.h>
 #include <quic/common/udpsocket/FollyQuicAsyncUDPSocket.h>
 #include <quic/congestion_control/CongestionControllerFactory.h>
+#include <quic/handshake/HandshakeLayer.h>
 #include <quic/server/handshake/ServerTransportParametersExtension.h>
 #include <quic/server/state/ServerConnectionIdRejector.h>
 #include <quic/server/state/ServerStateMachine.h>
@@ -36,6 +37,7 @@ struct CipherInfo {
 class QuicServerTransport
     : public QuicTransportBase,
       public ServerHandshake::HandshakeCallback,
+      public QuicPathManager::PathValidationCallback,
       public std::enable_shared_from_this<QuicServerTransport> {
  public:
   using Ptr = std::shared_ptr<QuicServerTransport>;
@@ -197,6 +199,13 @@ class QuicServerTransport
         label, context, keyLength);
   }
 
+  Optional<Handshake::TLSSummary> getTLSSummary() const override {
+    if (serverConn_->serverHandshakeLayer) {
+      return serverConn_->serverHandshakeLayer->getTLSSummary();
+    }
+    return std::nullopt;
+  }
+
   Optional<std::string> getSni();
 
   /* Log a collection of statistics that are meant to be sampled consistently
@@ -253,6 +262,8 @@ class QuicServerTransport
   bool hasReadCipher() const;
   void registerAllTransportKnobParamHandlers();
   bool shouldWriteNewSessionTicket();
+
+  void onPathValidationResult(const PathInfo& pathInfo) override;
 
   folly::Executor* getFollyEventbase() const {
     // TODO (jbeshay): handle nullptr
