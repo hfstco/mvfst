@@ -823,12 +823,21 @@ folly::dynamic QLogPacketAckEvent::toDynamic() const {
 }
 
 QLogMetricUpdateEvent::QLogMetricUpdateEvent(
+    std::chrono::microseconds minRttIn,
+    std::chrono::microseconds smoothedRttIn,
     std::chrono::microseconds latestRttIn,
-    std::chrono::microseconds mrttIn,
-    std::chrono::microseconds srttIn,
-    std::chrono::microseconds ackDelayIn,
+    std::chrono::microseconds rttVarianceIn,
+    uint16_t ptoCountIn,
+    uint64_t congestionWindowIn,
+    uint64_t bytesInFlightIn,
+    uint64_t ssthreshIn,
+    uint64_t packetsInFlightIn,
+    std::chrono::microseconds pacingRateIn,
     std::chrono::microseconds refTimeIn)
-    : latestRtt{latestRttIn}, mrtt{mrttIn}, srtt{srttIn}, ackDelay{ackDelayIn} {
+    : minRtt{minRttIn}, smoothedRtt{smoothedRttIn}, latestRtt {latestRttIn},
+      rttVariance{rttVarianceIn}, ptoCount{ptoCountIn}, congestionWindow{congestionWindowIn},
+      bytesInFlight{bytesInFlightIn}, ssthresh{ssthreshIn}, packetsInFlight{packetsInFlightIn},
+      pacingRate{pacingRateIn} {
   eventType = QLogEventType::MetricUpdate;
   refTime = refTimeIn;
 }
@@ -840,10 +849,21 @@ folly::dynamic QLogMetricUpdateEvent::toDynamic() const {
       fmt::format("{}", refTime.count()), "recovery", toString(eventType));
   folly::dynamic data = folly::dynamic::object();
 
+  if (minRtt.count() != INT64_MAX) {
+    data["min_rtt"] = minRtt.count();
+  }
+  data["smoothed_rtt"] = smoothedRtt.count();
   data["latest_rtt"] = latestRtt.count();
-  data["min_rtt"] = mrtt.count();
-  data["smoothed_rtt"] = srtt.count();
-  data["ack_delay"] = ackDelay.count();
+  data["rtt_variance"] = rttVariance.count();
+  data["pto_count"] = ptoCount;
+  data["congestion_window"] = congestionWindow;
+  data["bytes_in_flight"] = bytesInFlight;
+  if (ssthresh != UINT64_MAX) {
+    data["ssthresh"] = ssthresh;
+  }
+  /* data["packets_in_flight"] = packetsInFlight; */
+  data["pacing_rate"] = pacingRate.count();
+
 
   d.push_back(std::move(data));
   return d;

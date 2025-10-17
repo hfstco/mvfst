@@ -37,6 +37,18 @@ Cubic::Cubic(
         cwndBytes_,
         kCubicInit,
         cubicStateToString(state_).str());
+    conn_.qLogger->addMetricUpdate(
+          conn_.lossState.mrtt,
+          conn_.lossState.srtt,
+          conn_.lossState.lrtt,
+          conn_.lossState.rttvar,
+          conn_.lossState.ptoCount,
+          getCongestionWindow(),
+          conn_.lossState.inflightBytes,
+          ssthresh_,
+          getCongestionWindow() / conn_.udpSendPacketLen,
+          calculatePacingRate(conn_, getCongestionWindow(),
+            conn_.transportSettings.minCwndInMss, conn_.lossState.lrtt).interval);
   }
 }
 
@@ -96,6 +108,18 @@ void Cubic::onPersistentCongestion() {
         getCongestionWindow(),
         kPersistentCongestion,
         cubicStateToString(state_).str());
+    conn_.qLogger->addMetricUpdate(
+          conn_.lossState.mrtt,
+          conn_.lossState.srtt,
+          conn_.lossState.lrtt,
+          conn_.lossState.rttvar,
+          conn_.lossState.ptoCount,
+          getCongestionWindow(),
+          conn_.lossState.inflightBytes,
+          ssthresh_,
+          getCongestionWindow() / conn_.udpSendPacketLen,
+          calculatePacingRate(conn_, getCongestionWindow(),
+            conn_.transportSettings.minCwndInMss, conn_.lossState.lrtt).interval);
   }
 }
 
@@ -135,6 +159,18 @@ void Cubic::onPacketLoss(const LossEvent& loss) {
           getCongestionWindow(),
           kCubicLoss,
           cubicStateToString(state_).str());
+      conn_.qLogger->addMetricUpdate(
+          conn_.lossState.mrtt,
+          conn_.lossState.srtt,
+          conn_.lossState.lrtt,
+          conn_.lossState.rttvar,
+          conn_.lossState.ptoCount,
+          getCongestionWindow(),
+          conn_.lossState.inflightBytes,
+          ssthresh_,
+          getCongestionWindow() / conn_.udpSendPacketLen,
+          calculatePacingRate(conn_, getCongestionWindow(),
+            conn_.transportSettings.minCwndInMss, conn_.lossState.lrtt).interval);
     }
 
   } else {
@@ -144,6 +180,18 @@ void Cubic::onPacketLoss(const LossEvent& loss) {
           getCongestionWindow(),
           kCubicSkipLoss,
           cubicStateToString(state_).str());
+      conn_.qLogger->addMetricUpdate(
+          conn_.lossState.mrtt,
+          conn_.lossState.srtt,
+          conn_.lossState.lrtt,
+          conn_.lossState.rttvar,
+          conn_.lossState.ptoCount,
+          getCongestionWindow(),
+          conn_.lossState.inflightBytes,
+          ssthresh_,
+          getCongestionWindow() / conn_.udpSendPacketLen,
+          calculatePacingRate(conn_, getCongestionWindow(),
+            conn_.transportSettings.minCwndInMss, conn_.lossState.lrtt).interval);
     }
   }
 
@@ -159,6 +207,18 @@ void Cubic::onRemoveBytesFromInflight(uint64_t /* bytes */) {
         getCongestionWindow(),
         kRemoveInflight,
         cubicStateToString(state_).str());
+    conn_.qLogger->addMetricUpdate(
+          conn_.lossState.mrtt,
+          conn_.lossState.srtt,
+          conn_.lossState.lrtt,
+          conn_.lossState.rttvar,
+          conn_.lossState.ptoCount,
+          getCongestionWindow(),
+          conn_.lossState.inflightBytes,
+          ssthresh_,
+          getCongestionWindow() / conn_.udpSendPacketLen,
+          calculatePacingRate(conn_, getCongestionWindow(),
+            conn_.transportSettings.minCwndInMss, conn_.lossState.lrtt).interval);
   }
 }
 
@@ -270,6 +330,18 @@ int64_t Cubic::calculateCubicCwndDelta(TimePoint ackTime) noexcept {
         getCongestionWindow(),
         kCubicSteadyCwnd,
         cubicStateToString(state_).str());
+    conn_.qLogger->addMetricUpdate(
+          conn_.lossState.mrtt,
+          conn_.lossState.srtt,
+          conn_.lossState.lrtt,
+          conn_.lossState.rttvar,
+          conn_.lossState.ptoCount,
+          getCongestionWindow(),
+          conn_.lossState.inflightBytes,
+          ssthresh_,
+          getCongestionWindow() / conn_.udpSendPacketLen,
+          calculatePacingRate(conn_, getCongestionWindow(),
+            conn_.transportSettings.minCwndInMss, conn_.lossState.lrtt).interval);
   }
   return delta;
 }
@@ -346,6 +418,18 @@ void Cubic::onPacketAcked(const AckEvent& ack) {
           getCongestionWindow(),
           kCubicSkipAck,
           cubicStateToString(state_).str());
+      conn_.qLogger->addMetricUpdate(
+          conn_.lossState.mrtt,
+          conn_.lossState.srtt,
+          conn_.lossState.lrtt,
+          conn_.lossState.rttvar,
+          conn_.lossState.ptoCount,
+          getCongestionWindow(),
+          conn_.lossState.inflightBytes,
+          ssthresh_,
+          getCongestionWindow() / conn_.udpSendPacketLen,
+          calculatePacingRate(conn_, getCongestionWindow(),
+            conn_.transportSettings.minCwndInMss, conn_.lossState.lrtt).interval);
     }
     return;
   }
@@ -371,6 +455,18 @@ void Cubic::onPacketAcked(const AckEvent& ack) {
           getCongestionWindow(),
           kCwndNoChange,
           cubicStateToString(state_).str());
+      conn_.qLogger->addMetricUpdate(
+          conn_.lossState.mrtt,
+          conn_.lossState.srtt,
+          conn_.lossState.lrtt,
+          conn_.lossState.rttvar,
+          conn_.lossState.ptoCount,
+          getCongestionWindow(),
+          conn_.lossState.inflightBytes,
+          ssthresh_,
+          getCongestionWindow() / conn_.udpSendPacketLen,
+          calculatePacingRate(conn_, getCongestionWindow(),
+            conn_.transportSettings.minCwndInMss, conn_.lossState.lrtt).interval);
     }
   }
   if (conn_.qLogger) {
@@ -379,6 +475,18 @@ void Cubic::onPacketAcked(const AckEvent& ack) {
         getCongestionWindow(),
         kCongestionPacketAck,
         cubicStateToString(state_).str());
+    conn_.qLogger->addMetricUpdate(
+          conn_.lossState.mrtt,
+          conn_.lossState.srtt,
+          conn_.lossState.lrtt,
+          conn_.lossState.rttvar,
+          conn_.lossState.ptoCount,
+          getCongestionWindow(),
+          conn_.lossState.inflightBytes,
+          ssthresh_,
+          getCongestionWindow() / conn_.udpSendPacketLen,
+          calculatePacingRate(conn_, getCongestionWindow(),
+            conn_.transportSettings.minCwndInMss, conn_.lossState.lrtt).interval);
   }
 }
 
@@ -574,6 +682,18 @@ void Cubic::onPacketAckedInSteady(const AckEvent& ack) {
           getCongestionWindow(),
           kAckInQuiescence,
           cubicStateToString(state_).str());
+      conn_.qLogger->addMetricUpdate(
+          conn_.lossState.mrtt,
+          conn_.lossState.srtt,
+          conn_.lossState.lrtt,
+          conn_.lossState.rttvar,
+          conn_.lossState.ptoCount,
+          getCongestionWindow(),
+          conn_.lossState.inflightBytes,
+          ssthresh_,
+          getCongestionWindow() / conn_.udpSendPacketLen,
+          calculatePacingRate(conn_, getCongestionWindow(),
+            conn_.transportSettings.minCwndInMss, conn_.lossState.lrtt).interval);
     }
     return;
   }
@@ -606,6 +726,18 @@ void Cubic::onPacketAckedInSteady(const AckEvent& ack) {
           getCongestionWindow(),
           kResetTimeToOrigin,
           cubicStateToString(state_).str());
+      conn_.qLogger->addMetricUpdate(
+          conn_.lossState.mrtt,
+          conn_.lossState.srtt,
+          conn_.lossState.lrtt,
+          conn_.lossState.rttvar,
+          conn_.lossState.ptoCount,
+          getCongestionWindow(),
+          conn_.lossState.inflightBytes,
+          ssthresh_,
+          getCongestionWindow() / conn_.udpSendPacketLen,
+          calculatePacingRate(conn_, getCongestionWindow(),
+            conn_.transportSettings.minCwndInMss, conn_.lossState.lrtt).interval);
     }
     steadyState_.timeToOrigin = 0.0;
     steadyState_.lastMaxCwndBytes = cwndBytes_;
@@ -626,6 +758,18 @@ void Cubic::onPacketAckedInSteady(const AckEvent& ack) {
           getCongestionWindow(),
           kResetLastReductionTime,
           cubicStateToString(state_).str());
+      conn_.qLogger->addMetricUpdate(
+          conn_.lossState.mrtt,
+          conn_.lossState.srtt,
+          conn_.lossState.lrtt,
+          conn_.lossState.rttvar,
+          conn_.lossState.ptoCount,
+          getCongestionWindow(),
+          conn_.lossState.inflightBytes,
+          ssthresh_,
+          getCongestionWindow() / conn_.udpSendPacketLen,
+          calculatePacingRate(conn_, getCongestionWindow(),
+            conn_.transportSettings.minCwndInMss, conn_.lossState.lrtt).interval);
     }
   }
   uint64_t newCwnd = calculateCubicCwnd(calculateCubicCwndDelta(ack.ackTime));
@@ -666,6 +810,18 @@ void Cubic::onPacketAckedInSteady(const AckEvent& ack) {
           getCongestionWindow(),
           kRenoCwndEstimation,
           cubicStateToString(state_).str());
+      conn_.qLogger->addMetricUpdate(
+          conn_.lossState.mrtt,
+          conn_.lossState.srtt,
+          conn_.lossState.lrtt,
+          conn_.lossState.rttvar,
+          conn_.lossState.ptoCount,
+          getCongestionWindow(),
+          conn_.lossState.inflightBytes,
+          ssthresh_,
+          getCongestionWindow() / conn_.udpSendPacketLen,
+          calculatePacingRate(conn_, getCongestionWindow(),
+            conn_.transportSettings.minCwndInMss, conn_.lossState.lrtt).interval);
     }
   }
 }
@@ -692,6 +848,18 @@ void Cubic::onPacketAckedInRecovery(const AckEvent& ack) {
           getCongestionWindow(),
           kPacketAckedInRecovery,
           cubicStateToString(state_).str());
+      conn_.qLogger->addMetricUpdate(
+          conn_.lossState.mrtt,
+          conn_.lossState.srtt,
+          conn_.lossState.lrtt,
+          conn_.lossState.rttvar,
+          conn_.lossState.ptoCount,
+          getCongestionWindow(),
+          conn_.lossState.inflightBytes,
+          ssthresh_,
+          getCongestionWindow() / conn_.udpSendPacketLen,
+          calculatePacingRate(conn_, getCongestionWindow(),
+            conn_.transportSettings.minCwndInMss, conn_.lossState.lrtt).interval);
     }
   }
 }

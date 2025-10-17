@@ -109,10 +109,16 @@ class QLogger {
       ProtectionType protectionType,
       uint64_t packetSize) = 0;
   virtual void addMetricUpdate(
+      std::chrono::microseconds minRtt,
+      std::chrono::microseconds smoothedRtt,
       std::chrono::microseconds latestRtt,
-      std::chrono::microseconds mrtt,
-      std::chrono::microseconds srtt,
-      std::chrono::microseconds ackDelay) = 0;
+      std::chrono::microseconds rttVariance,
+      uint16_t ptoCount,
+      uint64_t congestionWindow,
+      uint64_t bytesInFlight,
+      uint64_t ssthresh,
+      uint64_t packetsInFlight,
+      std::chrono::microseconds pacingRate) = 0;
   virtual void addStreamStateUpdate(
       quic::StreamId streamId,
       std::string update,

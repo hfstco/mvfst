@@ -72,10 +72,16 @@ class QLoggerCommon : public quic::BaseQLogger {
       quic::ProtectionType protectionType,
       uint64_t packetSize) override;
   void addMetricUpdate(
+      std::chrono::microseconds minRtt,
+      std::chrono::microseconds smoothedRtt,
       std::chrono::microseconds latestRtt,
-      std::chrono::microseconds mrtt,
-      std::chrono::microseconds srtt,
-      std::chrono::microseconds ackDelay) override;
+      std::chrono::microseconds rttVariance,
+      uint16_t ptoCount,
+      uint64_t congestionWindow,
+      uint64_t bytesInFlight,
+      uint64_t ssthresh,
+      uint64_t packetsInFlight,
+      std::chrono::microseconds pacingRate) override;
   void addStreamStateUpdate(
       quic::StreamId id,
       std::string update,

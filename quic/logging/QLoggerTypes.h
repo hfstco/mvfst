@@ -721,16 +721,28 @@ class QLogPacketAckEvent : public QLogEvent {
 class QLogMetricUpdateEvent : public QLogEvent {
  public:
   QLogMetricUpdateEvent(
+      std::chrono::microseconds minRtt,
+      std::chrono::microseconds smoothedRtt,
       std::chrono::microseconds latestRtt,
-      std::chrono::microseconds mrtt,
-      std::chrono::microseconds srtt,
-      std::chrono::microseconds ackDelay,
+      std::chrono::microseconds rttVariance,
+      uint16_t ptoCount,
+      uint64_t congestionWindow,
+      uint64_t bytesInFlight,
+      uint64_t ssthresh,
+      uint64_t packetsInFlight,
+      std::chrono::microseconds pacingRate,
       std::chrono::microseconds refTime);
   ~QLogMetricUpdateEvent() override = default;
+  std::chrono::microseconds minRtt;
+  std::chrono::microseconds smoothedRtt;
   std::chrono::microseconds latestRtt;
-  std::chrono::microseconds mrtt;
-  std::chrono::microseconds srtt;
-  std::chrono::microseconds ackDelay;
+  std::chrono::microseconds rttVariance;
+  uint16_t ptoCount;
+  uint64_t congestionWindow;
+  uint64_t bytesInFlight;
+  uint64_t ssthresh;
+  uint64_t packetsInFlight;
+  std::chrono::microseconds pacingRate;
   [[nodiscard]] folly::dynamic toDynamic() const override;
 };
 

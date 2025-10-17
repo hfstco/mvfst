@@ -106,6 +106,18 @@ void Bbr2CongestionController::onPacketAckOrLoss(
           getCongestionWindow(),
           kCongestionPacketAck,
           bbr2StateToString(state_));
+      conn_.qLogger->addMetricUpdate(
+          conn_.lossState.mrtt,
+          conn_.lossState.srtt,
+          conn_.lossState.lrtt,
+          conn_.lossState.rttvar,
+          conn_.lossState.ptoCount,
+          getCongestionWindow(),
+          conn_.lossState.inflightBytes,
+          UINT64_MAX,
+          getCongestionWindow() / conn_.udpSendPacketLen,
+          calculatePacingRate(conn_, getCongestionWindow(),
+            conn_.transportSettings.minCwndInMss, conn_.lossState.lrtt).interval);
       conn_.qLogger->addNetworkPathModelUpdate(
           inflightLongTerm_.value_or(0),
           inflightShortTerm_.value_or(0),

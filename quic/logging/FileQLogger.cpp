@@ -392,15 +392,22 @@ void FileQLogger::addPacketBuffered(
 }
 
 void FileQLogger::addMetricUpdate(
+    std::chrono::microseconds minRtt,
+    std::chrono::microseconds smoothedRtt,
     std::chrono::microseconds latestRtt,
-    std::chrono::microseconds mrtt,
-    std::chrono::microseconds srtt,
-    std::chrono::microseconds ackDelay) {
+    std::chrono::microseconds rttVariance,
+    uint16_t ptoCount,
+    uint64_t congestionWindow,
+    uint64_t bytesInFlight,
+    uint64_t ssthresh,
+    uint64_t packetsInFlight,
+    std::chrono::microseconds pacingRate) {
   auto refTime = std::chrono::duration_cast<std::chrono::microseconds>(
       std::chrono::steady_clock::now().time_since_epoch());
 
   handleEvent(std::make_unique<quic::QLogMetricUpdateEvent>(
-      latestRtt, mrtt, srtt, ackDelay, refTime));
+    minRtt, smoothedRtt, latestRtt, rttVariance, ptoCount, congestionWindow,
+    bytesInFlight, ssthresh, packetsInFlight, pacingRate, refTime));
 }
 
 folly::dynamic FileQLogger::toDynamic() const {

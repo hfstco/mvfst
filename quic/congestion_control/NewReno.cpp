@@ -32,6 +32,18 @@ void NewReno::onRemoveBytesFromInflight(uint64_t /* bytes */) {
   if (conn_.qLogger) {
     conn_.qLogger->addCongestionMetricUpdate(
         conn_.lossState.inflightBytes, getCongestionWindow(), kRemoveInflight);
+    conn_.qLogger->addMetricUpdate(
+          conn_.lossState.mrtt,
+          conn_.lossState.srtt,
+          conn_.lossState.lrtt,
+          conn_.lossState.rttvar,
+          conn_.lossState.ptoCount,
+          getCongestionWindow(),
+          conn_.lossState.inflightBytes,
+          ssthresh_,
+          getCongestionWindow() / conn_.udpSendPacketLen,
+          calculatePacingRate(conn_, getCongestionWindow(),
+            conn_.transportSettings.minCwndInMss, conn_.lossState.lrtt).interval);
   }
 }
 
@@ -46,6 +58,18 @@ void NewReno::onPacketSent(const OutstandingPacketWrapper& packet) {
         conn_.lossState.inflightBytes,
         getCongestionWindow(),
         kCongestionPacketSent);
+    conn_.qLogger->addMetricUpdate(
+          conn_.lossState.mrtt,
+          conn_.lossState.srtt,
+          conn_.lossState.lrtt,
+          conn_.lossState.rttvar,
+          conn_.lossState.ptoCount,
+          getCongestionWindow(),
+          conn_.lossState.inflightBytes,
+          ssthresh_,
+          getCongestionWindow() / conn_.udpSendPacketLen,
+          calculatePacingRate(conn_, getCongestionWindow(),
+            conn_.transportSettings.minCwndInMss, conn_.lossState.lrtt).interval);
   }
 }
 
@@ -59,6 +83,18 @@ void NewReno::onAckEvent(const AckEvent& ack) {
         conn_.lossState.inflightBytes,
         getCongestionWindow(),
         kCongestionPacketAck);
+    conn_.qLogger->addMetricUpdate(
+          conn_.lossState.mrtt,
+          conn_.lossState.srtt,
+          conn_.lossState.lrtt,
+          conn_.lossState.rttvar,
+          conn_.lossState.ptoCount,
+          getCongestionWindow(),
+          conn_.lossState.inflightBytes,
+          ssthresh_,
+          getCongestionWindow() / conn_.udpSendPacketLen,
+          calculatePacingRate(conn_, getCongestionWindow(),
+            conn_.transportSettings.minCwndInMss, conn_.lossState.lrtt).interval);
   }
   for (const auto& packet : ack.ackedPackets) {
     onPacketAcked(packet);
@@ -138,6 +174,18 @@ void NewReno::onPacketLoss(const LossEvent& loss) {
         conn_.lossState.inflightBytes,
         getCongestionWindow(),
         kCongestionPacketLoss);
+    conn_.qLogger->addMetricUpdate(
+          conn_.lossState.mrtt,
+          conn_.lossState.srtt,
+          conn_.lossState.lrtt,
+          conn_.lossState.rttvar,
+          conn_.lossState.ptoCount,
+          getCongestionWindow(),
+          conn_.lossState.inflightBytes,
+          ssthresh_,
+          getCongestionWindow() / conn_.udpSendPacketLen,
+          calculatePacingRate(conn_, getCongestionWindow(),
+            conn_.transportSettings.minCwndInMss, conn_.lossState.lrtt).interval);
   }
   if (loss.persistentCongestion) {
     VLOG(10) << __func__ << " writable=" << getWritableBytes()
@@ -148,6 +196,18 @@ void NewReno::onPacketLoss(const LossEvent& loss) {
           conn_.lossState.inflightBytes,
           getCongestionWindow(),
           kPersistentCongestion);
+      conn_.qLogger->addMetricUpdate(
+          conn_.lossState.mrtt,
+          conn_.lossState.srtt,
+          conn_.lossState.lrtt,
+          conn_.lossState.rttvar,
+          conn_.lossState.ptoCount,
+          getCongestionWindow(),
+          conn_.lossState.inflightBytes,
+          ssthresh_,
+          getCongestionWindow() / conn_.udpSendPacketLen,
+          calculatePacingRate(conn_, getCongestionWindow(),
+            conn_.transportSettings.minCwndInMss, conn_.lossState.lrtt).interval);
     }
     cwndBytes_ = conn_.transportSettings.minCwndInMss * conn_.udpSendPacketLen;
   }

@@ -83,12 +83,6 @@ void updateRtt(
     conn.lossState.srtt = conn.lossState.srtt * (kRttAlpha - 1) / kRttAlpha +
         adjustedRtt / kRttAlpha;
   }
-
-  // inform qlog
-  if (conn.qLogger) {
-    conn.qLogger->addMetricUpdate(
-        rttSample, conn.lossState.mrtt, conn.lossState.srtt, ackDelay);
-  }
 }
 
 void updateAckSendStateOnRecvPacket(
