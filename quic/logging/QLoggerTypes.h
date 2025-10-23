@@ -401,6 +401,7 @@ enum class QLogEventType : uint32_t {
   ConnectionClose,
   TransportSummary,
   CongestionMetricUpdate,
+  CarefulResumePhaseUpdated,
   PacingMetricUpdate,
   AppIdleUpdate,
   PacketDrop,
@@ -559,6 +560,35 @@ class QLogCongestionMetricUpdateEvent : public QLogEvent {
   std::string congestionEvent;
   std::string state;
   std::string recoveryState;
+
+  [[nodiscard]] folly::dynamic toDynamic() const override;
+};
+
+class QLogCarefulResumePhaseUpdatedEvent : public QLogEvent {
+public:
+  QLogCarefulResumePhaseUpdatedEvent(
+      std::string oldPhaseIn,
+      std::string newPhaseIn,
+      uint32_t pipesizeIn,
+      uint32_t firstUnvalidatedPacketIn,
+      uint32_t lastUnvalidatedPacketIn,
+      uint32_t congestionWindowIn,
+      uint32_t ssthreshIn,
+      uint32_t savedCongestionWindowIn,
+      std::chrono::microseconds savedRttIn,
+      std::string triggerIn,
+      std::chrono::microseconds refTimeIn);
+  ~QLogCarefulResumePhaseUpdatedEvent() override = default;
+  std::string oldPhase;
+  std::string newPhase;
+  uint32_t pipesize;
+  uint32_t firstUnvalidatedPacket;
+  uint32_t lastUnvalidatedPacket;
+  uint32_t congestionWindow;
+  uint32_t ssthresh;
+  uint32_t savedCongestionWindow;
+  std::chrono::microseconds savedRtt;
+  std::string trigger;
 
   [[nodiscard]] folly::dynamic toDynamic() const override;
 };

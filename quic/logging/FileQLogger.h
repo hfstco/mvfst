@@ -45,6 +45,8 @@ class FileQLogger : public BaseQLogger {
   ~FileQLogger() override {
     if (streaming_ && dcid.has_value()) {
       finishStream();
+    } else {
+      outputLogsToFile(path_, prettyJson_);
     }
   }
 
@@ -72,6 +74,17 @@ class FileQLogger : public BaseQLogger {
       std::string congestionEvent,
       std::string state = "",
       std::string recoveryState = "") override;
+  void addCarefulResumePhaseUpdated(
+      std::string oldPhase,
+      std::string newPhase,
+      uint64_t pipesize,
+      uint64_t firstUnvalidatedPacket,
+      uint64_t lastUnvalidatedPacket,
+      uint64_t congestionWindow,
+      uint64_t ssthresh,
+      uint64_t savedCongestionWindow,
+      std::chrono::microseconds savedRtt,
+      std::string trigger) override;
   void addPacingMetricUpdate(
       uint64_t pacingBurstSizeIn,
       std::chrono::microseconds pacingIntervalIn) override;

@@ -11,6 +11,7 @@ add_library(
   BbrRttSampler.cpp
   BbrTesting.cpp
   Bbr2.cpp
+  CarefulResume.cpp
   CongestionControlFunctions.cpp
   CongestionControllerFactory.cpp
   Copa.cpp

@@ -540,6 +540,60 @@ folly::dynamic QLogCongestionMetricUpdateEvent::toDynamic() const {
   return d;
 }
 
+QLogCarefulResumePhaseUpdatedEvent::QLogCarefulResumePhaseUpdatedEvent(
+      std::string oldPhaseIn,
+      std::string newPhaseIn,
+      uint32_t pipesizeIn,
+      uint32_t firstUnvalidatedPacketIn,
+      uint32_t lastUnvalidatedPacketIn,
+      uint32_t congestionWindowIn,
+      uint32_t ssthreshIn,
+      uint32_t savedCongestionWindowIn,
+      std::chrono::microseconds savedRttIn,
+      std::string triggerIn,
+      std::chrono::microseconds refTimeIn)
+      : oldPhase(std::move(oldPhaseIn)), newPhase(std::move(newPhaseIn)),
+        pipesize(pipesizeIn), firstUnvalidatedPacket(firstUnvalidatedPacketIn),
+        lastUnvalidatedPacket(lastUnvalidatedPacketIn), congestionWindow(congestionWindowIn),
+        ssthresh(ssthreshIn), savedCongestionWindow(savedCongestionWindowIn),
+        savedRtt(savedRttIn), trigger(std::move(triggerIn)){
+  eventType = QLogEventType::CarefulResumePhaseUpdated;
+  refTime = refTimeIn;
+}
+
+folly::dynamic QLogCarefulResumePhaseUpdatedEvent::toDynamic() const {
+  // creating a folly::dynamic array to hold the information corresponding to
+  // the event fields relative_time, category, event_type, trigger, data
+  folly::dynamic d = folly::dynamic::array(
+      fmt::format("{}", refTime.count()), "recovery", toString(eventType));
+  folly::dynamic data = folly::dynamic::object();
+
+  data["old"] = oldPhase;
+  data["new"] = newPhase;
+
+  folly::dynamic stateData = folly::dynamic::object();
+
+  stateData["pipesize"] = pipesize;
+  stateData["first_unvalidated_packet"] = firstUnvalidatedPacket;
+  stateData["last_unvalidated_packet"] = lastUnvalidatedPacket;
+  stateData["congestion_window"] = congestionWindow;
+  stateData["ssthresh"] = ssthresh;
+
+  data["state_data"] = stateData;
+
+  folly::dynamic restoredData = folly::dynamic::object();
+
+  data["saved_congestion_window"] = savedCongestionWindow;
+  data["saved_rtt"] = savedRtt.count();
+
+  data["restored_data"] = restoredData;
+
+  data["trigger"] = trigger;
+
+  d.push_back(std::move(data));
+  return d;
+}
+
 QLogAppLimitedUpdateEvent::QLogAppLimitedUpdateEvent(
     bool limitedIn,
     std::chrono::microseconds refTimeIn)
@@ -1047,6 +1101,8 @@ folly::StringPiece toString(QLogEventType type) {
       return "transport_summary";
     case QLogEventType::CongestionMetricUpdate:
       return "congestion_metric_update";
+    case QLogEventType::CarefulResumePhaseUpdated:
+      return "careful_resume_phase_updated";
     case QLogEventType::PacingMetricUpdate:
       return "pacing_metric_update";
     case QLogEventType::AppIdleUpdate:

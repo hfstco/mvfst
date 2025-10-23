@@ -80,6 +80,17 @@ class QLogger {
       std::string congestionEvent,
       std::string state = "",
       std::string recoveryState = "") = 0;
+  virtual void addCarefulResumePhaseUpdated(
+      std::string oldPhase,
+      std::string newPhase,
+      uint64_t pipesize,
+      uint64_t firstUnvalidatedPacket,
+      uint64_t lastUnvalidatedPacket,
+      uint64_t congestionWindow,
+      uint64_t ssthresh,
+      uint64_t savedCongestionWindow,
+      std::chrono::microseconds savedRtt,
+      std::string trigger = "") = 0;
   virtual void addBandwidthEstUpdate(
       uint64_t bytes,
       std::chrono::microseconds interval) = 0;

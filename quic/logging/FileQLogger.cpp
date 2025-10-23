@@ -282,6 +282,34 @@ void FileQLogger::addCongestionMetricUpdate(
       refTime));
 }
 
+void FileQLogger::addCarefulResumePhaseUpdated(
+    std::string oldPhase,
+    std::string newPhase,
+    uint64_t pipesize,
+    uint64_t firstUnvalidatedPacket,
+    uint64_t lastUnvalidatedPacket,
+    uint64_t congestionWindow,
+    uint64_t ssthresh,
+    uint64_t savedCongestionWindow,
+    std::chrono::microseconds savedRtt,
+    std::string trigger) {
+  auto refTime = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch());
+
+  handleEvent(std::make_unique<quic::QLogCarefulResumePhaseUpdatedEvent>(
+      std::move(oldPhase),
+      std::move(newPhase),
+      pipesize,
+      firstUnvalidatedPacket,
+      lastUnvalidatedPacket,
+      congestionWindow,
+      ssthresh,
+      savedCongestionWindow,
+      savedRtt,
+      std::move(trigger),
+      refTime));
+}
+
 void FileQLogger::addBandwidthEstUpdate(
     uint64_t bytes,
     std::chrono::microseconds interval) {

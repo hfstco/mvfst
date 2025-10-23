@@ -106,6 +106,19 @@ void QLoggerCommon::addCongestionMetricUpdate(
       refTime));
 }
 
+void QLoggerCommon::addCarefulResumePhaseUpdated(
+      std::string oldPhase,
+      std::string newPhase,
+      uint32_t pipesize,
+      uint32_t firstUnvalidatedPacket,
+      uint32_t lastUnvalidatedPacket,
+      uint32_t congestionWindow,
+      uint32_t ssthresh,
+      uint32_t savedCongestionWindow,
+      std::chrono::microseconds savedRtt,
+      std::string trigger) {
+}
+
 void QLoggerCommon::addBandwidthEstUpdate(
     uint64_t bytes,
     std::chrono::microseconds interval) {
