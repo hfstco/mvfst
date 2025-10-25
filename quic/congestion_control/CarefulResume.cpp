@@ -185,20 +185,4 @@ namespace quic {
         savedRTT_, triggerToString(trigger_));
     }
   }
-
-  void CarefulResume::EnterObserve(uint64_t& cwndBytes, uint64_t& ssthresh) {
-    lastState_ = state_;
-    state_ = States::Observe;
-
-    startOfEpoch_ = Clock::now();
-
-    LOG(INFO) << "Entering Observe";
-
-    if (conn_.qLogger) {
-      conn_.qLogger->addCarefulResumePhaseUpdated(stateToString(lastState_),
-        stateToString(state_), pipeSize_, firstUnvalidatedPacket_,
-        lastUnvalidatedPacket_, cwndBytes, ssthresh, savedCongestionWindow_,
-        savedRTT_, triggerToString(trigger_));
-    }
-  }
   } // namespace quic

@@ -21,8 +21,7 @@ struct CarefulResume {
     Reconnaisance = 1,
     Unvalidated = 2,
     Validating = 3,
-    SafeRetreat = 4,
-    Observe = 100
+    SafeRetreat = 4
   };
 
   std::string stateToString(States state) {
@@ -37,8 +36,6 @@ struct CarefulResume {
         return "validating";
       case States::SafeRetreat:
         return "safe_retreat";
-      case States::Observe:
-        return "observe";
     }
     folly::assume_unreachable();
   }
@@ -129,6 +126,5 @@ private:
   void EnterValidating(uint64_t& cwndBytes, uint64_t& ssthresh);
   void EnterSafeRetreat(uint64_t& cwndBytes, uint64_t& ssthresh);
   void EnterNormal(uint64_t& cwndBytes, uint64_t& ssthresh);
-  void EnterObserve(uint64_t& cwndBytes, uint64_t& ssthresh);
 };
 }
