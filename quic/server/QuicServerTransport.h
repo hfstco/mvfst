@@ -286,6 +286,8 @@ class QuicServerTransport
   bool notifiedConnIdBound_{false};
   Optional<TimePoint> newSessionTicketWrittenTimestamp_;
   Optional<uint64_t> newSessionTicketWrittenCwndHint_;
+  Optional<uint64_t> newSessionTicketWrittenSavedCongestionWindow_;
+  Optional<uint64_t> newSessionTicketWrittenSavedRtt_;
   QuicServerConnectionState* serverConn_;
   folly::F14FastMap<
       uint64_t,

@@ -47,7 +47,9 @@ enum class TransportParameterId : uint64_t {
   cwnd_hint_bytes = 0x00007492,
   client_direct_encap = 0x000042fc,
   server_direct_encap = 0x000042fd,
-  reliable_stream_reset = 0x17f7586d2cb571
+  reliable_stream_reset = 0x17f7586d2cb571,
+  saved_congestion_window = 0x5eed1,
+  saved_rtt = 0x5eed2
 };
 
 struct TransportParameter {

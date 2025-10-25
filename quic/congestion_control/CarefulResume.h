@@ -95,6 +95,12 @@ struct CarefulResume {
      * Verify endpoint matches. */
 
     savedCongestionWindow_ = 3750000;
+    savedRTT_ = 600000;
+
+    if (conn_.maybeSavedCongestionWindow.has_value() && conn_.maybeSavedRtt.has_value()) {
+      savedCongestionWindow_ = conn_.maybeSavedCongestionWindow.value();
+      savedRTT_ = conn_.maybeSavedRtt.value();
+    }
 
     /* Set Careful Resume parameters forcefully. */
     if (getenv("PREVIOUS_RTT") && getenv("PREVIOUS_CWND_BYTES")) {

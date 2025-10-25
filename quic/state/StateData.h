@@ -755,6 +755,10 @@ struct QuicConnectionStateBase : public folly::DelayedDestruction {
 
   // Is the stream buffer low after the next write
   bool imminentStreamCompletion{false};
+
+  // Careful Resume. TODO
+  Optional<uint64_t> maybeSavedCongestionWindow;
+  Optional<uint64_t> maybeSavedRtt;
 };
 
 std::ostream& operator<<(std::ostream& os, const QuicConnectionStateBase& st);

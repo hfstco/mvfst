@@ -719,22 +719,40 @@ void maybeUpdateTransportFromAppToken(
   auto& params = appToken->transportParams.parameters;
   auto maybeCwndHintBytesResult =
       getIntegerParameter(TransportParameterId::cwnd_hint_bytes, params);
-  if (maybeCwndHintBytesResult.hasError()) {
-    return;
-  }
-  auto maybeCwndHintBytes = maybeCwndHintBytesResult.value();
-  if (maybeCwndHintBytes) {
-    QUIC_STATS(conn.statsCallback, onCwndHintBytesSample, *maybeCwndHintBytes);
+  if (!maybeCwndHintBytesResult.hasError()) {
+    auto maybeCwndHintBytes = maybeCwndHintBytesResult.value();
+    if (maybeCwndHintBytes) {
+      QUIC_STATS(conn.statsCallback, onCwndHintBytesSample, *maybeCwndHintBytes);
 
-    // Only use the cwndHint if the source address is included in the token
-    DCHECK(conn.peerAddress.isInitialized());
-    auto addressMatches =
-        std::find(
-            appToken->sourceAddresses.begin(),
-            appToken->sourceAddresses.end(),
-            conn.peerAddress.getIPAddress()) != appToken->sourceAddresses.end();
-    if (addressMatches) {
-      conn.maybeCwndHintBytes = maybeCwndHintBytes;
+      // Only use the cwndHint if the source address is included in the token
+      DCHECK(conn.peerAddress.isInitialized());
+      auto addressMatches =
+          std::find(
+              appToken->sourceAddresses.begin(),
+              appToken->sourceAddresses.end(),
+              conn.peerAddress.getIPAddress()) != appToken->sourceAddresses.end();
+      if (addressMatches) {
+        conn.maybeCwndHintBytes = maybeCwndHintBytes;
+      }
+    }
+  }
+  auto maybeSavedCongestionWindowResult = getIntegerParameter(TransportParameterId::saved_congestion_window, params);
+  auto maybeSavedRttResult = getIntegerParameter(TransportParameterId::saved_rtt, params);
+  if (!maybeSavedCongestionWindowResult.hasError() && !maybeSavedRttResult.hasError()) {
+    auto maybeSavedCongestionWindow = maybeSavedCongestionWindowResult.value();
+    auto maybeSavedRtt = maybeSavedRttResult.value();
+    if (maybeSavedCongestionWindow && maybeSavedRtt) {
+      // Only use the cwndHint if the source address is included in the token
+      DCHECK(conn.peerAddress.isInitialized());
+      auto addressMatches =
+          std::find(
+              appToken->sourceAddresses.begin(),
+              appToken->sourceAddresses.end(),
+              conn.peerAddress.getIPAddress()) != appToken->sourceAddresses.end();
+      if (addressMatches) {
+        conn.maybeSavedCongestionWindow = maybeSavedCongestionWindow;
+        conn.maybeSavedRtt = maybeSavedRtt;
+      }
     }
   }
 }

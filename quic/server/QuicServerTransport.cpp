@@ -596,15 +596,18 @@ bool QuicServerTransport::shouldWriteNewSessionTicket() {
   // 3. We haven't sent any session ticket in the last
   // kMinIntervalBetweenSessionTickets
 
-  if (conn_->transportSettings.includeCwndHintsInSessionTicket &&
+  /* Forcefully enable for Careful Resume. */
+  if (/* conn_->transportSettings.includeCwndHintsInSessionTicket && */
       conn_->congestionController &&
       Clock::now() - newSessionTicketWrittenTimestamp_.value() >
           kMinIntervalBetweenSessionTickets) {
     const auto& targetBDP = conn_->congestionController->getBDP();
+    /* TODO adjust congestion window changed limits. */
     bool bdpChangedSinceLastHint =
         !newSessionTicketWrittenCwndHint_.has_value() ||
         targetBDP / 2 > *newSessionTicketWrittenCwndHint_ ||
         targetBDP < *newSessionTicketWrittenCwndHint_;
+    /* TODO check if minimum rtt has changed? */
     if (bdpChangedSinceLastHint) {
       return true;
     }
@@ -628,6 +631,17 @@ QuicServerTransport::maybeWriteNewSessionTicket() {
       cwndHint = bdp;
       newSessionTicketWrittenCwndHint_ = cwndHint;
     }
+    /* Careful Resume. */
+    Optional<uint64_t> savedCongestionWindow = std::nullopt;
+    Optional<uint64_t> savedRtt = std::nullopt;
+    if (conn_->congestionController) {
+      savedCongestionWindow = conn_->congestionController->getBDP();
+      savedRtt = conn_->lossState.mrtt.count();
+      VLOG(7) << "Writing a new session ticket with savedCongestionWindow=" << savedCongestionWindow.value()
+      << " and savedRtt=" << savedRtt.value();
+      newSessionTicketWrittenSavedCongestionWindow_ = savedCongestionWindow;
+      newSessionTicketWrittenSavedRtt_ = savedRtt;
+    }
     AppToken appToken;
     auto transportParamsResult = createTicketTransportParameters(
         conn_->transportSettings.idleTimeout.count(),
@@ -641,7 +655,9 @@ QuicServerTransport::maybeWriteNewSessionTicket() {
         conn_->transportSettings.advertisedInitialMaxStreamsBidi,
         conn_->transportSettings.advertisedInitialMaxStreamsUni,
         conn_->transportSettings.advertisedExtendedAckFeatures,
-        cwndHint);
+        cwndHint,
+        savedCongestionWindow,
+        savedRtt);
     if (transportParamsResult.hasError()) {
       return quic::make_unexpected(transportParamsResult.error());
     }
