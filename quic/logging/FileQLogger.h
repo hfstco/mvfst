@@ -83,7 +83,7 @@ class FileQLogger : public BaseQLogger {
       uint64_t congestionWindow,
       uint64_t ssthresh,
       uint64_t savedCongestionWindow,
-      std::chrono::microseconds savedRtt,
+      uint64_t savedRtt,
       std::string trigger) override;
   void addPacingMetricUpdate(
       uint64_t pacingBurstSizeIn,

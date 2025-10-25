@@ -291,7 +291,7 @@ void FileQLogger::addCarefulResumePhaseUpdated(
     uint64_t congestionWindow,
     uint64_t ssthresh,
     uint64_t savedCongestionWindow,
-    std::chrono::microseconds savedRtt,
+    uint64_t savedRtt,
     std::string trigger) {
   auto refTime = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now().time_since_epoch());

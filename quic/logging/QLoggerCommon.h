@@ -53,7 +53,7 @@ class QLoggerCommon : public quic::BaseQLogger {
       uint32_t congestionWindow,
       uint32_t ssthresh,
       uint32_t savedCongestionWindow,
-      std::chrono::microseconds savedRtt,
+      uint64_t savedRtt,
       std::string trigger) override;
   void addBandwidthEstUpdate(uint64_t bytes, std::chrono::microseconds interval)
       override;

@@ -25,8 +25,8 @@ namespace quic {
       case States::Reconnaisance:
         if (conn_.ackStates.appDataAckState.largestAckedByPeer.has_value() &&
         conn_.ackStates.appDataAckState.largestAckedByPeer.value() > 10 &&
-          conn_.lossState.mrtt >= (savedRTT_ / 2) &&
-          conn_.lossState.mrtt <= (savedRTT_ * 10)) {
+          conn_.lossState.mrtt.count() >= (savedRTT_ / 2) &&
+          conn_.lossState.mrtt.count() <= (savedRTT_ * 10)) {
           trigger_ = Trigger::CwndLimited;
           return EnterUnvalidated(cwndBytes, ssthresh);
           }
@@ -83,7 +83,7 @@ namespace quic {
     startOfEpoch_ = Clock::now();
 
     LOG(INFO) << "Entering Reconnaissance savedCongestionWindow_=" << savedCongestionWindow_ <<
-      "; savedRTT_=" << savedRTT_.count();
+      "; savedRTT_=" << savedRTT_;
     if (conn_.qLogger) {
       conn_.qLogger->addCarefulResumePhaseUpdated(stateToString(lastState_),
         stateToString(state_), pipeSize_, firstUnvalidatedPacket_,

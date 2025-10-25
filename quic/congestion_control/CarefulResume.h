@@ -97,13 +97,12 @@ struct CarefulResume {
     /* TODO Load previous CC parameters for connection.
      * Verify endpoint matches. */
 
-    savedRTT_ = std::chrono::microseconds{600000};
     savedCongestionWindow_ = 3750000;
 
     /* Set Careful Resume parameters forcefully. */
     if (getenv("PREVIOUS_RTT") && getenv("PREVIOUS_CWND_BYTES")) {
       savedCongestionWindow_ = strtoull(getenv("PREVIOUS_CWND_BYTES"), NULL, 10);
-      savedRTT_ = std::chrono::microseconds(strtoull(getenv("PREVIOUS_RTT"), NULL, 10));
+      savedRTT_ = strtoull(getenv("PREVIOUS_RTT"), NULL, 10);
     }
   };
 
@@ -120,7 +119,7 @@ private:
   uint64_t firstUnvalidatedPacket_{0};
   uint64_t lastUnvalidatedPacket_{0};
 
-  std::chrono::microseconds savedRTT_{0};
+  uint64_t savedRTT_{0};
   uint64_t savedCongestionWindow_{0};
 
   Trigger trigger_{Trigger::RTTNotValidated};

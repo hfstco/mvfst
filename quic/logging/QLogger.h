@@ -89,7 +89,7 @@ class QLogger {
       uint64_t congestionWindow,
       uint64_t ssthresh,
       uint64_t savedCongestionWindow,
-      std::chrono::microseconds savedRtt,
+      uint64_t savedRtt,
       std::string trigger = "") = 0;
   virtual void addBandwidthEstUpdate(
       uint64_t bytes,

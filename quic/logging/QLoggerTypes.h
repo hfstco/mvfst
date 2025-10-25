@@ -575,7 +575,7 @@ public:
       uint32_t congestionWindowIn,
       uint32_t ssthreshIn,
       uint32_t savedCongestionWindowIn,
-      std::chrono::microseconds savedRttIn,
+      uint64_t savedRttIn,
       std::string triggerIn,
       std::chrono::microseconds refTimeIn);
   ~QLogCarefulResumePhaseUpdatedEvent() override = default;
@@ -587,7 +587,7 @@ public:
   uint32_t congestionWindow;
   uint32_t ssthresh;
   uint32_t savedCongestionWindow;
-  std::chrono::microseconds savedRtt;
+  uint64_t savedRtt;
   std::string trigger;
 
   [[nodiscard]] folly::dynamic toDynamic() const override;

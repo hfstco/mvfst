@@ -549,7 +549,7 @@ QLogCarefulResumePhaseUpdatedEvent::QLogCarefulResumePhaseUpdatedEvent(
       uint32_t congestionWindowIn,
       uint32_t ssthreshIn,
       uint32_t savedCongestionWindowIn,
-      std::chrono::microseconds savedRttIn,
+      uint64_t savedRttIn,
       std::string triggerIn,
       std::chrono::microseconds refTimeIn)
       : oldPhase(std::move(oldPhaseIn)), newPhase(std::move(newPhaseIn)),
@@ -584,7 +584,7 @@ folly::dynamic QLogCarefulResumePhaseUpdatedEvent::toDynamic() const {
   folly::dynamic restoredData = folly::dynamic::object();
 
   data["saved_congestion_window"] = savedCongestionWindow;
-  data["saved_rtt"] = savedRtt.count();
+  data["saved_rtt"] = savedRtt;
 
   data["restored_data"] = restoredData;
 
