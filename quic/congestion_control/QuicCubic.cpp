@@ -22,7 +22,7 @@ Cubic::Cubic(
     uint64_t initSsthresh,
     bool tcpFriendly,
     bool ackTrain)
-    : conn_(conn), ssthresh_(initSsthresh) {
+    : conn_(conn), ssthresh_(initSsthresh), carefulResume_(CarefulResume(conn)){
   cwndBytes_ = std::min(
       conn.transportSettings.maxCwndInMss * conn.udpSendPacketLen,
       std::max(
@@ -130,6 +130,9 @@ void Cubic::onPacketSent(const OutstandingPacketWrapper& /* packet */) {
   } else {
     isCwndBlocked_ = conn_.lossState.inflightBytes >= cwndBytes_;
   }
+
+  /* Careful Resume. */
+  carefulResume_.onPacketSent(cwndBytes_, ssthresh_);
 }
 
 void Cubic::onPacketLoss(const LossEvent& loss) {
@@ -144,7 +147,10 @@ void Cubic::onPacketLoss(const LossEvent& loss) {
   if (*loss.largestLostSentTime >=
       recoveryState_.endOfRecovery.value_or(*loss.largestLostSentTime)) {
     recoveryState_.endOfRecovery = Clock::now();
-    cubicReduction(loss.lossTime);
+    if (carefulResume_.state() != CarefulResume::States::Unvalidated &&
+      carefulResume_.state() != CarefulResume::States::SafeRetreat) {
+      cubicReduction(loss.lossTime);
+    }
     if (state_ == CubicStates::Hystart || state_ == CubicStates::Steady) {
       state_ = CubicStates::FastRecovery;
     }
@@ -198,6 +204,9 @@ void Cubic::onPacketLoss(const LossEvent& loss) {
   if (loss.persistentCongestion) {
     onPersistentCongestion();
   }
+
+  /* Careful Resume. */
+  carefulResume_.onPacketLoss(loss, cwndBytes_, ssthresh_);
 }
 
 void Cubic::onRemoveBytesFromInflight(uint64_t /* bytes */) {
@@ -448,6 +457,10 @@ void Cubic::onPacketAcked(const AckEvent& ack) {
     conn_.pacer->refreshPacingRate(
         cwndBytes_ * pacingGain(), conn_.lossState.srtt);
   }
+
+  /* Careful Resume. */
+  carefulResume_.onPacketAcked(ack, cwndBytes_, ssthresh_);
+
   if (cwndBytes_ == currentCwnd) {
     if (conn_.qLogger) {
       conn_.qLogger->addCongestionMetricUpdate(
@@ -543,11 +556,14 @@ void Cubic::onPacketAckedInHystart(const AckEvent& ack) {
   VLOG(15) << "Cubic Hystart increase cwnd=" << cwndBytes_ << ", by "
            << ack.ackedBytes;
 
-  cwndBytes_ = boundedCwnd(
-      cwndBytes_ + ack.ackedBytes,
-      conn_.udpSendPacketLen,
-      conn_.transportSettings.maxCwndInMss,
-      conn_.transportSettings.minCwndInMss);
+  if (carefulResume_.state() != CarefulResume::States::Unvalidated &&
+      carefulResume_.state() != CarefulResume::States::SafeRetreat) {
+    cwndBytes_ = boundedCwnd(
+        cwndBytes_ + ack.ackedBytes,
+        conn_.udpSendPacketLen,
+        conn_.transportSettings.maxCwndInMss,
+        conn_.transportSettings.minCwndInMss);
+  }
 
   Optional<Cubic::ExitReason> exitReason;
   SCOPE_EXIT {
@@ -772,24 +788,27 @@ void Cubic::onPacketAckedInSteady(const AckEvent& ack) {
             conn_.transportSettings.minCwndInMss, conn_.lossState.lrtt).interval);
     }
   }
-  uint64_t newCwnd = calculateCubicCwnd(calculateCubicCwndDelta(ack.ackTime));
-  if (conn_.transportSettings.ccaConfig.additiveIncreaseAfterHystart &&
-      newCwnd < ssthresh_) {
-    auto delta = ack.ackedBytes / 10;
-    if (newCwnd < cwndBytes_ + delta) {
-      newCwnd = boundedCwnd(
-          cwndBytes_ + delta,
-          conn_.udpSendPacketLen,
-          conn_.transportSettings.maxCwndInMss,
-          conn_.transportSettings.minCwndInMss);
+  if (carefulResume_.state() != CarefulResume::States::Unvalidated &&
+      carefulResume_.state() != CarefulResume::States::SafeRetreat) {
+    uint64_t newCwnd = calculateCubicCwnd(calculateCubicCwndDelta(ack.ackTime));
+    if (conn_.transportSettings.ccaConfig.additiveIncreaseAfterHystart &&
+        newCwnd < ssthresh_) {
+      auto delta = ack.ackedBytes / 10;
+      if (newCwnd < cwndBytes_ + delta) {
+        newCwnd = boundedCwnd(
+            cwndBytes_ + delta,
+            conn_.udpSendPacketLen,
+            conn_.transportSettings.maxCwndInMss,
+            conn_.transportSettings.minCwndInMss);
+      }
+        }
+    if (newCwnd < cwndBytes_) {
+      VLOG(10) << "Cubic steady state calculates a smaller cwnd than last round"
+               << ", new cnwd = " << newCwnd << ", current cwnd = " << cwndBytes_;
+    } else {
+      cwndBytes_ = newCwnd;
     }
-  }
-  if (newCwnd < cwndBytes_) {
-    VLOG(10) << "Cubic steady state calculates a smaller cwnd than last round"
-             << ", new cnwd = " << newCwnd << ", current cwnd = " << cwndBytes_;
-  } else {
-    cwndBytes_ = newCwnd;
-  }
+
   // Reno cwnd estimation for TCP friendly.
   if (steadyState_.tcpFriendly && ack.ackedBytes) {
     /* If tcpFriendly is false, we don't keep track of estRenoCwnd. Right now we
@@ -824,10 +843,11 @@ void Cubic::onPacketAckedInSteady(const AckEvent& ack) {
             conn_.transportSettings.minCwndInMss, conn_.lossState.lrtt).interval);
     }
   }
+  }
 }
 
 void Cubic::onPacketAckedInRecovery(const AckEvent& ack) {
-  CHECK_EQ(cwndBytes_, ssthresh_);
+  //CHECK_EQ(cwndBytes_, ssthresh_);
   if (isRecovered(ack.largestNewlyAckedPacketSentTime)) {
     state_ = CubicStates::Steady;
 
@@ -841,7 +861,10 @@ void Cubic::onPacketAckedInRecovery(const AckEvent& ack) {
     DCHECK(steadyState_.lastMaxCwndBytes.has_value());
     DCHECK(steadyState_.lastReductionTime.has_value());
     updateTimeToOrigin();
-    cwndBytes_ = calculateCubicCwnd(calculateCubicCwndDelta(ack.ackTime));
+    if (carefulResume_.state() != CarefulResume::States::Unvalidated &&
+      carefulResume_.state() != CarefulResume::States::SafeRetreat) {
+      cwndBytes_ = calculateCubicCwnd(calculateCubicCwndDelta(ack.ackTime));
+    }
     if (conn_.qLogger) {
       conn_.qLogger->addCongestionMetricUpdate(
           conn_.lossState.inflightBytes,

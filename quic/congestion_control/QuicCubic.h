@@ -12,6 +12,7 @@
 #include <quic/congestion_control/CongestionController.h>
 #include <quic/state/AckEvent.h>
 #include <quic/state/StateData.h>
+#include <quic/congestion_control/CarefulResume.h>
 
 namespace quic {
 
@@ -203,6 +204,8 @@ class Cubic : public CongestionController {
 
   TimePoint l4sCwndReducedTimestamp_;
   uint64_t lastCECount_{0};
+
+  CarefulResume carefulResume_;
 };
 
 folly::StringPiece cubicStateToString(CubicStates state);
