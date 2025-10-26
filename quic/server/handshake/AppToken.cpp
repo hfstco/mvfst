@@ -100,7 +100,7 @@ createTicketTransportParameters(
   }
 
   if(savedCongestionWindow && savedRtt) {
-  auto savedCongestionWindowResult = encodeIntegerParameter(TransportParameterId::saved_congestion_window, *savedCongestionWindow);
+    auto savedCongestionWindowResult = encodeIntegerParameter(TransportParameterId::saved_congestion_window, *savedCongestionWindow);
     if (savedCongestionWindowResult.hasError()) {
       return quic::make_unexpected(savedCongestionWindowResult.error());
     }

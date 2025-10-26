@@ -741,8 +741,10 @@ void maybeUpdateTransportFromAppToken(
   if (!maybeSavedCongestionWindowResult.hasError() && !maybeSavedRttResult.hasError()) {
     auto maybeSavedCongestionWindow = maybeSavedCongestionWindowResult.value();
     auto maybeSavedRtt = maybeSavedRttResult.value();
+    VLOG(10) << "Read Careful Resume parameters from Ticket. savedCongestionWindow=" << maybeSavedCongestionWindow.value()
+      << " savedRtt=" << maybeSavedRtt.value();
     if (maybeSavedCongestionWindow && maybeSavedRtt) {
-      // Only use the cwndHint if the source address is included in the token
+      // Only use the Careful Resume if the source address is included in the token
       DCHECK(conn.peerAddress.isInitialized());
       auto addressMatches =
           std::find(

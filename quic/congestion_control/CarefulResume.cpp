@@ -23,6 +23,14 @@ namespace quic {
   void CarefulResume::onPacketAcked(const AckEvent& ack, uint64_t& cwndBytes, uint64_t& ssthresh) {
     switch (state_) {
       case States::Reconnaisance:
+        if (conn_.maybeSavedCongestionWindow.has_value() && conn_.maybeSavedRtt.has_value()
+          && !savedCongestionWindow_ && !savedRTT_) {
+          savedCongestionWindow_ = conn_.maybeSavedCongestionWindow.value();
+          savedRTT_ = conn_.maybeSavedRtt.value();
+          VLOG(10) << "Careful Resume parameters set. savedCongestionWindow=" << savedCongestionWindow_
+          << " savedRTT=" << savedRTT_;
+        }
+
         if (conn_.ackStates.appDataAckState.largestAckedByPeer.has_value() &&
         conn_.ackStates.appDataAckState.largestAckedByPeer.value() > 10 &&
           conn_.lossState.mrtt.count() >= (savedRTT_ / 2) &&
