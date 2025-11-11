@@ -231,13 +231,14 @@ quic::Expected<std::unique_ptr<Aead>, QuicError> FizzClientHandshake::buildAead(
     fizz::KeyScheduler& keyScheduler =
         isEarlyTraffic ? *keySchedulerPtr : *state_.keyScheduler();
 
-    auto aead = FizzAead::wrap(fizz::Protocol::deriveRecordAeadWithLabel(
-        *state_.context()->getFactory(),
-        keyScheduler,
-        cipher,
-        secret,
-        kQuicKeyLabel,
-        kQuicIVLabel));
+    auto aead = FizzAead::wrap(
+        fizz::Protocol::deriveRecordAeadWithLabel(
+            *state_.context()->getFactory(),
+            keyScheduler,
+            cipher,
+            secret,
+            kQuicKeyLabel,
+            kQuicIVLabel));
 
     return aead;
   } catch (const std::exception& ex) {
@@ -278,7 +279,7 @@ void FizzClientHandshake::onNewCachedPsk(
   if (conn->earlyDataAppParamsGetter) {
     auto appParams = conn->earlyDataAppParamsGetter();
     if (appParams) {
-      quicCachedPsk.appParams = appParams->to<std::string>();
+      quicCachedPsk.appParams = appParams->toString();
     }
   }
 
@@ -399,7 +400,9 @@ class FizzClientHandshake::ActionMoveVisitor {
           case fizz::EarlySecrets::ClientEarlyTraffic:
             client_.computeCiphers(
                 CipherKind::ZeroRttWrite,
-                folly::range(secretAvailable.secret.secret));
+                ByteRange(
+                    secretAvailable.secret.secret.data(),
+                    secretAvailable.secret.secret.size()));
             break;
           default:
             break;
@@ -410,12 +413,16 @@ class FizzClientHandshake::ActionMoveVisitor {
           case fizz::HandshakeSecrets::ClientHandshakeTraffic:
             client_.computeCiphers(
                 CipherKind::HandshakeWrite,
-                folly::range(secretAvailable.secret.secret));
+                ByteRange(
+                    secretAvailable.secret.secret.data(),
+                    secretAvailable.secret.secret.size()));
             break;
           case fizz::HandshakeSecrets::ServerHandshakeTraffic:
             client_.computeCiphers(
                 CipherKind::HandshakeRead,
-                folly::range(secretAvailable.secret.secret));
+                ByteRange(
+                    secretAvailable.secret.secret.data(),
+                    secretAvailable.secret.secret.size()));
             break;
           case fizz::HandshakeSecrets::ECHAcceptConfirmation:
             break;
@@ -426,12 +433,16 @@ class FizzClientHandshake::ActionMoveVisitor {
           case fizz::AppTrafficSecrets::ClientAppTraffic:
             client_.computeCiphers(
                 CipherKind::OneRttWrite,
-                folly::range(secretAvailable.secret.secret));
+                ByteRange(
+                    secretAvailable.secret.secret.data(),
+                    secretAvailable.secret.secret.size()));
             break;
           case fizz::AppTrafficSecrets::ServerAppTraffic:
             client_.computeCiphers(
                 CipherKind::OneRttRead,
-                folly::range(secretAvailable.secret.secret));
+                ByteRange(
+                    secretAvailable.secret.secret.data(),
+                    secretAvailable.secret.secret.size()));
             break;
         }
         break;

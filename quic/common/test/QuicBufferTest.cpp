@@ -859,4 +859,387 @@ TEST(QuicBufferTest, TestFromStringEmpty) {
   EXPECT_TRUE(buf->empty());
 }
 
+TEST(QuicBufferTest, RangeToString) {
+  // Test basic ByteRange to string conversion
+  const uint8_t data[] = "Hello, World!";
+  ByteRange range(data, 13);
+  EXPECT_EQ(range.toString(), "Hello, World!");
+
+  // Test empty range
+  ByteRange emptyRange(nullptr, nullptr);
+  EXPECT_EQ(emptyRange.toString(), "");
+
+  // Test range with subset of data
+  ByteRange subRange(data, 5);
+  EXPECT_EQ(subRange.toString(), "Hello");
+
+  // Test range constructed with begin/end pointers
+  ByteRange pointerRange(data, data + 7);
+  EXPECT_EQ(pointerRange.toString(), "Hello, ");
+
+  // Test StringPiece (Range<const char*>) to string
+  const char* strData = "StringPiece test";
+  StringPiece strPiece(strData, 11);
+  EXPECT_EQ(strPiece.toString(), "StringPiece");
+
+  // Test with binary data (including null bytes)
+  const uint8_t binaryData[] = {
+      0x48, 0x65, 0x6C, 0x6C, 0x6F, 0x00, 0x57, 0x6F, 0x72, 0x6C, 0x64};
+  ByteRange binaryRange(binaryData, 11);
+  std::string expectedBinary =
+      std::string(reinterpret_cast<const char*>(binaryData), 11);
+  EXPECT_EQ(binaryRange.toString(), expectedBinary);
+  EXPECT_EQ(binaryRange.toString().size(), 11); // Should include the null byte
+}
+
+TEST(QuicBufferTest, TestToStringSingleBuffer) {
+  // Create a single buffer with headroom and tailroom
+  const std::string kData = "hello";
+  auto buf = QuicBuffer::copyBuffer(kData, 3 /* headroom */, 4 /* tailroom */);
+
+  // Capture state before toString()
+  auto* dataPtrBefore = buf->data();
+  auto headroomBefore = buf->headroom();
+  auto tailroomBefore = buf->tailroom();
+  auto lengthBefore = buf->length();
+
+  // Convert to string
+  auto out = buf->toString();
+  EXPECT_EQ(out, kData);
+
+  // Verify buffer is unchanged
+  EXPECT_EQ(buf->data(), dataPtrBefore);
+  EXPECT_EQ(buf->headroom(), headroomBefore);
+  EXPECT_EQ(buf->tailroom(), tailroomBefore);
+  EXPECT_EQ(buf->length(), lengthBefore);
+  EXPECT_FALSE(buf->isChained());
+}
+
+TEST(QuicBufferTest, TestToStringChain) {
+  // Create a chain: "hello" + " world" + "!!!" => "hello world!!!"
+  auto b1 = QuicBuffer::copyBuffer(std::string("hello"), 5 /* headroom */, 0);
+  auto b2 = QuicBuffer::copyBuffer(std::string(" world"), 0, 0);
+  auto b3 = QuicBuffer::copyBuffer(std::string("!!!"), 0, 15 /* tailroom */);
+
+  auto headroomFirstBefore = b1->headroom();
+  auto tailroomLastBefore = b3->tailroom();
+
+  b1->appendToChain(std::move(b2));
+  b1->appendToChain(std::move(b3));
+
+  // Sanity checks
+  EXPECT_TRUE(b1->isChained());
+  EXPECT_EQ(b1->computeChainDataLength(), 14);
+
+  // Capture ring pointers after chain is formed
+  auto* b1NextBefore = b1->next();
+  auto* b1PrevBefore = b1->prev();
+
+  // Convert to string
+  auto out = b1->toString();
+  EXPECT_EQ(out, std::string("hello world!!!"));
+
+  // Verify chain structure and buffer metadata unchanged
+  EXPECT_TRUE(b1->isChained());
+  EXPECT_EQ(b1->headroom(), headroomFirstBefore);
+  EXPECT_EQ(b1->prev()->tailroom(), tailroomLastBefore);
+  EXPECT_EQ(b1->computeChainDataLength(), 14);
+
+  // Verify next/prev still form a ring and head unchanged
+  EXPECT_EQ(b1->next(), b1NextBefore);
+  EXPECT_EQ(b1->prev(), b1PrevBefore);
+}
+
+TEST(QuicBufferTest, TestToStringWithEmptyBuffers) {
+  // Chain with empty buffers interleaved
+  auto b1 = QuicBuffer::copyBuffer(std::string("hello"), 3 /* headroom */, 0);
+  auto bEmpty1 = QuicBuffer::create(50); // empty
+  auto b2 = QuicBuffer::copyBuffer(std::string(" world"), 0, 0);
+  auto bEmpty2 = QuicBuffer::create(50); // empty
+  auto b3 = QuicBuffer::copyBuffer(std::string("!"), 0, 12 /* tailroom */);
+
+  b1->appendToChain(std::move(bEmpty1));
+  b1->appendToChain(std::move(b2));
+  b1->appendToChain(std::move(bEmpty2));
+  b1->appendToChain(std::move(b3));
+
+  auto totalBefore = b1->computeChainDataLength();
+  EXPECT_EQ(totalBefore, 12); // "hello world!" => 12 chars
+
+  auto out = b1->toString();
+  EXPECT_EQ(out, std::string("hello world!"));
+
+  // Verify unchanged
+  EXPECT_EQ(b1->computeChainDataLength(), totalBefore);
+  EXPECT_TRUE(b1->isChained());
+}
+
+TEST(QuicBufferTest, TestToStringAllEmpty) {
+  auto b1 = QuicBuffer::create(10);
+  auto b2 = QuicBuffer::create(10);
+  auto b3 = QuicBuffer::create(10);
+
+  b1->appendToChain(std::move(b2));
+  b1->appendToChain(std::move(b3));
+
+  EXPECT_TRUE(b1->empty());
+  EXPECT_EQ(b1->computeChainDataLength(), 0);
+
+  auto out = b1->toString();
+  EXPECT_TRUE(out.empty());
+
+  // Chain still intact and empty
+  EXPECT_TRUE(b1->empty());
+  EXPECT_TRUE(b1->isChained());
+  EXPECT_EQ(b1->computeChainDataLength(), 0);
+}
+
+TEST(QuicBufferTest, TestWrapIovEmpty) {
+  // Test with empty iovec array (count = 0)
+  struct iovec vec[1];
+  auto buf = QuicBuffer::wrapIov(vec, 0);
+
+  ASSERT_NE(buf, nullptr);
+  EXPECT_EQ(buf->length(), 0);
+  EXPECT_FALSE(buf->isChained());
+}
+
+TEST(QuicBufferTest, TestWrapIovSingle) {
+  // Test with a single iovec containing data
+  const char* data = "hello world";
+  struct iovec vec[1];
+  vec[0].iov_base = (void*)data;
+  vec[0].iov_len = 11;
+
+  auto buf = QuicBuffer::wrapIov(vec, 1);
+
+  ASSERT_NE(buf, nullptr);
+  EXPECT_EQ(buf->length(), 11);
+  EXPECT_FALSE(buf->isChained());
+  EXPECT_EQ(memcmp(buf->data(), data, 11), 0);
+}
+
+TEST(QuicBufferTest, TestWrapIovMultiple) {
+  // Test with multiple iovecs containing data
+  const char* data1 = "hello";
+  const char* data2 = " ";
+  const char* data3 = "world";
+
+  struct iovec vec[3];
+  vec[0].iov_base = (void*)data1;
+  vec[0].iov_len = 5;
+  vec[1].iov_base = (void*)data2;
+  vec[1].iov_len = 1;
+  vec[2].iov_base = (void*)data3;
+  vec[2].iov_len = 5;
+
+  auto buf = QuicBuffer::wrapIov(vec, 3);
+
+  ASSERT_NE(buf, nullptr);
+  EXPECT_TRUE(buf->isChained());
+  EXPECT_EQ(buf->countChainElements(), 3);
+  EXPECT_EQ(buf->computeChainDataLength(), 11);
+
+  // Verify each buffer in the chain
+  EXPECT_EQ(buf->length(), 5);
+  EXPECT_EQ(memcmp(buf->data(), "hello", 5), 0);
+
+  EXPECT_EQ(buf->next()->length(), 1);
+  EXPECT_EQ(memcmp(buf->next()->data(), " ", 1), 0);
+
+  EXPECT_EQ(buf->next()->next()->length(), 5);
+  EXPECT_EQ(memcmp(buf->next()->next()->data(), "world", 5), 0);
+}
+
+TEST(QuicBufferTest, TestWrapIovWithZeroLengthIovecs) {
+  // Test with iovecs that have zero length (should be skipped)
+  const char* data1 = "hello";
+  const char* data2 = "world";
+
+  struct iovec vec[4];
+  vec[0].iov_base = (void*)data1;
+  vec[0].iov_len = 5;
+  vec[1].iov_base = nullptr;
+  vec[1].iov_len = 0; // zero length, should be skipped
+  vec[2].iov_base = (void*)data2;
+  vec[2].iov_len = 5;
+  vec[3].iov_base = nullptr;
+  vec[3].iov_len = 0; // zero length, should be skipped
+
+  auto buf = QuicBuffer::wrapIov(vec, 4);
+
+  ASSERT_NE(buf, nullptr);
+  EXPECT_TRUE(buf->isChained());
+  // Should only have 2 elements since zero-length iovecs are skipped
+  EXPECT_EQ(buf->countChainElements(), 2);
+  EXPECT_EQ(buf->computeChainDataLength(), 10);
+
+  EXPECT_EQ(buf->length(), 5);
+  EXPECT_EQ(memcmp(buf->data(), "hello", 5), 0);
+
+  EXPECT_EQ(buf->next()->length(), 5);
+  EXPECT_EQ(memcmp(buf->next()->data(), "world", 5), 0);
+}
+
+TEST(QuicBufferTest, TestWrapIovAllZeroLength) {
+  // Test with all iovecs having zero length
+  struct iovec vec[3];
+  vec[0].iov_base = nullptr;
+  vec[0].iov_len = 0;
+  vec[1].iov_base = nullptr;
+  vec[1].iov_len = 0;
+  vec[2].iov_base = nullptr;
+  vec[2].iov_len = 0;
+
+  auto buf = QuicBuffer::wrapIov(vec, 3);
+
+  // Should return a zero-length buffer, not nullptr
+  ASSERT_NE(buf, nullptr);
+  EXPECT_EQ(buf->length(), 0);
+  EXPECT_FALSE(buf->isChained());
+}
+
+TEST(QuicBufferTest, TestWrapIovChainIntegrity) {
+  // Test that the chain is properly formed with correct next/prev pointers
+  const char* data1 = "A";
+  const char* data2 = "B";
+  const char* data3 = "C";
+
+  struct iovec vec[3];
+  vec[0].iov_base = (void*)data1;
+  vec[0].iov_len = 1;
+  vec[1].iov_base = (void*)data2;
+  vec[1].iov_len = 1;
+  vec[2].iov_base = (void*)data3;
+  vec[2].iov_len = 1;
+
+  auto buf = QuicBuffer::wrapIov(vec, 3);
+
+  ASSERT_NE(buf, nullptr);
+
+  QuicBuffer* first = buf.get();
+  QuicBuffer* second = first->next();
+  QuicBuffer* third = second->next();
+
+  // Verify forward chain
+  EXPECT_EQ(third->next(), first);
+
+  // Verify backward chain
+  EXPECT_EQ(first->prev(), third);
+  EXPECT_EQ(second->prev(), first);
+  EXPECT_EQ(third->prev(), second);
+}
+
+TEST(QuicBufferTest, TestPrepend) {
+  // Create a buffer with headroom
+  const uint8_t* data = (const uint8_t*)"hello";
+  auto quicBuffer = QuicBuffer::copyBuffer(data, 5, 10, 0);
+
+  EXPECT_EQ(quicBuffer->length(), 5);
+  EXPECT_EQ(quicBuffer->headroom(), 10);
+  EXPECT_EQ(memcmp(quicBuffer->data(), "hello", 5), 0);
+
+  const uint8_t* originalData = quicBuffer->data();
+
+  // Prepend 3 bytes
+  quicBuffer->prepend(3);
+
+  // After prepend:
+  // - data pointer should move backward by 3
+  // - length should increase by 3
+  // - original data should still be accessible at offset 3
+  EXPECT_EQ(quicBuffer->data(), originalData - 3);
+  EXPECT_EQ(quicBuffer->length(), 8);
+  EXPECT_EQ(quicBuffer->headroom(), 7);
+  EXPECT_EQ(memcmp(quicBuffer->data() + 3, "hello", 5), 0);
+}
+
+TEST(QuicBufferTest, TestPrependWithDataPopulation) {
+  // Create a buffer with headroom
+  const uint8_t* data = (const uint8_t*)"world";
+  auto quicBuffer = QuicBuffer::copyBuffer(data, 5, 6, 0);
+
+  EXPECT_EQ(quicBuffer->length(), 5);
+  EXPECT_EQ(quicBuffer->headroom(), 6);
+
+  // Prepend 6 bytes and populate with "hello "
+  quicBuffer->prepend(6);
+
+  // Write data into the prepended space
+  memcpy(quicBuffer->writableData(), "hello ", 6);
+
+  // Now the buffer should contain "hello world"
+  EXPECT_EQ(quicBuffer->length(), 11);
+  EXPECT_EQ(memcmp(quicBuffer->data(), "hello world", 11), 0);
+}
+
+TEST(QuicBufferTest, TestPrependZeroBytes) {
+  // Create a buffer with headroom
+  const uint8_t* data = (const uint8_t*)"test";
+  auto quicBuffer = QuicBuffer::copyBuffer(data, 4, 5, 0);
+
+  const uint8_t* originalData = quicBuffer->data();
+  std::size_t originalLength = quicBuffer->length();
+  std::size_t originalHeadroom = quicBuffer->headroom();
+
+  // Prepend 0 bytes should not change anything
+  quicBuffer->prepend(0);
+
+  EXPECT_EQ(quicBuffer->data(), originalData);
+  EXPECT_EQ(quicBuffer->length(), originalLength);
+  EXPECT_EQ(quicBuffer->headroom(), originalHeadroom);
+  EXPECT_EQ(memcmp(quicBuffer->data(), "test", 4), 0);
+}
+
+TEST(QuicBufferTest, TestPrependInsufficientHeadroom) {
+  // Create a buffer with limited headroom
+  const uint8_t* data = (const uint8_t*)"hello";
+  auto quicBuffer = QuicBuffer::copyBuffer(data, 5, 3, 0);
+
+  EXPECT_EQ(quicBuffer->headroom(), 3);
+
+  // Attempting to prepend more than available headroom should fail
+  EXPECT_DEATH(quicBuffer->prepend(5), "");
+}
+
+TEST(QuicBufferTest, TestPrependMultipleTimes) {
+  // Create a buffer with ample headroom
+  const uint8_t* data = (const uint8_t*)"end";
+  auto quicBuffer = QuicBuffer::copyBuffer(data, 3, 10, 0);
+
+  const uint8_t* originalData = quicBuffer->data();
+
+  // First prepend
+  quicBuffer->prepend(5);
+  memcpy(quicBuffer->writableData(), "start", 5);
+  EXPECT_EQ(quicBuffer->length(), 8);
+  EXPECT_EQ(quicBuffer->data(), originalData - 5);
+
+  // Second prepend
+  quicBuffer->prepend(2);
+  memcpy(quicBuffer->writableData(), ">>", 2);
+  EXPECT_EQ(quicBuffer->length(), 10);
+  EXPECT_EQ(quicBuffer->data(), originalData - 7);
+
+  // Verify final content: ">>startend"
+  EXPECT_EQ(memcmp(quicBuffer->data(), ">>startend", 10), 0);
+}
+
+TEST(QuicBufferTest, TestPrependExhaustHeadroom) {
+  // Create a buffer with specific headroom
+  const uint8_t* data = (const uint8_t*)"data";
+  auto quicBuffer = QuicBuffer::copyBuffer(data, 4, 8, 0);
+
+  EXPECT_EQ(quicBuffer->headroom(), 8);
+
+  // Prepend exactly all available headroom
+  quicBuffer->prepend(8);
+
+  EXPECT_EQ(quicBuffer->length(), 12);
+  EXPECT_EQ(quicBuffer->headroom(), 0);
+
+  // Verify original data is still intact at the end
+  EXPECT_EQ(memcmp(quicBuffer->data() + 8, "data", 4), 0);
+}
+
 } // namespace quic

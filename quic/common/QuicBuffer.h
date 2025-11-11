@@ -24,6 +24,8 @@ class QuicBuffer {
     CREATE = 0,
   };
 
+  QuicBuffer() : next_(this), prev_(this) {}
+
   explicit QuicBuffer(std::size_t capacity);
 
   // Same as the previous constructor, just added the CreateOp
@@ -85,6 +87,12 @@ class QuicBuffer {
       FreeFunction freeFn = nullptr,
       void* userData = nullptr);
 
+  // Convert an iovec array into a QuicBuffer chain.
+  // Wraps a number of iovecs into a QuicBuffer chain. If count == 0 or all
+  // iovecs have zero length, returns a zero-length buffer. This function never
+  // returns nullptr.
+  static std::unique_ptr<QuicBuffer> wrapIov(const iovec* vec, size_t count);
+
   static QuicBuffer wrapBufferAsValue(
       const void* buf,
       std::size_t capacity) noexcept;
@@ -107,6 +115,8 @@ class QuicBuffer {
   void append(std::size_t amount) noexcept {
     length_ += amount;
   }
+
+  void prepend(std::size_t amount) noexcept;
 
   [[nodiscard]] std::size_t length() const noexcept {
     return length_;
@@ -216,6 +226,11 @@ class QuicBuffer {
   };
 
   FillIovResult fillIov(struct iovec* iov, size_t len) const;
+
+  /**
+   * Non-destructively convert this QuicBuffer chain into a std::string.
+   */
+  std::string toString() const;
 
   void clear() noexcept;
 

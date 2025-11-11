@@ -731,17 +731,18 @@ TEST_F(QuicPacketBuilderTest, RetryPacketValid) {
   cursor.tryPull(retryTokenObtained->writableData(), retryTokenLen);
   retryTokenObtained->append(retryTokenLen);
 
-  std::string retryTokenObtainedString = retryTokenObtained->to<std::string>();
+  std::string retryTokenObtainedString = retryTokenObtained->toString();
   EXPECT_EQ(retryTokenObtainedString, retryToken);
 
   // integrity tag
   BufPtr integrityTagObtained = BufHelpers::create(kRetryIntegrityTagLen);
   cursor.tryPull(integrityTagObtained->writableData(), kRetryIntegrityTagLen);
   integrityTagObtained->append(kRetryIntegrityTagLen);
-  EXPECT_TRUE(folly::IOBufEqualTo()(
-      *integrityTagObtained,
-      folly::IOBuf::wrapBufferAsValue(
-          integrityTag.data(), integrityTag.size())));
+  EXPECT_TRUE(
+      folly::IOBufEqualTo()(
+          *integrityTagObtained,
+          folly::IOBuf::wrapBufferAsValue(
+              integrityTag.data(), integrityTag.size())));
 }
 
 TEST_F(QuicPacketBuilderTest, RetryPacketGiganticToken) {

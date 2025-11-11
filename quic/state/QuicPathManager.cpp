@@ -32,7 +32,7 @@ quic::Expected<PathIdType, QuicError> QuicPathManager::addPath(
   }
 
   if (pathIdToInfo_.size() >= kMaxPathCount) {
-    maybeReapUnusedPaths();
+    maybeReapUnusedPaths(/* force= */ true);
     if (pathIdToInfo_.size() >= kMaxPathCount) {
       return quic::make_unexpected(
           QuicError(LocalErrorCode::PATH_MANAGER_ERROR, "Too many paths"));
@@ -99,6 +99,10 @@ quic::Expected<void, QuicError> QuicPathManager::removePath(PathIdType pathId) {
 
   if (it->second.socket) {
     it->second.socket->pauseRead();
+  }
+
+  if (it->second.destinationConnectionId) {
+    conn_.retirePeerConnectionId(it->second.destinationConnectionId.value());
   }
 
   pathTupleToId_.erase({it->second.localAddress, it->second.peerAddress});
@@ -226,13 +230,15 @@ void QuicPathManager::onPathChallengeSent(
 
 const PathInfo* QuicPathManager::onPathResponseReceived(
     const PathResponseFrame& pathResponse,
-    PathIdType incomingPathId) {
+    PathIdType /*incomingPathId*/) {
   auto maybePath = getPathByChallengeDataImpl(pathResponse.pathData);
-  if (!maybePath || maybePath->id != incomingPathId) {
+  if (!maybePath) {
     // We can ignore this path response. This is either:
     // - a duplicate response
     // - a response from a path that was has timed out and failed validation.
-    // - a response that was received on the wrong path
+    // Note that it's ok to receive a path response on a path other than the one
+    // we sent the challenge on. See
+    // https://www.rfc-editor.org/rfc/rfc9000.html#section-8.2.2
     return nullptr;
   }
   auto& path = *maybePath;
@@ -446,9 +452,26 @@ QuicPathManager::switchCurrentPath(PathIdType switchToPathId) {
   }
   auto& switchToPath = it->second;
 
+  auto switchFromPathId = conn_.currentPathId;
   conn_.currentPathId = switchToPath.id;
   conn_.localAddress = switchToPath.localAddress;
   conn_.peerAddress = switchToPath.peerAddress;
+
+  if (switchToPath.destinationConnectionId) {
+    auto& destinationConnectionId = conn_.nodeType == QuicNodeType::Client
+        ? conn_.serverConnectionId
+        : conn_.clientConnectionId;
+    CHECK(destinationConnectionId)
+        << "Connection ID not initialized for active connection";
+    // Cache the current destination CID for the path we are switching away
+    // from. This will be retired when the path is removed.
+    auto setCidRes =
+        setDestinationCidForPath(switchFromPathId, *destinationConnectionId);
+    CHECK(!setCidRes.hasError()) << setCidRes.error();
+
+    destinationConnectionId = *switchToPath.destinationConnectionId;
+    switchToPath.destinationConnectionId.reset();
+  }
 
   return std::move(switchToPath.socket);
 }
@@ -484,7 +507,7 @@ void QuicPathManager::maybeReapUnusedPaths(bool force) {
     }
     if (!force && it.second.pathValidationTime &&
         (Clock::now() - it.second.pathValidationTime.value()) <
-            kTimeToRetainUnusedPaths) {
+            kTimeToRetainOldPaths) {
       continue;
     }
     if (it.first < minPathId) {
@@ -496,6 +519,85 @@ void QuicPathManager::maybeReapUnusedPaths(bool force) {
     auto removeResult = removePath(minPathId);
     CHECK(!removeResult.hasError()) << removeResult.error();
   }
+}
+
+quic::Expected<void, QuicError> QuicPathManager::addSocketToPath(
+    PathIdType pathId,
+    std::unique_ptr<QuicAsyncUDPSocket> socket) {
+  auto it = pathIdToInfo_.find(pathId);
+  if (it == pathIdToInfo_.end()) {
+    return quic::make_unexpected(QuicError(
+        LocalErrorCode::PATH_NOT_EXISTS,
+        std::string("Could not add socket for non-existent path id")));
+  }
+  if (pathId == conn_.currentPathId) {
+    return quic::make_unexpected(QuicError(
+        LocalErrorCode::PATH_MANAGER_ERROR,
+        std::string("Cannot add socket for current connection path")));
+  }
+
+  it->second.socket = std::move(socket);
+  return {};
+}
+
+Expected<void, QuicError> QuicPathManager::assignDestinationCidForPath(
+    PathIdType pathId) {
+  if (pathId == conn_.currentPathId) {
+    return quic::make_unexpected(QuicError(
+        LocalErrorCode::PATH_MANAGER_ERROR,
+        std::string("Cannot update destination CID for current path")));
+  }
+
+  auto it = pathIdToInfo_.find(pathId);
+  if (it == pathIdToInfo_.end()) {
+    return quic::make_unexpected(QuicError(
+        LocalErrorCode::PATH_NOT_EXISTS,
+        std::string("Cannot update destination CID for non-existent path id")));
+  }
+  auto& path = it->second;
+  Optional<ConnectionId> cidToRetire;
+  if (path.destinationConnectionId) {
+    // This path already has a destination CID. Retire it after we assign a new
+    // one.
+    cidToRetire = *path.destinationConnectionId;
+  }
+
+  auto nextCidResult = conn_.getNextAvailablePeerConnectionId();
+  if (nextCidResult.hasError()) {
+    return quic::make_unexpected(nextCidResult.error());
+  }
+  path.destinationConnectionId = nextCidResult.value();
+
+  VLOG(4) << "Assigned destination CID=" << *path.destinationConnectionId
+          << " for path=" << path.id;
+
+  if (cidToRetire) {
+    conn_.retirePeerConnectionId(*cidToRetire);
+  }
+
+  return {};
+}
+
+Expected<void, QuicError> QuicPathManager::setDestinationCidForPath(
+    PathIdType pathId,
+    ConnectionId cid) {
+  auto it = pathIdToInfo_.find(pathId);
+  if (it == pathIdToInfo_.end()) {
+    return quic::make_unexpected(QuicError(
+        LocalErrorCode::PATH_NOT_EXISTS,
+        std::string("Cannot update destination CID for non-existent path id")));
+  }
+  auto& path = it->second;
+  if (path.destinationConnectionId &&
+      path.destinationConnectionId.value() != cid) {
+    // This path already has a different destination CID. Retire it as we set
+    // the new one.
+    conn_.retirePeerConnectionId(*path.destinationConnectionId);
+  }
+
+  path.destinationConnectionId = cid;
+
+  return {};
 }
 
 } // namespace quic

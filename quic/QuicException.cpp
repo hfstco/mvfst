@@ -120,11 +120,17 @@ folly::StringPiece toString(LocalErrorCode code) {
       return "Pacer not available";
     case LocalErrorCode::RTX_POLICIES_LIMIT_EXCEEDED:
       return "Retransmission policies limit exceeded";
-    default:
-      break;
+    case LocalErrorCode::CONGESTION_CONTROL_ERROR:
+      return "Congestion control error";
+    case LocalErrorCode::PATH_NOT_EXISTS:
+      return "Path does not exist";
+    case LocalErrorCode::PATH_MANAGER_ERROR:
+      return "Path manager error";
+    case LocalErrorCode::NO_AVAILABLE_CID:
+      return "No available connection ids";
+    case quic::LocalErrorCode::MIGRATION_FAILED:
+      return "Migration failed";
   }
-  LOG(WARNING) << "toString has unhandled ErrorCode";
-  return "Unknown error";
 }
 
 std::string toString(TransportErrorCode code) {

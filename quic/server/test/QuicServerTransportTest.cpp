@@ -66,6 +66,12 @@ class QuicServerTransportTest : public QuicServerTransportAfterStartTestBase {
   auto getTxMatcher(StreamId id, uint64_t offset) {
     return MockByteEventCallback::getTxMatcher(id, offset);
   }
+
+  uint16_t getSkipOneInNPacketSequenceNumber() override {
+    // Disable packet number skipping to make it easier to ack ranges in this
+    // test class.
+    return 0;
+  }
 };
 
 TEST_F(QuicServerTransportTest, TestReadMultipleStreams) {
@@ -857,8 +863,9 @@ TEST_F(QuicServerTransportTest, RecvRstStreamFrame) {
   stream->retransmissionBuffer.emplace(
       std::piecewise_construct,
       std::forward_as_tuple(0),
-      std::forward_as_tuple(std::make_unique<WriteStreamBuffer>(
-          ChainedByteRangeHead(wordsBuf2), 0, false)));
+      std::forward_as_tuple(
+          std::make_unique<WriteStreamBuffer>(
+              ChainedByteRangeHead(wordsBuf2), 0, false)));
   ASSERT_FALSE(
       writeDataToQuicStream(*stream, IOBuf::copyBuffer(words.at(3)), false)
           .hasError());
@@ -948,8 +955,9 @@ TEST_F(QuicServerTransportTest, RecvStopSendingFrame) {
   stream->retransmissionBuffer.emplace(
       std::piecewise_construct,
       std::forward_as_tuple(0),
-      std::forward_as_tuple(std::make_unique<WriteStreamBuffer>(
-          ChainedByteRangeHead(wordsBuf2), 0, false)));
+      std::forward_as_tuple(
+          std::make_unique<WriteStreamBuffer>(
+              ChainedByteRangeHead(wordsBuf2), 0, false)));
   stream->writeBuffer.append(IOBuf::copyBuffer(words.at(3)));
   stream->currentWriteOffset = words.at(2).length() + words.at(3).length();
   stream->currentReadOffset = words.at(0).length() + words.at(1).length();
@@ -997,8 +1005,9 @@ TEST_F(QuicServerTransportTest, RecvStopSendingFrameAfterCloseStream) {
   stream->retransmissionBuffer.emplace(
       std::piecewise_construct,
       std::forward_as_tuple(0),
-      std::forward_as_tuple(std::make_unique<WriteStreamBuffer>(
-          ChainedByteRangeHead(wordsBuf2), 0, false)));
+      std::forward_as_tuple(
+          std::make_unique<WriteStreamBuffer>(
+              ChainedByteRangeHead(wordsBuf2), 0, false)));
   stream->writeBuffer.append(IOBuf::copyBuffer(words.at(3)));
   stream->currentWriteOffset = words.at(2).length() + words.at(3).length();
   stream->currentReadOffset = words.at(0).length() + words.at(1).length();
@@ -1048,8 +1057,9 @@ TEST_F(QuicServerTransportTest, RecvInvalidMaxStreamData) {
   stream->retransmissionBuffer.emplace(
       std::piecewise_construct,
       std::forward_as_tuple(0),
-      std::forward_as_tuple(std::make_unique<WriteStreamBuffer>(
-          ChainedByteRangeHead(wordsBuf2), 0, false)));
+      std::forward_as_tuple(
+          std::make_unique<WriteStreamBuffer>(
+              ChainedByteRangeHead(wordsBuf2), 0, false)));
   stream->writeBuffer.append(IOBuf::copyBuffer(words.at(3)));
   stream->currentWriteOffset = words.at(2).length() + words.at(3).length();
   stream->currentReadOffset = words.at(0).length() + words.at(1).length();
@@ -1094,8 +1104,9 @@ TEST_F(QuicServerTransportTest, RecvStopSendingFrameAfterHalfCloseRemote) {
   stream->retransmissionBuffer.emplace(
       std::piecewise_construct,
       std::forward_as_tuple(0),
-      std::forward_as_tuple(std::make_unique<WriteStreamBuffer>(
-          ChainedByteRangeHead(wordsBuf2), 0, false)));
+      std::forward_as_tuple(
+          std::make_unique<WriteStreamBuffer>(
+              ChainedByteRangeHead(wordsBuf2), 0, false)));
   stream->writeBuffer.append(IOBuf::copyBuffer(words.at(3)));
   stream->currentWriteOffset = words.at(2).length() + words.at(3).length();
   stream->currentReadOffset = words.at(0).length() + words.at(1).length();
@@ -1183,8 +1194,9 @@ TEST_F(QuicServerTransportTest, RecvStopSendingFrameAfterReset) {
   stream1->retransmissionBuffer.emplace(
       std::piecewise_construct,
       std::forward_as_tuple(0),
-      std::forward_as_tuple(std::make_unique<WriteStreamBuffer>(
-          ChainedByteRangeHead(wordsBuf2), 0, false)));
+      std::forward_as_tuple(
+          std::make_unique<WriteStreamBuffer>(
+              ChainedByteRangeHead(wordsBuf2), 0, false)));
   stream1->writeBuffer.append(IOBuf::copyBuffer(words.at(3)));
   stream1->currentWriteOffset = words.at(2).length() + words.at(3).length();
   stream1->currentReadOffset = words.at(0).length() + words.at(1).length();
@@ -1198,8 +1210,9 @@ TEST_F(QuicServerTransportTest, RecvStopSendingFrameAfterReset) {
   stream2->retransmissionBuffer.emplace(
       std::piecewise_construct,
       std::forward_as_tuple(0),
-      std::forward_as_tuple(std::make_unique<WriteStreamBuffer>(
-          ChainedByteRangeHead(wordsBuf2), 0, false)));
+      std::forward_as_tuple(
+          std::make_unique<WriteStreamBuffer>(
+              ChainedByteRangeHead(wordsBuf2), 0, false)));
   stream2->writeBuffer.append(IOBuf::copyBuffer(words.at(3)));
   stream2->currentWriteOffset = words.at(2).length() + words.at(3).length();
   stream2->currentReadOffset = words.at(0).length() + words.at(1).length();
@@ -1811,76 +1824,14 @@ TEST_F(
     deliverData(std::move(packetData), true, &newPeer);
     FAIL();
   } catch (const std::runtime_error& ex) {
-    EXPECT_EQ(std::string(ex.what()), "Invalid migration");
+    EXPECT_EQ(
+        std::string(ex.what()),
+        "TransportError: Invalid migration, Migration disabled");
   }
   EXPECT_TRUE(server->getConn().localConnectionError);
   EXPECT_EQ(
       server->getConn().localConnectionError->message, "Migration disabled");
   EXPECT_EQ(server->getConn().streamManager->streamCount(), 0);
-}
-
-TEST_F(QuicServerTransportTest, SwitchServerCidsNoOtherIds) {
-  auto& conn = server->getNonConstConn();
-
-  EXPECT_EQ(conn.retireAndSwitchPeerConnectionIds(), false);
-  EXPECT_EQ(conn.pendingEvents.frames.size(), 0);
-  EXPECT_EQ(conn.peerConnectionIds.size(), 1);
-}
-
-TEST_F(QuicServerTransportTest, SwitchServerCidsOneOtherCid) {
-  auto& conn = server->getNonConstConn();
-  auto originalCid = conn.clientConnectionId;
-  auto secondCid = ConnectionIdData(
-      ConnectionId::createAndMaybeCrash(std::vector<uint8_t>{5, 6, 7, 8}), 2);
-  conn.peerConnectionIds.push_back(secondCid);
-
-  EXPECT_EQ(conn.retireAndSwitchPeerConnectionIds(), true);
-  EXPECT_EQ(conn.peerConnectionIds.size(), 1);
-
-  EXPECT_EQ(conn.pendingEvents.frames.size(), 1);
-  auto retireFrame = conn.pendingEvents.frames[0].asRetireConnectionIdFrame();
-  EXPECT_EQ(retireFrame->sequenceNumber, 0);
-
-  auto replacedCid = conn.clientConnectionId;
-  EXPECT_NE(originalCid, *replacedCid);
-  EXPECT_EQ(secondCid.connId, *replacedCid);
-}
-
-TEST_F(QuicServerTransportTest, SwitchServerCidsMultipleCids) {
-  auto& conn = server->getNonConstConn();
-  auto originalCid = conn.clientConnectionId;
-  auto secondCid = ConnectionIdData(
-      ConnectionId::createAndMaybeCrash(std::vector<uint8_t>{5, 6, 7, 8}), 2);
-  auto thirdCid = ConnectionIdData(
-      ConnectionId::createAndMaybeCrash(std::vector<uint8_t>{3, 3, 3, 3}), 3);
-
-  conn.peerConnectionIds.push_back(secondCid);
-  conn.peerConnectionIds.push_back(thirdCid);
-
-  EXPECT_EQ(conn.retireAndSwitchPeerConnectionIds(), true);
-  EXPECT_EQ(conn.peerConnectionIds.size(), 2);
-
-  EXPECT_EQ(conn.pendingEvents.frames.size(), 1);
-  auto retireFrame = conn.pendingEvents.frames[0].asRetireConnectionIdFrame();
-  EXPECT_EQ(retireFrame->sequenceNumber, 0);
-
-  // Uses the first unused connection id.
-  auto replacedCid = conn.clientConnectionId;
-  EXPECT_NE(originalCid, *replacedCid);
-  EXPECT_EQ(secondCid.connId, *replacedCid);
-}
-
-TEST_F(
-    QuicServerTransportTest,
-    TestRetireAndSwitchPeerConnectionIdsEmptyPeerCid) {
-  auto& conn = server->getNonConstConn();
-
-  conn.clientConnectionId = ConnectionId::createZeroLength();
-  EXPECT_EQ(conn.peerConnectionIds.size(), 1);
-
-  EXPECT_EQ(conn.retireAndSwitchPeerConnectionIds(), true);
-  EXPECT_EQ(conn.pendingEvents.frames.size(), 0);
-  EXPECT_EQ(conn.peerConnectionIds.size(), 1);
 }
 
 TEST_F(QuicServerTransportTest, ShortHeaderPacketWithNoFrames) {
@@ -2646,7 +2597,9 @@ TEST_F(
   try {
     recvClientFinished(true, &newPeer);
   } catch (const std::runtime_error& ex) {
-    EXPECT_EQ(std::string(ex.what()), "Invalid migration");
+    EXPECT_EQ(
+        std::string(ex.what()),
+        "TransportError: Invalid migration, Migration not allowed during handshake");
   }
   EXPECT_TRUE(server->getConn().localConnectionError);
   EXPECT_EQ(
@@ -2706,7 +2659,9 @@ TEST_F(
   try {
     recvClientFinished(true, &newPeer);
   } catch (const std::runtime_error& ex) {
-    EXPECT_EQ(std::string(ex.what()), "Invalid migration");
+    EXPECT_EQ(
+        std::string(ex.what()),
+        "TransportError: Invalid migration, Migration not allowed during handshake");
   }
   EXPECT_TRUE(server->getConn().localConnectionError);
   EXPECT_EQ(
@@ -2873,7 +2828,9 @@ TEST_F(
   try {
     deliverData(std::move(packetData), true, &newPeer);
   } catch (const std::runtime_error& ex) {
-    EXPECT_EQ(std::string(ex.what()), "Invalid migration");
+    EXPECT_EQ(
+        std::string(ex.what()),
+        "TransportError: Invalid migration, Migration not allowed during handshake");
   }
   EXPECT_TRUE(server->getConn().localConnectionError);
   EXPECT_EQ(
@@ -2904,7 +2861,9 @@ TEST_F(
   try {
     recvClientFinished();
   } catch (const std::runtime_error& ex) {
-    EXPECT_EQ(std::string(ex.what()), "Invalid migration");
+    EXPECT_EQ(
+        std::string(ex.what()),
+        "TransportError: Invalid migration, Migration disabled");
   }
   EXPECT_TRUE(server->getConn().localConnectionError);
   EXPECT_EQ(
@@ -3436,9 +3395,8 @@ TEST_F(QuicUnencryptedServerTransportTest, TestSendHandshakeDoneNewTokenFrame) {
 
   auto clientReadNewTokenFrame = clientParsedFrame->asReadNewTokenFrame();
 
-  auto serverToken =
-      serverWriteNewTokenFrame.second[0]->token->to<std::string>();
-  auto clientToken = clientReadNewTokenFrame->token->to<std::string>();
+  auto serverToken = serverWriteNewTokenFrame.second[0]->token->toString();
+  auto clientToken = clientReadNewTokenFrame->token->toString();
 
   EXPECT_EQ(clientToken, serverToken);
   loopForWrites();
@@ -3913,8 +3871,9 @@ class QuicServerTransportHandshakeTest
               EXPECT_THAT(
                   appToken.sourceAddresses, ContainerEq(expectedSourceToken_));
 
-              EXPECT_TRUE(folly::IOBufEqualTo()(
-                  appToken.appParams, folly::IOBuf::copyBuffer(appParams)));
+              EXPECT_TRUE(
+                  folly::IOBufEqualTo()(
+                      appToken.appParams, folly::IOBuf::copyBuffer(appParams)));
               return {};
             }));
   }
@@ -4004,7 +3963,7 @@ TEST_F(QuicServerTransportTest, TestRegisterAndHandleTransportKnobParams) {
   int flag = 0;
   server->registerKnobParamHandler(
       199,
-      [&](QuicServerTransport* /* server_conn */,
+      [&](QuicServerTransport& /* server_conn */,
           TransportKnobParam::Val val) -> quic::Expected<void, QuicError> {
         EXPECT_EQ(std::get<uint64_t>(val), 10);
         flag = 1;
@@ -4012,7 +3971,7 @@ TEST_F(QuicServerTransportTest, TestRegisterAndHandleTransportKnobParams) {
       });
   server->registerKnobParamHandler(
       200,
-      [&](QuicServerTransport* /* server_conn */,
+      [&](QuicServerTransport& /* server_conn */,
           const TransportKnobParam::Val& /* val */)
           -> quic::Expected<void, QuicError> {
         flag = 2;
@@ -4028,7 +3987,7 @@ TEST_F(QuicServerTransportTest, TestRegisterAndHandleTransportKnobParams) {
   // overwrite will fail, the new handler won't be called
   server->registerKnobParamHandler(
       199,
-      [&](QuicServerTransport* /* server_conn */,
+      [&](QuicServerTransport& /* server_conn */,
           TransportKnobParam::Val val) -> quic::Expected<void, QuicError> {
         EXPECT_EQ(std::get<uint64_t>(val), 30);
         flag = 3;
@@ -4168,25 +4127,6 @@ TEST_F(QuicServerTransportTest, TestConnMigrationKnobHandler) {
       {{.id = static_cast<uint64_t>(TransportKnobParamId::CONNECTION_MIGRATION),
         .val = uint64_t(0)}});
   EXPECT_EQ(transportSettings.disableMigration, true);
-}
-
-TEST_F(QuicServerTransportTest, TestNewStreamBlockedConditionKnobHandler) {
-  auto& transportSettings = server->getNonConstConn().transportSettings;
-
-  // useNewStreamBlockedCondition is disabled by default
-  ASSERT_FALSE(transportSettings.useNewStreamBlockedCondition);
-
-  server->handleKnobParams(
-      {{.id = static_cast<uint64_t>(
-            TransportKnobParamId::USE_NEW_STREAM_BLOCKED_CONDITION),
-        .val = uint64_t(1)}});
-  EXPECT_TRUE(transportSettings.useNewStreamBlockedCondition);
-
-  server->handleKnobParams(
-      {{.id = static_cast<uint64_t>(
-            TransportKnobParamId::USE_NEW_STREAM_BLOCKED_CONDITION),
-        .val = uint64_t(0)}});
-  EXPECT_FALSE(transportSettings.useNewStreamBlockedCondition);
 }
 
 TEST_F(QuicServerTransportTest, TestAutotuneStreamFlowControlKnobHandler) {
@@ -4341,15 +4281,6 @@ TEST_F(QuicServerTransportTest, TestAckFrequencyPolicyKnobHandler) {
       HTTPPriorityQueue::Priority(
           server->getTransportSettings().defaultPriority),
       HTTPPriorityQueue::Priority(4, false));
-  server->handleKnobParams(
-      {{.id = static_cast<uint64_t>(
-            TransportKnobParamId::WRITE_LOOP_TIME_FRACTION),
-        .val = uint64_t(2)}});
-  EXPECT_EQ(server->getTransportSettings().writeLimitRttFraction, 2);
-  server->handleKnobParams(
-      {{.id = static_cast<uint64_t>(TransportKnobParamId::WRITES_PER_STREAM),
-        .val = uint64_t(5)}});
-  EXPECT_EQ(server->getTransportSettings().priorityQueueWritesPerStream, 5);
 }
 
 TEST_F(QuicServerTransportTest, TestSetMaxPacingRateLifecycle) {

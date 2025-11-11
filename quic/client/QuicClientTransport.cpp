@@ -34,8 +34,10 @@ void QuicClientTransport::onNotifyDataAvailable(
     QuicAsyncUDPSocket& sock) noexcept {
   auto self = this->shared_from_this();
   CHECK(conn_) << "trying to receive packets without a connection";
-  auto readBufferSize =
-      conn_->transportSettings.maxRecvPacketSize * numGROBuffers_;
+  auto readBufferSize = std::max(
+                            conn_->transportSettings.maxRecvPacketSize,
+                            uint64_t(kDefaultUDPReadBufferSize)) *
+      numGROBuffers_;
   const uint16_t numPackets = conn_->transportSettings.maxRecvBatchSize;
 
   const size_t readAllocSize =
@@ -104,10 +106,11 @@ quic::Expected<void, QuicError> QuicClientTransport::readWithRecvmmsgWrapper(
         if (conn_->loopDetectorCallback) {
           conn_->readDebugState.noReadReason = NoReadReason::NONRETRIABLE_ERROR;
         }
-        onReadError(folly::AsyncSocketException(
-            folly::AsyncSocketException::INTERNAL_ERROR,
-            "::recvmmsg() failed",
-            errno));
+        onReadError(
+            folly::AsyncSocketException(
+                folly::AsyncSocketException::INTERNAL_ERROR,
+                "::recvmmsg() failed",
+                errno));
         break;
       case NoReadReason::READ_OK:
       case NoReadReason::EMPTY_DATA:

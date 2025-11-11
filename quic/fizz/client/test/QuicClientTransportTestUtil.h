@@ -581,13 +581,14 @@ class QuicClientTransportTestBase : public virtual testing::Test {
     client->addNewPeerAddress(serverAddr);
     client->setHostname(hostname_);
     ON_CALL(*sock, write(testing::_, testing::_, testing::_))
-        .WillByDefault(testing::Invoke([&](const folly::SocketAddress&,
-                                           const struct iovec* vec,
-                                           size_t iovec_len) {
-          socketWrites.push_back(
-              copyChain(folly::IOBuf::wrapIov(vec, iovec_len)));
-          return getTotalIovecLen(vec, iovec_len);
-        }));
+        .WillByDefault(
+            testing::Invoke([&](const folly::SocketAddress&,
+                                const struct iovec* vec,
+                                size_t iovec_len) {
+              socketWrites.push_back(
+                  copyChain(folly::IOBuf::wrapIov(vec, iovec_len)));
+              return getTotalIovecLen(vec, iovec_len);
+            }));
     ON_CALL(*sock, address()).WillByDefault(testing::Return(serverAddr));
 
     setupCryptoLayer();
@@ -697,6 +698,8 @@ class QuicClientTransportTestBase : public virtual testing::Test {
 
   void setConnectionIds() {
     originalConnId = client->getConn().clientConnectionId;
+    ConnectionIdData clientCidData(*originalConnId, 0);
+    client->getNonConstConn().selfConnectionIds.emplace_back(clientCidData);
     ServerConnectionIdParams params(0, 0, 0);
     serverChosenConnId = *connIdAlgo_->encodeConnectionId(params);
   }
@@ -877,7 +880,7 @@ class QuicClientTransportTestBase : public virtual testing::Test {
       }
       if (!idleTimeout) {
         throw std::runtime_error(
-            toString(client->getConn().localConnectionError->code));
+            toString(*client->getConn().localConnectionError));
       }
     }
   }
@@ -1105,5 +1108,54 @@ class QuicClientTransportAfterStartTestBase
     startTransport();
   }
 };
+
+std::unique_ptr<testing::NiceMock<quic::test::MockAsyncUDPSocket>>
+getMockSocketWithExpectations(std::shared_ptr<FollyQuicEventBase> qEvb) {
+  using testing::_;
+  auto newSocket =
+      std::make_unique<testing::NiceMock<quic::test::MockAsyncUDPSocket>>(qEvb);
+  ON_CALL(*newSocket, setReuseAddr(_))
+      .WillByDefault(testing::Return(quic::Expected<void, QuicError>{}));
+  ON_CALL(*newSocket, setAdditionalCmsgsFunc(_))
+      .WillByDefault(testing::Return(quic::Expected<void, QuicError>{}));
+  ON_CALL(*newSocket, setDFAndTurnOffPMTU())
+      .WillByDefault(testing::Return(quic::Expected<void, QuicError>{}));
+  ON_CALL(*newSocket, setErrMessageCallback(testing::_))
+      .WillByDefault(testing::Return(quic::Expected<void, QuicError>{}));
+  ON_CALL(*newSocket, setTosOrTrafficClass(_))
+      .WillByDefault(testing::Return(quic::Expected<void, QuicError>{}));
+  ON_CALL(*newSocket, init(testing::_))
+      .WillByDefault(testing::Return(quic::Expected<void, QuicError>{}));
+  ON_CALL(*newSocket, applyOptions(testing::_, testing::_))
+      .WillByDefault(testing::Return(quic::Expected<void, QuicError>{}));
+  ON_CALL(*newSocket, bind(testing::_))
+      .WillByDefault(testing::Return(quic::Expected<void, QuicError>{}));
+  ON_CALL(*newSocket, connect(testing::_))
+      .WillByDefault(testing::Return(quic::Expected<void, QuicError>{}));
+  ON_CALL(*newSocket, close())
+      .WillByDefault(testing::Return(quic::Expected<void, QuicError>{}));
+  ON_CALL(*newSocket, resumeWrite(testing::_))
+      .WillByDefault(testing::Return(quic::Expected<void, QuicError>{}));
+  ON_CALL(*newSocket, setGRO(testing::_))
+      .WillByDefault(testing::Return(quic::Expected<void, QuicError>{}));
+  ON_CALL(*newSocket, setRecvTos(testing::_))
+      .WillByDefault(testing::Return(quic::Expected<void, QuicError>{}));
+  ON_CALL(*newSocket, getRecvTos()).WillByDefault(testing::Return(false));
+  ON_CALL(*newSocket, setCmsgs(testing::_))
+      .WillByDefault(testing::Return(quic::Expected<void, QuicError>{}));
+  ON_CALL(*newSocket, appendCmsgs(testing::_))
+      .WillByDefault(testing::Return(quic::Expected<void, QuicError>{}));
+  ON_CALL(*newSocket, getTimestamping()).WillByDefault(testing::Return(0));
+  ON_CALL(*newSocket, setReusePort(testing::_))
+      .WillByDefault(testing::Return(quic::Expected<void, QuicError>{}));
+  ON_CALL(*newSocket, setRcvBuf(testing::_))
+      .WillByDefault(testing::Return(quic::Expected<void, QuicError>{}));
+  ON_CALL(*newSocket, setSndBuf(testing::_))
+      .WillByDefault(testing::Return(quic::Expected<void, QuicError>{}));
+  ON_CALL(*newSocket, setFD(testing::_, testing::_))
+      .WillByDefault(testing::Return(quic::Expected<void, QuicError>{}));
+
+  return newSocket;
+}
 
 } // namespace quic::test

@@ -13,7 +13,7 @@
 namespace quic {
 
 QuicBuffer::QuicBuffer(std::size_t capacity)
-    : sharedBuffer_(new(std::nothrow) uint8_t[capacity]),
+    : sharedBuffer_(new (std::nothrow) uint8_t[capacity]),
       data_(sharedBuffer_.get()),
       buf_(data_),
       next_(this),
@@ -114,6 +114,21 @@ std::unique_ptr<QuicBuffer> QuicBuffer::takeOwnership(
       std::move(shared)));
 }
 
+std::unique_ptr<QuicBuffer> QuicBuffer::wrapIov(
+    const iovec* vec,
+    size_t count) {
+  QuicBuffer result;
+  for (size_t i = 0; i < count; ++i) {
+    size_t len = vec[i].iov_len;
+    void* data = vec[i].iov_base;
+    if (len > 0) {
+      auto buf = wrapBuffer(data, len);
+      result.appendToChain(std::move(buf));
+    }
+  }
+  return result.isChained() ? result.pop() : create(0);
+}
+
 std::unique_ptr<QuicBuffer> QuicBuffer::fromString(
     std::unique_ptr<std::string> ptr) {
   // Take ownership of the string's underlying buffer and ensure the
@@ -195,6 +210,13 @@ void QuicBuffer::retreat(std::size_t amount) noexcept {
   data_ -= amount;
 }
 
+void QuicBuffer::prepend(std::size_t amount) noexcept {
+  CHECK_LE(amount, headroom())
+      << "Not enough room to prepend data in QuicBuffer";
+  data_ -= amount;
+  length_ += amount;
+}
+
 bool QuicBuffer::isSharedOne() const noexcept {
   return !sharedBuffer_ || (sharedBuffer_.use_count() > 1);
 }
@@ -258,7 +280,7 @@ ByteRange QuicBuffer::coalesce() {
     const std::size_t newTailroom = prev()->tailroom();
     coalesceAndReallocate(newHeadroom, computeChainDataLength(), newTailroom);
   }
-  return ByteRange(data_, length_);
+  return {data_, length_};
 }
 
 std::unique_ptr<QuicBuffer> QuicBuffer::pop() {
@@ -478,6 +500,24 @@ bool QuicBufferEqualTo::operator()(const QuicBuffer* a, const QuicBuffer* b)
   }
 
   return true;
+}
+
+std::string QuicBuffer::toString() const {
+  const std::size_t totalLength = computeChainDataLength();
+  std::string out;
+  out.resize(totalLength);
+
+  std::size_t offset = 0;
+  const QuicBuffer* current = this;
+  do {
+    if (current->length() > 0) {
+      std::memcpy(out.data() + offset, current->data(), current->length());
+      offset += current->length();
+    }
+    current = current->next();
+  } while (current != this);
+
+  return out;
 }
 
 } // namespace quic

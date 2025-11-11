@@ -7,6 +7,8 @@
 
 #pragma once
 
+#include <string>
+
 namespace quic {
 template <class Iter>
 struct Range {
@@ -18,6 +20,14 @@ struct Range {
   Range(Iter begin, Iter end) : begin_(begin), end_(end) {}
 
   Range() : begin_(nullptr), end_(nullptr) {}
+
+  // Conversion constructor for safe conversions (e.g., mutable to const)
+  template <class OtherIter>
+  Range(
+      const Range<OtherIter>& other,
+      typename std::enable_if<
+          std::is_convertible<OtherIter, Iter>::value>::type* = nullptr)
+      : begin_(other.begin_), end_(other.end_) {}
 
   size_t size() const {
     return end_ - begin_;
@@ -52,6 +62,12 @@ struct Range {
   reference operator[](size_t index) const {
     // Return the value at the specified index
     return *(begin_ + index);
+  }
+
+  std::string toString() const {
+    return std::string(
+        reinterpret_cast<const char*>(begin_),
+        reinterpret_cast<const char*>(end_));
   }
 };
 
