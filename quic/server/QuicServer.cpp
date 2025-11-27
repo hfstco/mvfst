@@ -10,6 +10,7 @@
 #include <folly/Random.h>
 #include <folly/io/async/EventBaseManager.h>
 #include <folly/portability/GFlags.h>
+#include <folly/system/HardwareConcurrency.h>
 #include <quic/codec/DefaultConnectionIdAlgo.h>
 #include <quic/codec/QuicHeaderCodec.h>
 #include <quic/server/QuicReusePortUDPSocketFactory.h>
@@ -139,8 +140,10 @@ bool QuicServer::isInitialized() const noexcept {
 void QuicServer::start(const folly::SocketAddress& address, size_t maxWorkers) {
   checkRunningInThread(mainThreadId_);
   CHECK(ctx_) << "Must set a TLS context for the Quic server";
-  CHECK_LE(maxWorkers, std::numeric_limits<uint8_t>::max());
-  size_t numCpu = std::thread::hardware_concurrency();
+  CHECK_LE(maxWorkers, std::numeric_limits<uint8_t>::max())
+      << "Quic server doesn't support more than "
+      << (int)std::numeric_limits<uint8_t>::max() << " workers";
+  size_t numCpu = folly::hardware_concurrency();
   if (maxWorkers == 0) {
     maxWorkers = numCpu;
   }

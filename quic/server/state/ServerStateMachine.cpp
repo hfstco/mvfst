@@ -539,9 +539,6 @@ quic::Expected<void, QuicError> updateHandshakeState(
 
   if (zeroRttReadCipher) {
     conn.usedZeroRtt = true;
-    if (conn.qLogger) {
-      conn.qLogger->addTransportStateUpdate(kDerivedZeroRttReadCipher);
-    }
     conn.readCodec->setZeroRttReadCipher(std::move(zeroRttReadCipher));
   }
   if (zeroRttHeaderCipher) {
@@ -555,9 +552,6 @@ quic::Expected<void, QuicError> updateHandshakeState(
   }
 
   if (oneRttWriteCipher) {
-    if (conn.qLogger) {
-      conn.qLogger->addTransportStateUpdate(kDerivedOneRttWriteCipher);
-    }
     if (conn.oneRttWriteCipher) {
       return quic::make_unexpected(QuicError(
           TransportErrorCode::CRYPTO_ERROR, "Duplicate 1-rtt write cipher"));
@@ -582,9 +576,6 @@ quic::Expected<void, QuicError> updateHandshakeState(
     updateNegotiatedAckFeatures(conn);
   }
   if (oneRttReadCipher) {
-    if (conn.qLogger) {
-      conn.qLogger->addTransportStateUpdate(kDerivedOneRttReadCipher);
-    }
     // Clear limit because CFIN is received at this point
     conn.isClientAddrVerified = true;
     conn.writableBytesLimit.reset();
@@ -779,6 +770,20 @@ quic::Expected<void, QuicError> onConnectionMigration(
     conn.fallbackPathId.reset();
   }
 
+  if (readPath->status != PathStatus::Validated &&
+      readPath->outstandingChallengeData.has_value() &&
+      !conn.pendingEvents.pathChallenges.contains(readPathId)) {
+    // We're migrating to a path with an outstanding path challenge that we
+    // haven't received a response for yet. We resend it here to give the path
+    // validation a better chance at succeeding.
+    // This helps work around a bug in some QUIC implementations that do
+    // not properly handle a path challenge when it's sent in the same packet as
+    // a path response responding to a path probe.
+    conn.pendingEvents.pathChallenges.emplace(
+        readPath->id,
+        PathChallengeFrame(readPath->outstandingChallengeData.value()));
+  }
+
   // If this is NAT rebinding, keep congestion state unchanged
   bool isNATRebinding =
       maybeNATRebinding(readPath->peerAddress, connPath->peerAddress);
@@ -805,6 +810,8 @@ quic::Expected<void, QuicError> onConnectionMigration(
   if (switchPathRes.hasError()) {
     return quic::make_unexpected(switchPathRes.error());
   }
+
+  QUIC_STATS(conn.statsCallback, onConnectionMigration);
 
   if (!isNATRebinding) {
     auto ccaRestored =
@@ -996,7 +1003,6 @@ quic::Expected<void, QuicError> onServerReadDataFromOpen(
 
     auto customTransportParams = getSupportedExtTransportParams(conn);
 
-    QUIC_STATS(conn.statsCallback, onStatelessReset);
     conn.serverHandshakeLayer->accept(
         std::make_shared<ServerTransportParametersExtension>(
             version,
@@ -1232,9 +1238,6 @@ quic::Expected<void, QuicError> onServerReadDataFromOpen(
     }
 
     if (conn.peerAddress != readData.peerAddress) {
-      // TODO: JBESHAY MIGRATION - this counter will count all packets received
-      // on non-primary paths. Revisit all connection migration counters.
-      QUIC_STATS(conn.statsCallback, onPeerAddressChanged);
       auto migrationDenied = (encryptionLevel != EncryptionLevel::AppData) ||
           conn.transportSettings.disableMigration;
       if (migrationDenied) {
@@ -1575,9 +1578,6 @@ quic::Expected<void, QuicError> onServerReadDataFromOpen(
           VLOG(4) << errMsg << " " << conn;
           // we want to deliver app callbacks with the peer supplied error,
           // but send a NO_ERROR to the peer.
-          if (conn.qLogger) {
-            conn.qLogger->addTransportStateUpdate(getPeerClose(errMsg));
-          }
           conn.peerConnectionError =
               QuicError(QuicErrorCode(connFrame.errorCode), std::move(errMsg));
           if (getSendConnFlowControlBytesWire(conn) == 0 &&
@@ -1887,9 +1887,6 @@ quic::Expected<void, QuicError> onServerReadDataFromClosed(
         auto errMsg = fmt::format(
             "Server closed by peer reason={}", connFrame.reasonPhrase);
         VLOG(4) << errMsg << " " << conn;
-        if (conn.qLogger) {
-          conn.qLogger->addTransportStateUpdate(getPeerClose(errMsg));
-        }
         // we want to deliver app callbacks with the peer supplied error,
         // but send a NO_ERROR to the peer.
         conn.peerConnectionError =

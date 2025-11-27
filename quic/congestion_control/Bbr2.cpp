@@ -101,23 +101,18 @@ void Bbr2CongestionController::onPacketAckOrLoss(
     const LossEvent* FOLLY_NULLABLE lossEvent) {
   SCOPE_EXIT {
     if (conn_.qLogger) {
-      conn_.qLogger->addCongestionMetricUpdate(
-          conn_.lossState.inflightBytes,
-          getCongestionWindow(),
-          kCongestionPacketAck,
-          bbr2StateToString(state_));
       conn_.qLogger->addMetricUpdate(
+          conn_.lossState.lrtt,
           conn_.lossState.mrtt,
           conn_.lossState.srtt,
-          conn_.lossState.lrtt,
+          conn_.lossState.maybeLrttAckDelay.value_or(0us),
           conn_.lossState.rttvar,
-          conn_.lossState.ptoCount,
           getCongestionWindow(),
           conn_.lossState.inflightBytes,
-          UINT64_MAX,
-          getCongestionWindow() / conn_.udpSendPacketLen,
-          calculatePacingRate(conn_, getCongestionWindow(),
-            conn_.transportSettings.minCwndInMss, conn_.lossState.lrtt).interval);
+          std::nullopt,
+          std::nullopt,
+          std::nullopt,
+          conn_.lossState.ptoCount);
       conn_.qLogger->addNetworkPathModelUpdate(
           inflightLongTerm_.value_or(0),
           inflightShortTerm_.value_or(0),

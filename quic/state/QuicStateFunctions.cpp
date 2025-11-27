@@ -83,6 +83,22 @@ void updateRtt(
     conn.lossState.srtt = conn.lossState.srtt * (kRttAlpha - 1) / kRttAlpha +
         adjustedRtt / kRttAlpha;
   }
+
+  // inform qlog
+  if (conn.qLogger) {
+    conn.qLogger->addMetricUpdate(
+        rttSample,
+        conn.lossState.mrtt,
+        conn.lossState.srtt,
+        ackDelay,
+        conn.lossState.rttvar,
+        std::nullopt,
+        conn.lossState.inflightBytes,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        conn.lossState.ptoCount);
+  }
 }
 
 void updateAckSendStateOnRecvPacket(
@@ -247,13 +263,9 @@ PacketNum getNextPacketNum(
 
 void increaseNextPacketNum(
     QuicConnectionStateBase& conn,
-    PacketNumberSpace pnSpace,
-    bool dsrPacket) noexcept {
+    PacketNumberSpace pnSpace) noexcept {
   auto& ackState = getAckState(conn, pnSpace);
   ackState.nextPacketNum++;
-  if (!dsrPacket) {
-    ackState.nonDsrPacketSequenceNumber++;
-  }
   if (ackState.nextPacketNum == kMaxPacketNumber) {
     conn.pendingEvents.closeTransport = true;
   }

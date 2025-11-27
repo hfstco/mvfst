@@ -1228,10 +1228,6 @@ void QuicTransportBaseLite::checkForClosedStream() {
     }
 
     VLOG(10) << "Closing stream=" << *itr;
-    if (conn_->qLogger) {
-      conn_->qLogger->addTransportStateUpdate(
-          getClosingStream(fmt::format("{}", *itr)));
-    }
     if (connCallback_) {
       connCallback_->onStreamPreReaped(*itr);
     }
@@ -1519,7 +1515,6 @@ void QuicTransportBaseLite::closeImpl(
          uint64_t(conn_->transportSettings.timeReorderingThreshDividend),
          conn_->usedZeroRtt,
          conn_->version.value_or(QuicVersion::MVFST_INVALID),
-         conn_->dsrPacketCount,
          conn_->initialPacketsReceived,
          conn_->uniqueInitialCryptoFramesReceived,
          timeUntilLastInitialCryptoFrameReceived,
@@ -2305,9 +2300,6 @@ void QuicTransportBaseLite::lossTimeoutExpired() noexcept {
       return;
     }
 
-    if (conn_->qLogger) {
-      conn_->qLogger->addTransportStateUpdate(kLossTimeoutExpired);
-    }
     pacedWriteDataToSocket();
   } catch (const QuicTransportException& ex) {
     VLOG(4) << __func__ << " " << ex.what() << " " << *this;

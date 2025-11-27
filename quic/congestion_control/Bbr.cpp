@@ -112,24 +112,18 @@ void BbrCongestionController::onPacketLoss(
   if (loss.persistentCongestion) {
     recoveryWindow_ = conn_.udpSendPacketLen * kMinCwndInMssForBbr;
     if (conn_.qLogger) {
-      conn_.qLogger->addCongestionMetricUpdate(
-          conn_.lossState.inflightBytes,
-          getCongestionWindow(),
-          kPersistentCongestion,
-          bbrStateToString(state_),
-          bbrRecoveryStateToString(recoveryState_));
       conn_.qLogger->addMetricUpdate(
+          conn_.lossState.lrtt,
           conn_.lossState.mrtt,
           conn_.lossState.srtt,
-          conn_.lossState.lrtt,
+          conn_.lossState.maybeLrttAckDelay.value_or(0us),
           conn_.lossState.rttvar,
-          conn_.lossState.ptoCount,
           getCongestionWindow(),
           conn_.lossState.inflightBytes,
-          UINT64_MAX,
-          getCongestionWindow() / conn_.udpSendPacketLen,
-          calculatePacingRate(conn_, getCongestionWindow(),
-            conn_.transportSettings.minCwndInMss, conn_.lossState.lrtt).interval);
+          std::nullopt,
+          std::nullopt,
+          std::nullopt,
+          conn_.lossState.ptoCount);
     }
   }
 }
@@ -204,24 +198,18 @@ void BbrCongestionController::onPacketAcked(
     bool hasLoss) {
   SCOPE_EXIT {
     if (conn_.qLogger) {
-      conn_.qLogger->addCongestionMetricUpdate(
-          conn_.lossState.inflightBytes,
-          getCongestionWindow(),
-          kCongestionPacketAck,
-          bbrStateToString(state_),
-          bbrRecoveryStateToString(recoveryState_));
       conn_.qLogger->addMetricUpdate(
+          conn_.lossState.lrtt,
           conn_.lossState.mrtt,
           conn_.lossState.srtt,
-          conn_.lossState.lrtt,
+          conn_.lossState.maybeLrttAckDelay.value_or(0us),
           conn_.lossState.rttvar,
-          conn_.lossState.ptoCount,
           getCongestionWindow(),
           conn_.lossState.inflightBytes,
-          UINT64_MAX,
-          getCongestionWindow() / conn_.udpSendPacketLen,
-          calculatePacingRate(conn_, getCongestionWindow(),
-            conn_.transportSettings.minCwndInMss, conn_.lossState.lrtt).interval);
+          std::nullopt,
+          std::nullopt,
+          std::nullopt,
+          conn_.lossState.ptoCount);
     }
   };
   if (ack.implicit) {

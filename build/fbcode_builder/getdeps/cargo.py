@@ -13,7 +13,7 @@ import sys
 import typing
 
 from .builder import BuilderBase
-from .copytree import simple_copytree
+from .copytree import rmtree_more, simple_copytree
 
 if typing.TYPE_CHECKING:
     from .buildopts import BuildOptions
@@ -79,7 +79,7 @@ class CargoBuilder(BuilderBase):
             if os.path.islink(dst):
                 os.remove(dst)
             else:
-                shutil.rmtree(dst)
+                rmtree_more(dst)
         simple_copytree(src, dst)
 
     def recreate_linked_dir(self, src, dst) -> None:
@@ -203,7 +203,9 @@ incremental = false
             build_source_dir, os.path.join(self.inst_dir, "source")
         )
 
-    def run_tests(self, schedule_type, owner, test_filter, retry, no_testpilot) -> None:
+    def run_tests(
+        self, schedule_type, owner, test_filter, retry, no_testpilot, timeout=None
+    ) -> None:
         if test_filter:
             args = ["--", test_filter]
         else:

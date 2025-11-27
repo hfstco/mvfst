@@ -44,10 +44,6 @@ class LogQuicStats : public quic::QuicTransportStatsCallback {
     VLOG(2) << prefix_ << __func__;
   }
 
-  void onDSRPacketSent(size_t pktSize) override {
-    VLOG(2) << prefix_ << __func__ << " size=" << pktSize;
-  }
-
   void onPacketRetransmission() override {
     VLOG(2) << prefix_ << __func__;
   }
@@ -118,7 +114,19 @@ class LogQuicStats : public quic::QuicTransportStatsCallback {
     VLOG(2) << prefix_ << __func__;
   }
 
-  void onPeerAddressChanged() override {
+  void onConnectionMigration() override {
+    VLOG(2) << prefix_ << __func__;
+  }
+
+  void onPathAdded() override {
+    VLOG(2) << prefix_ << __func__;
+  }
+
+  void onPathValidationSuccess() override {
+    VLOG(2) << prefix_ << __func__;
+  }
+
+  void onPathValidationFailure() override {
     VLOG(2) << prefix_ << __func__;
   }
 

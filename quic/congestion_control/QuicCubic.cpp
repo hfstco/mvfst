@@ -32,23 +32,20 @@ Cubic::Cubic(
   steadyState_.estRenoCwnd = cwndBytes_;
   hystartState_.ackTrain = ackTrain;
   if (conn_.qLogger) {
-    conn_.qLogger->addCongestionMetricUpdate(
-        conn_.lossState.inflightBytes,
-        cwndBytes_,
-        kCubicInit,
-        cubicStateToString(state_).str());
     conn_.qLogger->addMetricUpdate(
-          conn_.lossState.mrtt,
-          conn_.lossState.srtt,
-          conn_.lossState.lrtt,
-          conn_.lossState.rttvar,
-          conn_.lossState.ptoCount,
-          getCongestionWindow(),
-          conn_.lossState.inflightBytes,
-          ssthresh_,
-          getCongestionWindow() / conn_.udpSendPacketLen,
-          calculatePacingRate(conn_, getCongestionWindow(),
-            conn_.transportSettings.minCwndInMss, conn_.lossState.lrtt).interval);
+        conn_.lossState.lrtt,
+        conn_.lossState.mrtt,
+        conn_.lossState.srtt,
+        conn_.lossState.maybeLrttAckDelay.value_or(0us),
+        conn_.lossState.rttvar,
+        cwndBytes_,
+        conn_.lossState.inflightBytes,
+        ssthresh_ == std::numeric_limits<uint64_t>::max()
+            ? std::nullopt
+            : Optional<uint64_t>(ssthresh_),
+        std::nullopt,
+        std::nullopt,
+        conn_.lossState.ptoCount);
   }
 }
 
@@ -103,23 +100,8 @@ void Cubic::onPersistentCongestion() {
   state_ = CubicStates::Hystart;
 
   if (conn_.qLogger) {
-    conn_.qLogger->addCongestionMetricUpdate(
-        conn_.lossState.inflightBytes,
-        getCongestionWindow(),
-        kPersistentCongestion,
-        cubicStateToString(state_).str());
-    conn_.qLogger->addMetricUpdate(
-          conn_.lossState.mrtt,
-          conn_.lossState.srtt,
-          conn_.lossState.lrtt,
-          conn_.lossState.rttvar,
-          conn_.lossState.ptoCount,
-          getCongestionWindow(),
-          conn_.lossState.inflightBytes,
-          ssthresh_,
-          getCongestionWindow() / conn_.udpSendPacketLen,
-          calculatePacingRate(conn_, getCongestionWindow(),
-            conn_.transportSettings.minCwndInMss, conn_.lossState.lrtt).interval);
+    conn_.qLogger->addCongestionStateUpdate(
+        std::nullopt, cubicStateToString(state_).str(), kPersistentCongestion);
   }
 }
 
@@ -160,44 +142,28 @@ void Cubic::onPacketLoss(const LossEvent& loss) {
           cwndBytes_ * pacingGain(), conn_.lossState.srtt);
     }
     if (conn_.qLogger) {
-      conn_.qLogger->addCongestionMetricUpdate(
-          conn_.lossState.inflightBytes,
-          getCongestionWindow(),
-          kCubicLoss,
-          cubicStateToString(state_).str());
-      conn_.qLogger->addMetricUpdate(
-          conn_.lossState.mrtt,
-          conn_.lossState.srtt,
-          conn_.lossState.lrtt,
-          conn_.lossState.rttvar,
-          conn_.lossState.ptoCount,
-          getCongestionWindow(),
-          conn_.lossState.inflightBytes,
-          ssthresh_,
-          getCongestionWindow() / conn_.udpSendPacketLen,
-          calculatePacingRate(conn_, getCongestionWindow(),
-            conn_.transportSettings.minCwndInMss, conn_.lossState.lrtt).interval);
+      conn_.qLogger->addCongestionStateUpdate(
+          cubicStateToString(CubicStates::Steady).str(),
+          cubicStateToString(state_).str(),
+          kCubicLoss);
     }
 
   } else {
     if (conn_.qLogger) {
-      conn_.qLogger->addCongestionMetricUpdate(
-          conn_.lossState.inflightBytes,
-          getCongestionWindow(),
-          kCubicSkipLoss,
-          cubicStateToString(state_).str());
       conn_.qLogger->addMetricUpdate(
+          conn_.lossState.lrtt,
           conn_.lossState.mrtt,
           conn_.lossState.srtt,
-          conn_.lossState.lrtt,
+          conn_.lossState.maybeLrttAckDelay.value_or(0us),
           conn_.lossState.rttvar,
-          conn_.lossState.ptoCount,
           getCongestionWindow(),
           conn_.lossState.inflightBytes,
-          ssthresh_,
-          getCongestionWindow() / conn_.udpSendPacketLen,
-          calculatePacingRate(conn_, getCongestionWindow(),
-            conn_.transportSettings.minCwndInMss, conn_.lossState.lrtt).interval);
+          ssthresh_ == std::numeric_limits<uint64_t>::max()
+              ? std::nullopt
+              : Optional<uint64_t>(ssthresh_),
+          std::nullopt,
+          std::nullopt,
+          conn_.lossState.ptoCount);
     }
   }
 
@@ -211,23 +177,20 @@ void Cubic::onPacketLoss(const LossEvent& loss) {
 
 void Cubic::onRemoveBytesFromInflight(uint64_t /* bytes */) {
   if (conn_.qLogger) {
-    conn_.qLogger->addCongestionMetricUpdate(
-        conn_.lossState.inflightBytes,
-        getCongestionWindow(),
-        kRemoveInflight,
-        cubicStateToString(state_).str());
     conn_.qLogger->addMetricUpdate(
-          conn_.lossState.mrtt,
-          conn_.lossState.srtt,
-          conn_.lossState.lrtt,
-          conn_.lossState.rttvar,
-          conn_.lossState.ptoCount,
-          getCongestionWindow(),
-          conn_.lossState.inflightBytes,
-          ssthresh_,
-          getCongestionWindow() / conn_.udpSendPacketLen,
-          calculatePacingRate(conn_, getCongestionWindow(),
-            conn_.transportSettings.minCwndInMss, conn_.lossState.lrtt).interval);
+        conn_.lossState.lrtt,
+        conn_.lossState.mrtt,
+        conn_.lossState.srtt,
+        conn_.lossState.maybeLrttAckDelay.value_or(0us),
+        conn_.lossState.rttvar,
+        getCongestionWindow(),
+        conn_.lossState.inflightBytes,
+        ssthresh_ == std::numeric_limits<uint64_t>::max()
+            ? std::nullopt
+            : Optional<uint64_t>(ssthresh_),
+        std::nullopt,
+        std::nullopt,
+        conn_.lossState.ptoCount);
   }
 }
 
@@ -274,9 +237,6 @@ void Cubic::updateTimeToOrigin() noexcept {
   // The following calculation can be converted to pure integer calculation if
   // we change the equation a bit to remove all decimals. It's also possible
   // to remove the cbrt calculation by changing the equation.
-  if (conn_.qLogger) {
-    conn_.qLogger->addTransportStateUpdate(kRecalculateTimeToOrigin);
-  }
   if (*steadyState_.lastMaxCwndBytes <= cwndBytes_) {
     steadyState_.timeToOrigin = 0.0;
     steadyState_.originPoint = steadyState_.lastMaxCwndBytes;
@@ -334,23 +294,20 @@ int64_t Cubic::calculateCubicCwndDelta(TimePoint ackTime) noexcept {
            << ", origin=" << *steadyState_.lastMaxCwndBytes
            << ", cwnd delta=" << delta;
   if (conn_.qLogger) {
-    conn_.qLogger->addCongestionMetricUpdate(
-        conn_.lossState.inflightBytes,
-        getCongestionWindow(),
-        kCubicSteadyCwnd,
-        cubicStateToString(state_).str());
     conn_.qLogger->addMetricUpdate(
-          conn_.lossState.mrtt,
-          conn_.lossState.srtt,
-          conn_.lossState.lrtt,
-          conn_.lossState.rttvar,
-          conn_.lossState.ptoCount,
-          getCongestionWindow(),
-          conn_.lossState.inflightBytes,
-          ssthresh_,
-          getCongestionWindow() / conn_.udpSendPacketLen,
-          calculatePacingRate(conn_, getCongestionWindow(),
-            conn_.transportSettings.minCwndInMss, conn_.lossState.lrtt).interval);
+        conn_.lossState.lrtt,
+        conn_.lossState.mrtt,
+        conn_.lossState.srtt,
+        conn_.lossState.maybeLrttAckDelay.value_or(0us),
+        conn_.lossState.rttvar,
+        getCongestionWindow(),
+        conn_.lossState.inflightBytes,
+        ssthresh_ == std::numeric_limits<uint64_t>::max()
+            ? std::nullopt
+            : Optional<uint64_t>(ssthresh_),
+        std::nullopt,
+        std::nullopt,
+        conn_.lossState.ptoCount);
   }
   return delta;
 }
@@ -422,23 +379,20 @@ void Cubic::onPacketAcked(const AckEvent& ack) {
   if (recoveryState_.endOfRecovery.has_value() &&
       *recoveryState_.endOfRecovery >= ack.largestNewlyAckedPacketSentTime) {
     if (conn_.qLogger) {
-      conn_.qLogger->addCongestionMetricUpdate(
-          conn_.lossState.inflightBytes,
-          getCongestionWindow(),
-          kCubicSkipAck,
-          cubicStateToString(state_).str());
       conn_.qLogger->addMetricUpdate(
+          conn_.lossState.lrtt,
           conn_.lossState.mrtt,
           conn_.lossState.srtt,
-          conn_.lossState.lrtt,
+          conn_.lossState.maybeLrttAckDelay.value_or(0us),
           conn_.lossState.rttvar,
-          conn_.lossState.ptoCount,
           getCongestionWindow(),
           conn_.lossState.inflightBytes,
-          ssthresh_,
-          getCongestionWindow() / conn_.udpSendPacketLen,
-          calculatePacingRate(conn_, getCongestionWindow(),
-            conn_.transportSettings.minCwndInMss, conn_.lossState.lrtt).interval);
+          ssthresh_ == std::numeric_limits<uint64_t>::max()
+              ? std::nullopt
+              : Optional<uint64_t>(ssthresh_),
+          std::nullopt,
+          std::nullopt,
+          conn_.lossState.ptoCount);
     }
     return;
   }
@@ -463,43 +417,37 @@ void Cubic::onPacketAcked(const AckEvent& ack) {
 
   if (cwndBytes_ == currentCwnd) {
     if (conn_.qLogger) {
-      conn_.qLogger->addCongestionMetricUpdate(
-          conn_.lossState.inflightBytes,
-          getCongestionWindow(),
-          kCwndNoChange,
-          cubicStateToString(state_).str());
       conn_.qLogger->addMetricUpdate(
+          conn_.lossState.lrtt,
           conn_.lossState.mrtt,
           conn_.lossState.srtt,
-          conn_.lossState.lrtt,
+          conn_.lossState.maybeLrttAckDelay.value_or(0us),
           conn_.lossState.rttvar,
-          conn_.lossState.ptoCount,
           getCongestionWindow(),
           conn_.lossState.inflightBytes,
-          ssthresh_,
-          getCongestionWindow() / conn_.udpSendPacketLen,
-          calculatePacingRate(conn_, getCongestionWindow(),
-            conn_.transportSettings.minCwndInMss, conn_.lossState.lrtt).interval);
+          ssthresh_ == std::numeric_limits<uint64_t>::max()
+              ? std::nullopt
+              : Optional<uint64_t>(ssthresh_),
+          std::nullopt,
+          std::nullopt,
+          conn_.lossState.ptoCount);
     }
   }
   if (conn_.qLogger) {
-    conn_.qLogger->addCongestionMetricUpdate(
-        conn_.lossState.inflightBytes,
-        getCongestionWindow(),
-        kCongestionPacketAck,
-        cubicStateToString(state_).str());
     conn_.qLogger->addMetricUpdate(
-          conn_.lossState.mrtt,
-          conn_.lossState.srtt,
-          conn_.lossState.lrtt,
-          conn_.lossState.rttvar,
-          conn_.lossState.ptoCount,
-          getCongestionWindow(),
-          conn_.lossState.inflightBytes,
-          ssthresh_,
-          getCongestionWindow() / conn_.udpSendPacketLen,
-          calculatePacingRate(conn_, getCongestionWindow(),
-            conn_.transportSettings.minCwndInMss, conn_.lossState.lrtt).interval);
+        conn_.lossState.lrtt,
+        conn_.lossState.mrtt,
+        conn_.lossState.srtt,
+        conn_.lossState.maybeLrttAckDelay.value_or(0us),
+        conn_.lossState.rttvar,
+        getCongestionWindow(),
+        conn_.lossState.inflightBytes,
+        ssthresh_ == std::numeric_limits<uint64_t>::max()
+            ? std::nullopt
+            : Optional<uint64_t>(ssthresh_),
+        std::nullopt,
+        std::nullopt,
+        conn_.lossState.ptoCount);
   }
 }
 
@@ -693,23 +641,20 @@ void Cubic::onPacketAckedInHystart(const AckEvent& ack) {
 void Cubic::onPacketAckedInSteady(const AckEvent& ack) {
   if (isAppLimited()) {
     if (conn_.qLogger) {
-      conn_.qLogger->addCongestionMetricUpdate(
-          conn_.lossState.inflightBytes,
-          getCongestionWindow(),
-          kAckInQuiescence,
-          cubicStateToString(state_).str());
       conn_.qLogger->addMetricUpdate(
+          conn_.lossState.lrtt,
           conn_.lossState.mrtt,
           conn_.lossState.srtt,
-          conn_.lossState.lrtt,
+          conn_.lossState.maybeLrttAckDelay.value_or(0us),
           conn_.lossState.rttvar,
-          conn_.lossState.ptoCount,
           getCongestionWindow(),
           conn_.lossState.inflightBytes,
-          ssthresh_,
-          getCongestionWindow() / conn_.udpSendPacketLen,
-          calculatePacingRate(conn_, getCongestionWindow(),
-            conn_.transportSettings.minCwndInMss, conn_.lossState.lrtt).interval);
+          ssthresh_ == std::numeric_limits<uint64_t>::max()
+              ? std::nullopt
+              : Optional<uint64_t>(ssthresh_),
+          std::nullopt,
+          std::nullopt,
+          conn_.lossState.ptoCount);
     }
     return;
   }
@@ -737,23 +682,20 @@ void Cubic::onPacketAckedInSteady(const AckEvent& ack) {
     // lastMaxCwndBytes won't be set when we transit from Hybrid to Steady. In
     // that case, we are at the "origin" already.
     if (conn_.qLogger) {
-      conn_.qLogger->addCongestionMetricUpdate(
-          conn_.lossState.inflightBytes,
-          getCongestionWindow(),
-          kResetTimeToOrigin,
-          cubicStateToString(state_).str());
       conn_.qLogger->addMetricUpdate(
+          conn_.lossState.lrtt,
           conn_.lossState.mrtt,
           conn_.lossState.srtt,
-          conn_.lossState.lrtt,
+          conn_.lossState.maybeLrttAckDelay.value_or(0us),
           conn_.lossState.rttvar,
-          conn_.lossState.ptoCount,
           getCongestionWindow(),
           conn_.lossState.inflightBytes,
-          ssthresh_,
-          getCongestionWindow() / conn_.udpSendPacketLen,
-          calculatePacingRate(conn_, getCongestionWindow(),
-            conn_.transportSettings.minCwndInMss, conn_.lossState.lrtt).interval);
+          ssthresh_ == std::numeric_limits<uint64_t>::max()
+              ? std::nullopt
+              : Optional<uint64_t>(ssthresh_),
+          std::nullopt,
+          std::nullopt,
+          conn_.lossState.ptoCount);
     }
     steadyState_.timeToOrigin = 0.0;
     steadyState_.lastMaxCwndBytes = cwndBytes_;
@@ -769,23 +711,20 @@ void Cubic::onPacketAckedInSteady(const AckEvent& ack) {
   if (!steadyState_.lastReductionTime) {
     steadyState_.lastReductionTime = ack.ackTime;
     if (conn_.qLogger) {
-      conn_.qLogger->addCongestionMetricUpdate(
-          conn_.lossState.inflightBytes,
-          getCongestionWindow(),
-          kResetLastReductionTime,
-          cubicStateToString(state_).str());
       conn_.qLogger->addMetricUpdate(
+          conn_.lossState.lrtt,
           conn_.lossState.mrtt,
           conn_.lossState.srtt,
-          conn_.lossState.lrtt,
+          conn_.lossState.maybeLrttAckDelay.value_or(0us),
           conn_.lossState.rttvar,
-          conn_.lossState.ptoCount,
           getCongestionWindow(),
           conn_.lossState.inflightBytes,
-          ssthresh_,
-          getCongestionWindow() / conn_.udpSendPacketLen,
-          calculatePacingRate(conn_, getCongestionWindow(),
-            conn_.transportSettings.minCwndInMss, conn_.lossState.lrtt).interval);
+          ssthresh_ == std::numeric_limits<uint64_t>::max()
+              ? std::nullopt
+              : Optional<uint64_t>(ssthresh_),
+          std::nullopt,
+          std::nullopt,
+          conn_.lossState.ptoCount);
     }
   }
   if (carefulResume_.state() != CarefulResume::States::Unvalidated &&
@@ -824,23 +763,20 @@ void Cubic::onPacketAckedInSteady(const AckEvent& ack) {
         conn_.transportSettings.minCwndInMss);
     cwndBytes_ = std::max(cwndBytes_, steadyState_.estRenoCwnd);
     if (conn_.qLogger) {
-      conn_.qLogger->addCongestionMetricUpdate(
-          conn_.lossState.inflightBytes,
-          getCongestionWindow(),
-          kRenoCwndEstimation,
-          cubicStateToString(state_).str());
       conn_.qLogger->addMetricUpdate(
+          conn_.lossState.lrtt,
           conn_.lossState.mrtt,
           conn_.lossState.srtt,
-          conn_.lossState.lrtt,
+          conn_.lossState.maybeLrttAckDelay.value_or(0us),
           conn_.lossState.rttvar,
-          conn_.lossState.ptoCount,
           getCongestionWindow(),
           conn_.lossState.inflightBytes,
-          ssthresh_,
-          getCongestionWindow() / conn_.udpSendPacketLen,
-          calculatePacingRate(conn_, getCongestionWindow(),
-            conn_.transportSettings.minCwndInMss, conn_.lossState.lrtt).interval);
+          ssthresh_ == std::numeric_limits<uint64_t>::max()
+              ? std::nullopt
+              : Optional<uint64_t>(ssthresh_),
+          std::nullopt,
+          std::nullopt,
+          conn_.lossState.ptoCount);
     }
   }
   }
@@ -866,23 +802,10 @@ void Cubic::onPacketAckedInRecovery(const AckEvent& ack) {
       cwndBytes_ = calculateCubicCwnd(calculateCubicCwndDelta(ack.ackTime));
     }
     if (conn_.qLogger) {
-      conn_.qLogger->addCongestionMetricUpdate(
-          conn_.lossState.inflightBytes,
-          getCongestionWindow(),
-          kPacketAckedInRecovery,
-          cubicStateToString(state_).str());
-      conn_.qLogger->addMetricUpdate(
-          conn_.lossState.mrtt,
-          conn_.lossState.srtt,
-          conn_.lossState.lrtt,
-          conn_.lossState.rttvar,
-          conn_.lossState.ptoCount,
-          getCongestionWindow(),
-          conn_.lossState.inflightBytes,
-          ssthresh_,
-          getCongestionWindow() / conn_.udpSendPacketLen,
-          calculatePacingRate(conn_, getCongestionWindow(),
-            conn_.transportSettings.minCwndInMss, conn_.lossState.lrtt).interval);
+      conn_.qLogger->addCongestionStateUpdate(
+          cubicStateToString(CubicStates::FastRecovery).str(),
+          cubicStateToString(state_).str(),
+          std::nullopt);
     }
   }
 }

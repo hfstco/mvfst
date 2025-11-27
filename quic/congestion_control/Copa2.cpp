@@ -28,20 +28,18 @@ void Copa2::onRemoveBytesFromInflight(uint64_t /* bytes */) {
            << " cwnd=" << cwndBytes_
            << " inflight=" << conn_.lossState.inflightBytes << " " << conn_;
   if (conn_.qLogger) {
-    conn_.qLogger->addCongestionMetricUpdate(
-        conn_.lossState.inflightBytes, getCongestionWindow(), kRemoveInflight);
     conn_.qLogger->addMetricUpdate(
-          conn_.lossState.mrtt,
-          conn_.lossState.srtt,
-          conn_.lossState.lrtt,
-          conn_.lossState.rttvar,
-          conn_.lossState.ptoCount,
-          getCongestionWindow(),
-          conn_.lossState.inflightBytes,
-          UINT64_MAX,
-          getCongestionWindow() / conn_.udpSendPacketLen,
-          calculatePacingRate(conn_, getCongestionWindow(),
-            conn_.transportSettings.minCwndInMss, conn_.lossState.lrtt).interval);
+        conn_.lossState.lrtt,
+        conn_.lossState.mrtt,
+        conn_.lossState.srtt,
+        conn_.lossState.maybeLrttAckDelay.value_or(0us),
+        conn_.lossState.rttvar,
+        getCongestionWindow(),
+        conn_.lossState.inflightBytes,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        conn_.lossState.ptoCount);
   }
 }
 
@@ -53,22 +51,18 @@ void Copa2::onPacketSent(const OutstandingPacketWrapper& packet) {
            << " packetNum=" << packet.packet.header.getPacketSequenceNum()
            << " " << conn_;
   if (conn_.qLogger) {
-    conn_.qLogger->addCongestionMetricUpdate(
-        conn_.lossState.inflightBytes,
-        getCongestionWindow(),
-        kCongestionPacketSent);
     conn_.qLogger->addMetricUpdate(
-          conn_.lossState.mrtt,
-          conn_.lossState.srtt,
-          conn_.lossState.lrtt,
-          conn_.lossState.rttvar,
-          conn_.lossState.ptoCount,
-          getCongestionWindow(),
-          conn_.lossState.inflightBytes,
-          UINT64_MAX,
-          getCongestionWindow() / conn_.udpSendPacketLen,
-          calculatePacingRate(conn_, getCongestionWindow(),
-            conn_.transportSettings.minCwndInMss, conn_.lossState.lrtt).interval);
+        conn_.lossState.lrtt,
+        conn_.lossState.mrtt,
+        conn_.lossState.srtt,
+        conn_.lossState.maybeLrttAckDelay.value_or(0us),
+        conn_.lossState.rttvar,
+        getCongestionWindow(),
+        conn_.lossState.inflightBytes,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        conn_.lossState.ptoCount);
   }
 }
 
@@ -131,22 +125,18 @@ void Copa2::onPacketLoss(const LossEvent& loss) {
            << " lostPackets=" << loss.lostPackets << " cwnd=" << cwndBytes_
            << " inflight=" << conn_.lossState.inflightBytes << " " << conn_;
   if (conn_.qLogger) {
-    conn_.qLogger->addCongestionMetricUpdate(
-        conn_.lossState.inflightBytes,
-        getCongestionWindow(),
-        kCongestionPacketLoss);
     conn_.qLogger->addMetricUpdate(
-          conn_.lossState.mrtt,
-          conn_.lossState.srtt,
-          conn_.lossState.lrtt,
-          conn_.lossState.rttvar,
-          conn_.lossState.ptoCount,
-          getCongestionWindow(),
-          conn_.lossState.inflightBytes,
-          UINT64_MAX,
-          getCongestionWindow() / conn_.udpSendPacketLen,
-          calculatePacingRate(conn_, getCongestionWindow(),
-            conn_.transportSettings.minCwndInMss, conn_.lossState.lrtt).interval);
+        conn_.lossState.lrtt,
+        conn_.lossState.mrtt,
+        conn_.lossState.srtt,
+        conn_.lossState.maybeLrttAckDelay.value_or(0us),
+        conn_.lossState.rttvar,
+        getCongestionWindow(),
+        conn_.lossState.inflightBytes,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        conn_.lossState.ptoCount);
   }
   DCHECK(loss.largestLostPacketNum.has_value());
   if (loss.persistentCongestion) {
@@ -159,22 +149,18 @@ void Copa2::onPacketLoss(const LossEvent& loss) {
       conn_.pacer->refreshPacingRate(cwndBytes_, conn_.lossState.mrtt);
     }
     if (conn_.qLogger) {
-      conn_.qLogger->addCongestionMetricUpdate(
-          conn_.lossState.inflightBytes,
-          getCongestionWindow(),
-          kPersistentCongestion);
       conn_.qLogger->addMetricUpdate(
+          conn_.lossState.lrtt,
           conn_.lossState.mrtt,
           conn_.lossState.srtt,
-          conn_.lossState.lrtt,
+          conn_.lossState.maybeLrttAckDelay.value_or(0us),
           conn_.lossState.rttvar,
-          conn_.lossState.ptoCount,
           getCongestionWindow(),
           conn_.lossState.inflightBytes,
-          UINT64_MAX,
-          getCongestionWindow() / conn_.udpSendPacketLen,
-          calculatePacingRate(conn_, getCongestionWindow(),
-            conn_.transportSettings.minCwndInMss, conn_.lossState.lrtt).interval);
+          std::nullopt,
+          std::nullopt,
+          std::nullopt,
+          conn_.lossState.ptoCount);
     }
   }
 

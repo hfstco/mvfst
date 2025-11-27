@@ -63,7 +63,6 @@ class QLogger {
     uint64_t finalPacketLossTimeReorderingThreshDividend{};
     bool usedZeroRtt{};
     QuicVersion quicVersion{QuicVersion::MVFST_INVALID};
-    uint64_t dsrPacketCount{};
     uint16_t initialPacketsReceived{};
     uint16_t uniqueInitialCryptoFramesReceived{};
     std::chrono::milliseconds timeUntilLastInitialCryptoFrameReceived;
@@ -120,16 +119,21 @@ class QLogger {
       ProtectionType protectionType,
       uint64_t packetSize) = 0;
   virtual void addMetricUpdate(
-      std::chrono::microseconds minRtt,
-      std::chrono::microseconds smoothedRtt,
       std::chrono::microseconds latestRtt,
-      std::chrono::microseconds rttVariance,
-      uint16_t ptoCount,
-      uint64_t congestionWindow,
-      uint64_t bytesInFlight,
-      uint64_t ssthresh,
-      uint64_t packetsInFlight,
-      std::chrono::microseconds pacingRate) = 0;
+      std::chrono::microseconds mrtt,
+      std::chrono::microseconds srtt,
+      std::chrono::microseconds ackDelay,
+      Optional<std::chrono::microseconds> rttVar = std::nullopt,
+      Optional<uint64_t> congestionWindow = std::nullopt,
+      Optional<uint64_t> bytesInFlight = std::nullopt,
+      Optional<uint64_t> ssthresh = std::nullopt,
+      Optional<uint64_t> packetsInFlight = std::nullopt,
+      Optional<uint64_t> pacingRateBytesPerSec = std::nullopt,
+      Optional<uint32_t> ptoCount = std::nullopt) = 0;
+  virtual void addCongestionStateUpdate(
+      Optional<std::string> oldState,
+      std::string newState,
+      Optional<std::string> trigger) = 0;
   virtual void addStreamStateUpdate(
       quic::StreamId streamId,
       std::string update,

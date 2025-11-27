@@ -737,9 +737,6 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacketData(
         VLOG(4) << errMsg << " " << *this;
         // we want to deliver app callbacks with the peer supplied error,
         // but send a NO_ERROR to the peer.
-        if (conn_->qLogger) {
-          conn_->qLogger->addTransportStateUpdate(getPeerClose(errMsg));
-        }
         conn_->peerConnectionError =
             QuicError(QuicErrorCode(connFrame.errorCode), std::move(errMsg));
         // We don't return an error here, as receiving a close triggers the
@@ -1071,21 +1068,6 @@ quic::Expected<void, QuicError> QuicClientTransportLite::onReadData(
   }
 
   return {};
-}
-
-QuicSocketLite::WriteResult QuicClientTransportLite::writeBufMeta(
-    StreamId /* id */,
-    const BufferMeta& /* data */,
-    bool /* eof */,
-    ByteEventCallback* /* cb */) {
-  return quic::make_unexpected(LocalErrorCode::INVALID_OPERATION);
-}
-
-QuicSocketLite::WriteResult
-QuicClientTransportLite::setDSRPacketizationRequestSender(
-    StreamId /* id */,
-    std::unique_ptr<DSRPacketizationRequestSender> /* sender */) {
-  return quic::make_unexpected(LocalErrorCode::INVALID_OPERATION);
 }
 
 quic::Expected<void, QuicError> QuicClientTransportLite::writeData() {
@@ -1584,6 +1566,9 @@ quic::Expected<void, QuicError> QuicClientTransportLite::recvMsg(
           remaining = 0;
           networkData.addPacket(
               ReceivedUdpPacket(std::move(readBuffer), timings, params.tos));
+          // This is the last packet. Break here to silence the linter's warning
+          // about a use-after-move in the next iteration of the loop
+          break;
         }
       }
     } else {
@@ -1774,6 +1759,9 @@ quic::Expected<void, QuicError> QuicClientTransportLite::recvMmsg(
           remaining = 0;
           networkData.addPacket(
               ReceivedUdpPacket(std::move(readBuffer), timings, params.tos));
+          // This is the last packet. Break here to silence the linter's warning
+          // about a use-after-move in the next iteration of the loop
+          break;
         }
       }
     } else {
@@ -2257,6 +2245,8 @@ quic::Expected<void, QuicError> QuicClientTransportLite::migrateConnection(
     conn_->qLogger->addConnectionMigrationUpdate(true);
   }
 
+  QUIC_STATS(conn_->statsCallback, onConnectionMigration);
+
   // Keep the old path for some time so we can read any packets that might
   // already be inflight
   auto removePathLambda = [conn = shared_from_this(), oldPathId]() {
@@ -2476,6 +2466,12 @@ void QuicClientTransportLite::onPathValidationResult(const PathInfo& pathInfo) {
     it->second->onPathValidationResult(pathInfo);
     // Remove the callback
     pathValidationCallbacks_.erase(pathInfo.id);
+  }
+
+  if (pathInfo.status == PathStatus::Validated) {
+    QUIC_STATS(conn_->statsCallback, onPathValidationSuccess);
+  } else {
+    QUIC_STATS(conn_->statsCallback, onPathValidationFailure);
   }
 
   if (pathInfo.id != conn_->currentPathId) {

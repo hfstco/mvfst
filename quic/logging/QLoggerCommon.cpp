@@ -79,7 +79,6 @@ void QLoggerCommon::addTransportSummary(const TransportSummaryArgs& args) {
           args.finalPacketLossTimeReorderingThreshDividend,
           args.usedZeroRtt,
           args.quicVersion,
-          args.dsrPacketCount,
           args.initialPacketsReceived,
           args.uniqueInitialCryptoFramesReceived,
           args.timeUntilLastInitialCryptoFrameReceived,
@@ -233,6 +232,22 @@ void QLoggerCommon::addPacketsLost(
 }
 
 void QLoggerCommon::addTransportStateUpdate(std::string update) {
+  // Filter out invalid ConnectionState enum values.
+  static const std::unordered_set<std::string> validStates = {
+      "attempted",
+      "handshake_started",
+      "handshake_complete",
+      "closed",
+      "peer_validated",
+      "early_write",
+      "handshake_confirmed",
+      "closing",
+      "draining"};
+
+  if (validStates.find(update) == validStates.end()) {
+    return; // Skip invalid states
+  }
+
   auto refTime = std::chrono::duration_cast<std::chrono::microseconds>(
       std::chrono::steady_clock::now().time_since_epoch());
 
@@ -253,23 +268,49 @@ void QLoggerCommon::addPacketBuffered(
 }
 
 void QLoggerCommon::addMetricUpdate(
-  std::chrono::microseconds minRtt,
-  std::chrono::microseconds smoothedRtt,
-  std::chrono::microseconds latestRtt,
-  std::chrono::microseconds rttVariance,
-  uint16_t ptoCount,
-  uint64_t congestionWindow,
-  uint64_t bytesInFlight,
-  uint64_t ssthresh,
-  uint64_t packetsInFlight,
-  std::chrono::microseconds pacingRate) {
+    std::chrono::microseconds latestRtt,
+    std::chrono::microseconds mrtt,
+    std::chrono::microseconds srtt,
+    std::chrono::microseconds ackDelay,
+    Optional<std::chrono::microseconds> rttVar,
+    Optional<uint64_t> congestionWindow,
+    Optional<uint64_t> bytesInFlight,
+    Optional<uint64_t> ssthresh,
+    Optional<uint64_t> packetsInFlight,
+    Optional<uint64_t> pacingRateBytesPerSec,
+    Optional<uint32_t> ptoCount) {
   auto refTime = std::chrono::duration_cast<std::chrono::microseconds>(
       std::chrono::steady_clock::now().time_since_epoch());
 
   logTrace(
-    std::make_unique<quic::QLogMetricUpdateEvent>(
-    minRtt, smoothedRtt, latestRtt, rttVariance, ptoCount, congestionWindow,
-    bytesInFlight, ssthresh, packetsInFlight, pacingRate, refTime));
+      std::make_unique<quic::QLogMetricUpdateEvent>(
+          latestRtt,
+          mrtt,
+          srtt,
+          ackDelay,
+          refTime,
+          rttVar,
+          congestionWindow,
+          bytesInFlight,
+          ssthresh,
+          packetsInFlight,
+          pacingRateBytesPerSec,
+          ptoCount));
+}
+
+void QLoggerCommon::addCongestionStateUpdate(
+    Optional<std::string> oldState,
+    std::string newState,
+    Optional<std::string> trigger) {
+  auto refTime = std::chrono::duration_cast<std::chrono::microseconds>(
+      std::chrono::steady_clock::now().time_since_epoch());
+
+  logTrace(
+      std::make_unique<quic::QLogCongestionStateUpdateEvent>(
+          std::move(oldState),
+          std::move(newState),
+          std::move(trigger),
+          refTime));
 }
 
 void QLoggerCommon::addStreamStateUpdate(
