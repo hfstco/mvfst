@@ -12,7 +12,6 @@
 #include <quic/server/QuicServerTransport.h>
 #include <quic/server/handshake/AppToken.h>
 #include <quic/server/handshake/DefaultAppTokenValidator.h>
-#include <quic/state/QuicStreamUtilities.h>
 #include <quic/state/TransportSettingsFunctions.h>
 
 #include <quic/common/Optional.h>
@@ -1438,8 +1437,9 @@ void QuicServerTransport::onPathValidationResult(const PathInfo& pathInfo) {
     }
     auto removePathRes = conn->conn_->pathManager->removePath(pathToRemove);
     if (removePathRes.hasError()) {
-      LOG(WARNING) << "Failed to remove " + pathType + " path: "
-                   << removePathRes.error();
+      // This is best effort since the path could have already been reaped.
+      VLOG(4) << "Removing " + pathType + " path error: "
+              << removePathRes.error();
     }
   };
 
@@ -1480,6 +1480,18 @@ void QuicServerTransport::onPathValidationResult(const PathInfo& pathInfo) {
       // We should fallback to the previously validated path or close the
       // connection if we don't have one.
 
+      // Increment consecutive migration failure counter
+      ++serverConn_->consecutiveMigrationFailures;
+
+      // Close connection if we've exceeded the limit
+      if (serverConn_->consecutiveMigrationFailures >=
+          kMaxConsecutiveMigrationFailures) {
+        closeImpl(QuicError(
+            QuicErrorCode(TransportErrorCode::INVALID_MIGRATION),
+            std::string("Too many consecutive migration failures")));
+        return;
+      }
+
       // This will reverse what ServerStateMachine::onConnectionMigration()
       // did. The reason it's here is that we want to be able to close the
       // connection, which is only possible from the transport.
@@ -1505,6 +1517,8 @@ void QuicServerTransport::onPathValidationResult(const PathInfo& pathInfo) {
             }
             conn_->fallbackPathId.reset();
             migrationReverted = true;
+            // Schedule ping to confirm client is on fallback path
+            conn_->pendingEvents.sendPing = true;
           }
         }
       }
