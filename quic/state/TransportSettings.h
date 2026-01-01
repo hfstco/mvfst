@@ -141,6 +141,10 @@ struct DatagramConfig {
   CongestionControlMode trackingMode{CongestionControlMode::Constrained};
   uint32_t readBufSize{kDefaultMaxDatagramsBuffered};
   uint32_t writeBufSize{kDefaultMaxDatagramsBuffered};
+  // Schedule datagrams via PriorityQueue with streams instead of separately
+  bool scheduleDatagramsWithStreams{false};
+  // Default priority for datagrams when scheduleDatagramsWithStreams is true
+  uint8_t defaultDatagramPriority{0};
 };
 
 struct AckReceiveTimestampsConfig {
@@ -476,9 +480,6 @@ struct TransportSettings {
   // to the client.
   bool disablePausedPriority{false};
 
-  // Use the new priority queue and scheduling implementation
-  bool useNewPriorityQueue{true};
-
   bool sendAckOnlyInitial{false};
 
   // Randomly skip one in N sequence numbers when sending packets.
@@ -514,6 +515,8 @@ struct TransportSettings {
 
   // TODO(T239869314): Remove this after experiment is done.
   std::chrono::milliseconds keepAliveTimeout{0};
+
+  bool enableScone{false};
 };
 
 } // namespace quic

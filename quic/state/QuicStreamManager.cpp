@@ -7,7 +7,6 @@
 
 #include <quic/logging/QLogger.h>
 #include <quic/priority/HTTPPriorityQueue.h>
-#include <quic/state/QuicPriorityQueue.h>
 #include <quic/state/QuicStreamManager.h>
 #include <quic/state/QuicStreamUtilities.h>
 #include <quic/state/QuicTransportStatsCallback.h>
@@ -108,9 +107,6 @@ static LocalErrorCode openLocalStreamIfNotClosed(
 
 void QuicStreamManager::setWriteQueueMaxNextsPerStream(
     uint64_t maxNextsPerStream) {
-  if (oldWriteQueue_) {
-    oldWriteQueue_->setMaxNextsPerStream(maxNextsPerStream);
-  }
   dynamic_cast<HTTPPriorityQueue&>(writeQueue())
       .advanceAfterNext(maxNextsPerStream);
 }
@@ -138,6 +134,32 @@ QuicStreamState* QuicStreamManager::findStream(StreamId streamId) {
   } else {
     return &lookup->second;
   }
+}
+
+QuicStreamState* QuicStreamManager::getStreamIfExists(StreamId streamId) {
+  // Fast path: state already materialized (common case)
+  auto* stream = findStream(streamId);
+  if (stream) {
+    return stream;
+  }
+
+  // Slow path: check if stream exists but state not materialized
+  if (!streamExists(streamId)) {
+    return nullptr; // Stream doesn't exist or was closed
+  }
+
+  // Stream exists in open set but state needs lazy materialization
+  auto result = getStream(streamId);
+  if (!result.has_value()) {
+    // Error materializing state (should be rare)
+    return nullptr;
+  }
+  // At this point result.value() should never be nullptr because:
+  // - We verified streamExists() is true (stream is in open set)
+  // - getStream() only returns nullptr for closed streams
+  // - Closed streams are removed from open sets
+  DCHECK(result.value() != nullptr);
+  return result.value();
 }
 
 quic::Expected<void, QuicError>
@@ -236,10 +258,6 @@ bool QuicStreamManager::consumeMaxLocalUnidirectionalStreamIdIncreased() {
 
 quic::Expected<void, LocalErrorCode> QuicStreamManager::setPriorityQueue(
     std::unique_ptr<PriorityQueue> queue) {
-  if (oldWriteQueue_) {
-    LOG(ERROR) << "Cannot change priority queue when the old queue is in use";
-    return quic::make_unexpected(LocalErrorCode::INTERNAL_ERROR);
-  }
   if (!writeQueue().empty()) {
     LOG(ERROR) << "Cannot change priority queue when the queue is not empty";
     return quic::make_unexpected(LocalErrorCode::INTERNAL_ERROR);
@@ -290,29 +308,8 @@ quic::Expected<void, QuicError> QuicStreamManager::refreshTransportSettings(
   if (!writeQueue_) {
     writeQueue_ = std::make_unique<HTTPPriorityQueue>();
   }
-  return updatePriorityQueueImpl(transportSettings_->useNewPriorityQueue);
-}
-
-quic::Expected<void, QuicError> QuicStreamManager::updatePriorityQueueImpl(
-    bool useNewPriorityQueue) {
-  if (!useNewPriorityQueue && !oldWriteQueue_) {
-    if (writeQueue_->empty() && connFlowControlBlocked_.empty()) {
-      oldWriteQueue_ = std::make_unique<deprecated::PriorityQueue>();
-    } else {
-      return quic::make_unexpected(QuicError(
-          QuicErrorCode(LocalErrorCode::INTERNAL_ERROR),
-          "Cannot change priority queue when the queue is not empty"));
-    }
-  } else if (useNewPriorityQueue && oldWriteQueue_) {
-    if (oldWriteQueue_->empty()) {
-      oldWriteQueue_.reset();
-    } else {
-      return quic::make_unexpected(QuicError(
-          QuicErrorCode(LocalErrorCode::INTERNAL_ERROR),
-          "Cannot change to new priority queue when the queue is not empty"));
-    }
-  } // else no change
-
+  setWriteQueueMaxNextsPerStream(
+      transportSettings_->priorityQueueWritesPerStream);
   return {};
 }
 
@@ -894,15 +891,6 @@ void QuicStreamManager::updateWritableStreams(
     return;
   }
 
-  // Check if paused
-  // pausedButDisabled adds a hard dep on writeQueue being an HTTPPriorityQueue.
-  auto httpPri = HTTPPriorityQueue::Priority(stream.priority);
-  if (oldWriteQueue_ && httpPri->paused &&
-      !transportSettings_->disablePausedPriority) {
-    removeWritable(stream);
-    return;
-  }
-
   // Update writable/loss sets based on data presence
   if (stream.hasWritableData()) {
     writableStreams_.emplace(stream.id);
@@ -916,38 +904,27 @@ void QuicStreamManager::updateWritableStreams(
   }
 
   // Update the actual scheduling queues (PriorityQueue or control set)
-  connFlowControlOpen |= bool(oldWriteQueue_);
   if (stream.hasSchedulableData(connFlowControlOpen)) {
     if (stream.isControl) {
       controlWriteQueue_.emplace(stream.id);
     } else {
-      if (oldWriteQueue_) {
-        const static deprecated::Priority kPausedDisabledPriority(7, true);
-        auto oldPri = httpPri->paused
-            ? kPausedDisabledPriority
-            : deprecated::Priority(
-                  httpPri->urgency, httpPri->incremental, httpPri->order);
-        oldWriteQueue_->insertOrUpdate(stream.id, oldPri);
-      } else {
-        const static PriorityQueue::Priority kPausedDisabledPriority(
-            HTTPPriorityQueue::Priority(7, true));
-        writeQueue().insertOrUpdate(
-            PriorityQueue::Identifier::fromStreamID(stream.id),
-            httpPri->paused && transportSettings_->disablePausedPriority
-                ? kPausedDisabledPriority
-                : stream.priority);
-      }
+      // pausedButDisabled adds a hard dep on writeQueue being an
+      // HTTPPriorityQueue.
+      auto httpPri = HTTPPriorityQueue::Priority(stream.priority);
+      const static PriorityQueue::Priority kPausedDisabledPriority(
+          HTTPPriorityQueue::Priority(7, true));
+      writeQueue().insertOrUpdate(
+          PriorityQueue::Identifier::fromStreamID(stream.id),
+          httpPri->paused && transportSettings_->disablePausedPriority
+              ? kPausedDisabledPriority
+              : stream.priority);
     }
   } else {
     // Not schedulable, remove from queues
     if (stream.isControl) {
       controlWriteQueue_.erase(stream.id);
     } else {
-      if (oldWriteQueue_) {
-        oldWriteQueue_->erase(stream.id);
-      } else {
-        writeQueue().erase(PriorityQueue::Identifier::fromStreamID(stream.id));
-      }
+      writeQueue().erase(PriorityQueue::Identifier::fromStreamID(stream.id));
     }
   }
 }

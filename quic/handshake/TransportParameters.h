@@ -48,6 +48,8 @@ enum class TransportParameterId : uint64_t {
   client_direct_encap = 0x000042fc,
   server_direct_encap = 0x000042fd,
   reliable_stream_reset = 0x17f7586d2cb571,
+  scone_supported = 0x219e
+  reliable_stream_reset = 0x17f7586d2cb571,
   saved_congestion_window = 0x5eed1,
   saved_rtt = 0x5eed2
 };
@@ -84,7 +86,7 @@ struct TransportParameter {
    */
 
   // calc size needed to encode TransportParameter on the wire as shown above
-  uint64_t getEncodedSize() const {
+  [[nodiscard]] uint64_t getEncodedSize() const {
     // varint size of param + varint size of value's length + size of value
     uint64_t valueLen = value->computeChainDataLength();
     return getQuicIntegerSize(u64_tp(parameter)).value() +
@@ -92,7 +94,7 @@ struct TransportParameter {
   }
 
   // Encodes TransportParameter as shown above (avoids reallocations)
-  BufPtr encode() const {
+  [[nodiscard]] BufPtr encode() const {
     // reserve the exact size needed
     auto res =
         BufHelpers::createCombined(static_cast<size_t>(getEncodedSize()));
@@ -154,6 +156,11 @@ quic::Expected<TransportParameter, QuicError> encodeIntegerParameter(
 TransportParameter encodeIPAddressParameter(
     TransportParameterId id,
     const folly::IPAddress& addr);
+
+bool getSconeSupportedParameter(
+    const std::vector<TransportParameter>& parameters);
+
+TransportParameter encodeSconeSupportedParameter();
 
 inline TransportParameter encodeEmptyParameter(TransportParameterId id) {
   TransportParameter param;

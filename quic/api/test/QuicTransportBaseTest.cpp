@@ -10,12 +10,15 @@
 #include <folly/portability/GMock.h>
 #include <folly/portability/GTest.h>
 
+#include <quic/QuicConstants.h>
 #include <quic/api/QuicSocket.h>
 #include <quic/api/QuicTransportBase.h>
 #include <quic/codec/DefaultConnectionIdAlgo.h>
+#include <quic/codec/QuicPacketBuilder.h>
 #include <quic/common/events/FollyQuicEventBase.h>
 #include <quic/common/test/TestUtils.h>
 #include <quic/fizz/server/handshake/FizzServerQuicHandshakeContext.h>
+#include <quic/logging/QLoggerConstants.h>
 #include <quic/server/state/ServerStateMachine.h>
 #include <quic/state/DatagramHandlers.h>
 #include <quic/state/QuicStreamFunctions.h>
@@ -392,7 +395,7 @@ class TestQuicTransport
     pacedWriteDataToSocket();
   }
 
-  bool hasWriteCipher() const {
+  bool hasWriteCipher() const override {
     return conn_->oneRttWriteCipher != nullptr;
   }
 
@@ -404,7 +407,7 @@ class TestQuicTransport
     return *conn_;
   }
 
-  void closeTransport() {
+  void closeTransport() override {
     transportClosed = true;
   }
 
@@ -452,7 +455,7 @@ class TestQuicTransport
     return readLooper_;
   }
 
-  void unbindConnection() {}
+  void unbindConnection() override {}
 
   void onReadError(const folly::AsyncSocketException&) noexcept {}
 
@@ -633,6 +636,10 @@ class TestQuicTransport
 
   void maybeStopWriteLooperAndArmSocketWritableEvent() {
     QuicTransportBase::maybeStopWriteLooperAndArmSocketWritableEvent();
+  }
+
+  void invokeReadDataAndCallbacks() {
+    QuicTransportBase::invokeReadDataAndCallbacks(true);
   }
 
   void closeImpl(
@@ -4392,8 +4399,9 @@ TEST_F(QuicTransportImplTest, ObserverDetachOnCloseStartedDuringDestroy) {
   InSequence s;
 
   EXPECT_CALL(*cb, closeStarted(transport.get(), _))
-      .WillOnce(Invoke([&cb](auto callbackTransport, auto /* errorOpt */) {
-        EXPECT_TRUE(callbackTransport->removeObserver(cb.get()));
+      .WillOnce(Invoke([&cb](auto* callbackTransport, const auto& /* event */) {
+        auto* fullTransport = dynamic_cast<QuicSocket*>(callbackTransport);
+        EXPECT_TRUE(fullTransport && fullTransport->removeObserver(cb.get()));
       }));
   EXPECT_CALL(*cb, observerDetach(transport.get()));
   transport = nullptr;
@@ -4410,8 +4418,9 @@ TEST_F(QuicTransportImplTest, ObserverDetachOnClosingDuringDestroy) {
 
   EXPECT_CALL(*cb, closeStarted(transport.get(), _));
   EXPECT_CALL(*cb, closing(transport.get(), _))
-      .WillOnce(Invoke([&cb](auto callbackTransport, auto /* errorOpt */) {
-        EXPECT_TRUE(callbackTransport->removeObserver(cb.get()));
+      .WillOnce(Invoke([&cb](auto* callbackTransport, const auto& /* event */) {
+        auto* fullTransport = dynamic_cast<QuicSocket*>(callbackTransport);
+        EXPECT_TRUE(fullTransport && fullTransport->removeObserver(cb.get()));
       }));
   EXPECT_CALL(*cb, observerDetach(transport.get()));
   transport = nullptr;
@@ -5282,6 +5291,73 @@ TEST_P(
   transport->maybeStopWriteLooperAndArmSocketWritableEvent();
 
   transport.reset();
+}
+
+TEST_F(QuicTransportImplTest, SconeRateSignalCallbackProcessingSync) {
+  transport->transportConn->transportSettings.enableScone = true;
+  transport->transportConn->scone.emplace();
+  transport->transportConn->scone->negotiated = true;
+
+  uint8_t rateA = 0x1B; // 27
+  uint8_t rateB = 0x2C; // 44
+  QuicVersion testVersion = QuicVersion::SCONE_VERSION_2;
+  transport->transportConn->scone->pendingRateSignals.push_back(
+      {rateA, testVersion});
+  transport->transportConn->scone->pendingRateSignals.push_back(
+      {rateB, testVersion});
+
+  MockConnectionCallback cb;
+  transport->setConnectionCallback(&cb);
+  EXPECT_CALL(cb, onSconeRateSignal(rateA, testVersion)).Times(1);
+  EXPECT_CALL(cb, onSconeRateSignal(rateB, testVersion)).Times(1);
+
+  // Run everything on the event-base thread so that the connection callback is
+  // installed in the correct thread context before processing.
+  transport->invokeReadDataAndCallbacks();
+
+  EXPECT_TRUE(transport->transportConn->scone->pendingRateSignals.empty());
+  transport->setConnectionCallback(nullptr);
+}
+
+// Test that we can call APIs on implicitly opened streams that don't have
+// materialized state yet. This is a regression test for a bug where
+// getStreamIfExists() was incorrectly using findStream() instead of the
+// streamExists() + getStream() pattern, causing it to return nullptr for
+// streams that existed in the open set but didn't have state materialized.
+TEST_P(
+    QuicTransportImplTestBase,
+    ImplicitlyOpenedStreamWithUnmaterializedState) {
+  // Set up the transport
+  transport->transportConn->oneRttWriteCipher = test::createNoOpAead();
+
+  // In QUIC, when you receive data on stream N, it implicitly opens all
+  // streams with IDs < N. For a server receiving from a client:
+  // - Client bidirectional streams have IDs: 0, 4, 8, 12, ...
+  // So receiving on stream 8 implicitly opens streams 0 and 4.
+
+  // Receive data on stream 8 - this implicitly opens streams 0 and 4
+  transport->addDataToStream(
+      8, StreamBuffer(folly::IOBuf::copyBuffer("data on stream 8"), 0));
+
+  // Stream 4 is now implicitly opened (in the open set) but doesn't have
+  // materialized state yet. The bug would cause setReadCallback to return
+  // STREAM_NOT_EXISTS because findStream() would return nullptr.
+
+  // Try to set a read callback on the implicitly opened stream 4
+  NiceMock<MockReadCallback> readCb;
+  auto result = transport->setReadCallback(4, &readCb);
+
+  // This should succeed - the stream exists and state should be materialized
+  EXPECT_FALSE(result.hasError())
+      << "setReadCallback should succeed on implicitly opened stream";
+
+  // Verify we can perform other operations on the implicitly opened stream
+  auto priorityResult = transport->getStreamPriority(4);
+  EXPECT_FALSE(priorityResult.hasError())
+      << "getStreamPriority should succeed on implicitly opened stream";
+
+  // Clean up: remove the read callback before transport is destroyed
+  ASSERT_FALSE(transport->setReadCallback(4, nullptr).hasError());
 }
 
 } // namespace quic::test

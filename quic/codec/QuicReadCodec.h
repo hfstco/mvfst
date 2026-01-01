@@ -49,6 +49,13 @@ struct CodecError {
   explicit CodecError(QuicError errorIn) : error(std::move(errorIn)) {}
 };
 
+struct SCONEPacket {
+  uint8_t rate;
+  uint32_t version;
+  ConnectionId dstCid;
+  ConnectionId srcCid;
+};
+
 struct CodecResult {
   enum class Type {
     REGULAR_PACKET,
@@ -56,7 +63,8 @@ struct CodecResult {
     CIPHER_UNAVAILABLE,
     STATELESS_RESET,
     NOTHING,
-    CODEC_ERROR
+    CODEC_ERROR,
+    SCONE_PACKET
   };
 
   ~CodecResult();
@@ -70,6 +78,7 @@ struct CodecResult {
   /* implicit */ CodecResult(RetryPacket&& retryPacket);
   /* implicit */ CodecResult(Nothing&& nothing);
   /* implicit */ CodecResult(CodecError&& codecErrorIn);
+  /* implicit */ CodecResult(SCONEPacket&& sconePacketIn);
 
   Type type();
   RegularQuicPacket* regularPacket();
@@ -78,6 +87,7 @@ struct CodecResult {
   RetryPacket* retryPacket();
   Nothing* nothing();
   CodecError* codecError();
+  SCONEPacket* sconePacket();
 
  private:
   void destroyCodecResult();
@@ -89,6 +99,7 @@ struct CodecResult {
     StatelessReset reset;
     Nothing none;
     CodecError error;
+    SCONEPacket sconePacket_;
   };
 
   Type type_;
@@ -130,22 +141,23 @@ class QuicReadCodec {
   Optional<VersionNegotiationPacket> tryParsingVersionNegotiation(
       BufQueue& queue);
 
-  const Aead* getOneRttReadCipher() const;
-  const Aead* getZeroRttReadCipher() const;
-  const Aead* getHandshakeReadCipher() const;
+  [[nodiscard]] const Aead* getOneRttReadCipher() const;
+  [[nodiscard]] const Aead* getZeroRttReadCipher() const;
+  [[nodiscard]] const Aead* getHandshakeReadCipher() const;
 
-  const Aead* getInitialCipher() const;
+  [[nodiscard]] const Aead* getInitialCipher() const;
 
-  const PacketNumberCipher* getInitialHeaderCipher() const;
-  const PacketNumberCipher* getOneRttHeaderCipher() const;
-  const PacketNumberCipher* getHandshakeHeaderCipher() const;
-  const PacketNumberCipher* getZeroRttHeaderCipher() const;
+  [[nodiscard]] const PacketNumberCipher* getInitialHeaderCipher() const;
+  [[nodiscard]] const PacketNumberCipher* getOneRttHeaderCipher() const;
+  [[nodiscard]] const PacketNumberCipher* getHandshakeHeaderCipher() const;
+  [[nodiscard]] const PacketNumberCipher* getZeroRttHeaderCipher() const;
 
-  const Optional<StatelessResetToken>& getStatelessResetToken() const;
+  [[nodiscard]] const Optional<StatelessResetToken>& getStatelessResetToken()
+      const;
 
   [[nodiscard]] ProtectionType getCurrentOneRttReadPhase() const;
 
-  CodecParameters getCodecParameters() const;
+  [[nodiscard]] CodecParameters getCodecParameters() const;
 
   void setInitialReadCipher(std::unique_ptr<Aead> initialReadCipher);
   void setOneRttReadCipher(std::unique_ptr<Aead> oneRttReadCipher);
@@ -167,8 +179,8 @@ class QuicReadCodec {
   void setServerConnectionId(ConnectionId connId);
   void setStatelessResetToken(StatelessResetToken statelessResetToken);
   void setCryptoEqual(std::function<bool(ByteRange, ByteRange)> cryptoEqual);
-  const ConnectionId& getClientConnectionId() const;
-  const ConnectionId& getServerConnectionId() const;
+  [[nodiscard]] const ConnectionId& getClientConnectionId() const;
+  [[nodiscard]] const ConnectionId& getServerConnectionId() const;
 
   void setConnectionStatsCallback(QuicTransportStatsCallback* callback);
 
@@ -241,5 +253,10 @@ class QuicReadCodec {
 
   QuicTransportStatsCallback* statsCallback_{nullptr};
 };
+
+/**
+ * Decode a SCONE packet from the given cursor.
+ */
+Expected<SCONEPacket, TransportErrorCode> decodeScone(Cursor& cursor);
 
 } // namespace quic

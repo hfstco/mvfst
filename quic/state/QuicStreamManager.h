@@ -13,7 +13,6 @@
 #include <quic/codec/Types.h>
 #include <quic/common/Expected.h>
 #include <quic/priority/PriorityQueue.h>
-#include <quic/state/QuicPriorityQueue.h>
 #include <quic/state/StreamData.h>
 #include <quic/state/TransportSettings.h>
 #include <numeric>
@@ -21,6 +20,9 @@
 
 namespace quic {
 class QLogger;
+
+// Default priority for datagrams when scheduling with streams
+extern const PriorityQueue::Priority kDefaultDatagramPriority;
 
 namespace detail {
 
@@ -219,7 +221,6 @@ class QuicStreamManager {
     unidirectionalReadableStreams_ =
         std::move(other.unidirectionalReadableStreams_);
     peekableStreams_ = std::move(other.peekableStreams_);
-    oldWriteQueue_ = std::move(other.oldWriteQueue_);
     writeQueue_ = std::move(other.writeQueue_);
     controlWriteQueue_ = std::move(other.controlWriteQueue_);
     writableStreams_ = std::move(other.writableStreams_);
@@ -325,6 +326,21 @@ class QuicStreamManager {
    */
   bool streamExists(StreamId streamId);
 
+  /*
+   * Optimized stream lookup that handles lazy state materialization.
+   *
+   * Fast path: If stream state is already materialized, returns it immediately.
+   * Slow path: If stream exists but state not materialized, creates state.
+   *
+   * Returns:
+   * - Pointer to stream state if stream exists (may materialize state lazily)
+   * - nullptr if stream doesn't exist or was closed
+   *
+   * This is the recommended replacement for streamExists() + getStream()
+   * pattern. Safe for both local and remote streams.
+   */
+  QuicStreamState* FOLLY_NULLABLE getStreamIfExists(StreamId streamId);
+
   uint64_t openableLocalBidirectionalStreams() {
     CHECK_GE(
         maxLocalBidirectionalStreamId_,
@@ -410,7 +426,7 @@ class QuicStreamManager {
    * Return a const reference to the underlying container holding the stream
    * state.
    */
-  const auto& streams() const {
+  [[nodiscard]] const auto& streams() const {
     return streams_;
   }
 
@@ -455,25 +471,16 @@ class QuicStreamManager {
     return *writeQueue_;
   }
 
-  auto* oldWriteQueue() {
-    return oldWriteQueue_.get();
-  }
-
-  bool hasWritable() const {
-    return (oldWriteQueue_ && !oldWriteQueue_->empty()) ||
-        !writeQueue_->empty() || !controlWriteQueue_.empty();
+  [[nodiscard]] bool hasWritable() const {
+    return !writeQueue_->empty() || !controlWriteQueue_.empty();
   }
 
   void removeWritable(const QuicStreamState& stream) {
     if (stream.isControl) {
       controlWriteQueue_.erase(stream.id);
     } else {
-      if (oldWriteQueue_) {
-        oldWriteQueue()->erase(stream.id);
-      } else {
-        writeQueue().erase(PriorityQueue::Identifier::fromStreamID(stream.id));
-        connFlowControlBlocked_.erase(stream.id);
-      }
+      writeQueue().erase(PriorityQueue::Identifier::fromStreamID(stream.id));
+      connFlowControlBlocked_.erase(stream.id);
     }
     writableStreams_.erase(stream.id);
     lossStreams_.erase(stream.id);
@@ -481,14 +488,11 @@ class QuicStreamManager {
 
   void clearWritable() {
     writableStreams_.clear();
-    if (oldWriteQueue_) {
-      oldWriteQueue()->clear();
-    }
     writeQueue().clear();
     controlWriteQueue_.clear();
   }
 
-  const auto& blockedStreams() const {
+  [[nodiscard]] const auto& blockedStreams() const {
     return blockedStreams_;
   }
 
@@ -500,7 +504,7 @@ class QuicStreamManager {
     blockedStreams_.erase(streamId);
   }
 
-  bool hasBlocked() const {
+  [[nodiscard]] bool hasBlocked() const {
     return !blockedStreams_.empty();
   }
 
@@ -537,9 +541,6 @@ class QuicStreamManager {
   [[nodiscard]] quic::Expected<void, QuicError> refreshTransportSettings(
       const TransportSettings& settings);
 
-  [[nodiscard]] quic::Expected<void, QuicError> updatePriorityQueueImpl(
-      bool useNewPriorityQueue);
-
   void setStreamLimitWindowingFraction(uint64_t fraction) {
     if (fraction > 0) {
       streamLimitWindowingFraction_ = fraction;
@@ -558,7 +559,7 @@ class QuicStreamManager {
     return ret;
   }
 
-  const auto& windowUpdates() const {
+  [[nodiscard]] const auto& windowUpdates() const {
     return windowUpdates_;
   }
 
@@ -574,7 +575,7 @@ class QuicStreamManager {
     windowUpdates_.erase(streamId);
   }
 
-  bool hasWindowUpdates() const {
+  [[nodiscard]] bool hasWindowUpdates() const {
     return !windowUpdates_.empty();
   }
 
@@ -586,7 +587,7 @@ class QuicStreamManager {
     closedStreams_.insert(streamId);
   }
 
-  const auto& deliverableStreams() const {
+  [[nodiscard]] const auto& deliverableStreams() const {
     return deliverableStreams_;
   }
 
@@ -608,11 +609,11 @@ class QuicStreamManager {
     return ret;
   }
 
-  bool hasDeliverable() const {
+  [[nodiscard]] bool hasDeliverable() const {
     return !deliverableStreams_.empty();
   }
 
-  bool deliverableContains(StreamId streamId) const {
+  [[nodiscard]] bool deliverableContains(StreamId streamId) const {
     return deliverableStreams_.count(streamId) > 0;
   }
 
@@ -736,7 +737,7 @@ class QuicStreamManager {
     return streams_.size();
   }
 
-  const auto& stopSendingStreams() const {
+  [[nodiscard]] const auto& stopSendingStreams() const {
     return stopSendingStreams_;
   }
 
@@ -774,7 +775,7 @@ class QuicStreamManager {
     flowControlUpdated_.clear();
   }
 
-  bool isAppIdle() const;
+  [[nodiscard]] bool isAppIdle() const;
 
   [[nodiscard]] bool getNumBidirectionalGroups() const {
     return openBidirectionalLocalStreamGroups_.size();
@@ -796,22 +797,18 @@ class QuicStreamManager {
   void setWriteQueueMaxNextsPerStream(uint64_t maxNextsPerStream);
 
   void addConnFCBlockedStream(StreamId id) {
-    if (!oldWriteQueue_) {
-      connFlowControlBlocked_.insert(id);
-    }
+    connFlowControlBlocked_.insert(id);
   }
 
   void onMaxData() {
-    if (!oldWriteQueue_) {
-      for (auto id : connFlowControlBlocked_) {
-        auto stream = findStream(id);
-        if (stream) {
-          writeQueue().insertOrUpdate(
-              PriorityQueue::Identifier::fromStreamID(id), stream->priority);
-        }
+    for (auto id : connFlowControlBlocked_) {
+      auto stream = findStream(id);
+      if (stream) {
+        writeQueue().insertOrUpdate(
+            PriorityQueue::Identifier::fromStreamID(id), stream->priority);
       }
-      connFlowControlBlocked_.clear();
     }
+    connFlowControlBlocked_.clear();
   }
 
  private:
@@ -899,7 +896,6 @@ class QuicStreamManager {
   UnorderedSet<StreamId> peekableStreams_;
 
   std::unique_ptr<PriorityQueue> writeQueue_;
-  std::unique_ptr<deprecated::PriorityQueue> oldWriteQueue_;
   std::set<StreamId> controlWriteQueue_;
   UnorderedSet<StreamId> writableStreams_;
   UnorderedSet<StreamId> txStreams_;

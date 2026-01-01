@@ -12,7 +12,6 @@
 #include <quic/server/QuicServerTransport.h>
 #include <quic/server/handshake/AppToken.h>
 #include <quic/server/handshake/DefaultAppTokenValidator.h>
-#include <quic/state/QuicStreamUtilities.h>
 #include <quic/state/TransportSettingsFunctions.h>
 
 #include <quic/common/Optional.h>
@@ -557,6 +556,16 @@ bool QuicServerTransport::shouldWriteNewSessionTicket() {
     // No session ticket has been written yet, we should write one.
     return true;
   }
+
+  // Check if current peer address differs from the most recent source address.
+  // This triggers a new session ticket after connection migration to ensure
+  // the client gets a ticket with the new address for future 0-RTT attempts.
+  if (!serverConn_->tokenSourceAddresses.empty() &&
+      serverConn_->tokenSourceAddresses.back() !=
+          conn_->peerAddress.getIPAddress()) {
+    return true;
+  }
+
   // Conditions for writing more session tickets after the first one:
   // 1. includeCwndHintsInSessionTicket transport setting is set
   // 2. The current BDP is either smaller than or more than twice
@@ -629,15 +638,32 @@ QuicServerTransport::maybeWriteNewSessionTicket() {
     appToken.transportParams = std::move(transportParamsResult.value());
     appToken.sourceAddresses = serverConn_->tokenSourceAddresses;
     appToken.version = conn_->version.value();
-    // If a client connects to server for the first time and doesn't attempt
-    // early data, tokenSourceAddresses will not be set because
-    // validateAndUpdateSourceAddressToken is not called in this case.
-    // So checking if source address token is empty here and adding peerAddr
-    // if so.
-    // TODO accumulate recent source tokens
-    if (appToken.sourceAddresses.empty()) {
-      appToken.sourceAddresses.push_back(conn_->peerAddress.getIPAddress());
+
+    // Ensure the current peer address is always in the source addresses list.
+    // This handles:
+    // 1. First connection without 0-RTT (tokenSourceAddresses is empty)
+    // 2. Connection migration (new address may not be in tokenSourceAddresses)
+    auto currentPeerIP = conn_->peerAddress.getIPAddress();
+    auto it = std::find(
+        appToken.sourceAddresses.begin(),
+        appToken.sourceAddresses.end(),
+        currentPeerIP);
+
+    if (it == appToken.sourceAddresses.end()) {
+      // Current peer address not in the list, add it
+      if (appToken.sourceAddresses.size() >= kMaxNumTokenSourceAddresses) {
+        // Remove oldest address (front of list) to make room
+        appToken.sourceAddresses.erase(appToken.sourceAddresses.begin());
+      }
+      appToken.sourceAddresses.push_back(currentPeerIP);
+    } else if (it != appToken.sourceAddresses.end() - 1) {
+      // Move current address to the end (most recent) if not already there
+      appToken.sourceAddresses.erase(it);
+      appToken.sourceAddresses.push_back(currentPeerIP);
     }
+
+    // Keep connection state in sync with what was written to the session ticket
+    serverConn_->tokenSourceAddresses = appToken.sourceAddresses;
     if (conn_->earlyDataAppParamsGetter) {
       appToken.appParams = conn_->earlyDataAppParamsGetter();
     }
@@ -1231,27 +1257,6 @@ void QuicServerTransport::registerAllTransportKnobParamHandlers() {
         return {};
       });
   registerTransportKnobParamHandler(
-      static_cast<uint64_t>(TransportKnobParamId::USE_NEW_PRIORITY_QUEUE),
-      [](QuicServerTransport& serverTransport,
-         TransportKnobParam::Val value) -> quic::Expected<void, QuicError> {
-        bool useNewPriorityQueue = static_cast<bool>(std::get<uint64_t>(value));
-        auto serverConn = serverTransport.serverConn_;
-        VLOG(3) << "USE_NEW_PRIORITY_QUEUE KnobParam received: "
-                << useNewPriorityQueue;
-        auto refreshResult = serverConn->streamManager->updatePriorityQueueImpl(
-            useNewPriorityQueue);
-        if (refreshResult.hasError()) {
-          return quic::make_unexpected(QuicError(
-              TransportErrorCode::INTERNAL_ERROR,
-              "Refresh transport settings failed"));
-        } else {
-          std::swap(
-              useNewPriorityQueue,
-              serverConn->transportSettings.useNewPriorityQueue);
-        }
-        return {};
-      });
-  registerTransportKnobParamHandler(
       static_cast<uint64_t>(TransportKnobParamId::MIN_STREAM_BUF_THRESH),
       [](QuicServerTransport& serverTransport,
          TransportKnobParam::Val value) -> quic::Expected<void, QuicError> {
@@ -1438,8 +1443,9 @@ void QuicServerTransport::onPathValidationResult(const PathInfo& pathInfo) {
     }
     auto removePathRes = conn->conn_->pathManager->removePath(pathToRemove);
     if (removePathRes.hasError()) {
-      LOG(WARNING) << "Failed to remove " + pathType + " path: "
-                   << removePathRes.error();
+      // This is best effort since the path could have already been reaped.
+      VLOG(4) << "Removing " + pathType + " path error: "
+              << removePathRes.error();
     }
   };
 
@@ -1480,6 +1486,18 @@ void QuicServerTransport::onPathValidationResult(const PathInfo& pathInfo) {
       // We should fallback to the previously validated path or close the
       // connection if we don't have one.
 
+      // Increment consecutive migration failure counter
+      ++serverConn_->consecutiveMigrationFailures;
+
+      // Close connection if we've exceeded the limit
+      if (serverConn_->consecutiveMigrationFailures >=
+          kMaxConsecutiveMigrationFailures) {
+        closeImpl(QuicError(
+            QuicErrorCode(TransportErrorCode::INVALID_MIGRATION),
+            std::string("Too many consecutive migration failures")));
+        return;
+      }
+
       // This will reverse what ServerStateMachine::onConnectionMigration()
       // did. The reason it's here is that we want to be able to close the
       // connection, which is only possible from the transport.
@@ -1505,6 +1523,8 @@ void QuicServerTransport::onPathValidationResult(const PathInfo& pathInfo) {
             }
             conn_->fallbackPathId.reset();
             migrationReverted = true;
+            // Schedule ping to confirm client is on fallback path
+            conn_->pendingEvents.sendPing = true;
           }
         }
       }

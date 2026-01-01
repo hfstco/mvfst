@@ -32,7 +32,7 @@ target_link_libraries(
   ${Boost_LIBRARIES}
 )
 
-install(FILES QuicConstants.h DESTINATION include/quic/)
+install(FILES QuicConstants.h QuicTypealiases.h DESTINATION include/quic/)
 
 install(
   TARGETS mvfst_constants
@@ -80,6 +80,7 @@ add_subdirectory(client)
 add_subdirectory(codec)
 add_subdirectory(common)
 add_subdirectory(congestion_control)
+add_subdirectory(datagram)
 add_subdirectory(fizz)
 add_subdirectory(flowcontrol)
 add_subdirectory(folly_utils)

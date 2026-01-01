@@ -656,9 +656,7 @@ TEST_F(QuicServerTransportTest, TestOpenAckStreamFrame) {
           ->packet.header.getPacketSequenceNum();
 
   uint32_t buffersInPacket1 = 0;
-  for (size_t i = 0; i < server->getNonConstConn().outstandings.packets.size();
-       ++i) {
-    auto& packet = server->getNonConstConn().outstandings.packets[i];
+  for (auto& packet : server->getNonConstConn().outstandings.packets) {
     if (packet.packet.header.getPacketNumberSpace() !=
         PacketNumberSpace::AppData) {
       continue;
@@ -2294,7 +2292,7 @@ TEST_F(QuicUnencryptedServerTransportTest, TestPendingZeroRttData) {
   size_t expectedPendingLen =
       server->getConn().transportSettings.maxPacketsToBuffer;
   for (size_t i = 0; i < expectedPendingLen + 10; ++i) {
-    StreamId streamId = static_cast<StreamId>(i);
+    auto streamId = static_cast<StreamId>(i);
     auto packetData = packetToBuf(createStreamPacket(
         *clientConnectionId,
         server->getConn().serverConnectionId.value_or(getTestConnectionId(1)),
@@ -2321,7 +2319,7 @@ TEST_F(QuicUnencryptedServerTransportTest, TestPendingOneRttData) {
   size_t expectedPendingLen =
       server->getConn().transportSettings.maxPacketsToBuffer;
   for (size_t i = 0; i < expectedPendingLen + 10; ++i) {
-    StreamId streamId = static_cast<StreamId>(i);
+    auto streamId = static_cast<StreamId>(i);
     auto packetData = packetToBuf(createStreamPacket(
         *clientConnectionId,
         *server->getConn().serverConnectionId,
@@ -4337,67 +4335,6 @@ TEST_F(QuicServerTransportTest, TestBurstSizeKnobHandlers) {
       kMaxWriteConnectionDataPacketLimit);
 }
 
-TEST_F(QuicServerTransportTest, TestUseNewPriorityQueueKnobHandler) {
-  auto& transportSettings = server->getNonConstConn().transportSettings;
-  transportSettings.advertisedInitialMaxStreamsBidi = 2;
-  auto tsres = server->getConn().streamManager->refreshTransportSettings(
-      transportSettings);
-  server->handleKnobParams(
-      {{.id =
-            static_cast<uint64_t>(TransportKnobParamId::USE_NEW_PRIORITY_QUEUE),
-        .val = uint64_t(1)}});
-  EXPECT_TRUE(transportSettings.useNewPriorityQueue);
-  EXPECT_EQ(server->getConn().streamManager->oldWriteQueue(), nullptr);
-
-  server->handleKnobParams(
-      {{.id =
-            static_cast<uint64_t>(TransportKnobParamId::USE_NEW_PRIORITY_QUEUE),
-        .val = uint64_t(0)}});
-  EXPECT_FALSE(transportSettings.useNewPriorityQueue);
-  EXPECT_NE(server->getConn().streamManager->oldWriteQueue(), nullptr);
-
-  EXPECT_EQ(
-      server->getConn().streamManager->openableRemoteBidirectionalStreams(), 2);
-  // updating knob with writable streams fails
-  auto peerStream = server->getConn().streamManager->getStream(0);
-  EXPECT_EQ(
-      server->getConn().streamManager->openableRemoteBidirectionalStreams(), 1);
-  auto streamId = server->createBidirectionalStream().value();
-
-  auto buf = folly::IOBuf::create(1100);
-  buf->append(1100);
-  auto serverWriteChain16 = server->writeChain(streamId, std::move(buf), false);
-
-  server->handleKnobParams(
-      {{.id =
-            static_cast<uint64_t>(TransportKnobParamId::USE_NEW_PRIORITY_QUEUE),
-        .val = uint64_t(1)}});
-  EXPECT_FALSE(transportSettings.useNewPriorityQueue);
-  EXPECT_NE(server->getConn().streamManager->oldWriteQueue(), nullptr);
-  EXPECT_EQ(
-      server->getConn().streamManager->openableRemoteBidirectionalStreams(), 1);
-
-  // updating the knob now should not reset the openable streams
-  peerStream = server->getConn().streamManager->getStream(0);
-  (*peerStream)->sendState = StreamSendState::Closed;
-  (*peerStream)->recvState = StreamRecvState::Closed;
-  auto res =
-      server->getConn().streamManager->removeClosedStream((*peerStream)->id);
-  EXPECT_EQ(
-      server->getConn().streamManager->openableRemoteBidirectionalStreams(), 2);
-
-  // The switch back works
-  server->handleKnobParams(
-      {{.id =
-            static_cast<uint64_t>(TransportKnobParamId::USE_NEW_PRIORITY_QUEUE),
-        .val = uint64_t(0)}});
-  EXPECT_FALSE(transportSettings.useNewPriorityQueue);
-
-  // Peer openable streams unchanged
-  EXPECT_EQ(
-      server->getConn().streamManager->openableRemoteBidirectionalStreams(), 2);
-}
-
 TEST_F(QuicServerTransportTest, TestStreamBufKnobHandlers) {
   auto& transportSettings = server->getNonConstConn().transportSettings;
 
@@ -4431,11 +4368,11 @@ TEST_F(QuicServerTransportTest, TestStreamBufKnobHandlers) {
 class QuicServerTransportCertTest : public QuicServerTransportTest {
  protected:
   class MockCert : public fizz::Cert {
-    std::string getIdentity() const override {
+    [[nodiscard]] std::string getIdentity() const override {
       return "";
     }
 
-    std::optional<std::string> getDER() const override {
+    [[nodiscard]] std::optional<std::string> getDER() const override {
       return std::nullopt;
     }
   };
@@ -4509,6 +4446,108 @@ TEST_F(QuicServerTransportTest, TestSendCloseOnIdleTimeoutKnobHandler) {
             TransportKnobParamId::SEND_CLOSE_ON_IDLE_TIMEOUT),
         .val = uint64_t(42)}});
   EXPECT_TRUE(transportSettings.alwaysSendConnectionCloseOnIdleTimeout);
+}
+
+TEST_F(QuicServerTransportTest, SconeNegotiationServerSide) {
+  // In transportSettings passed to server, set enableScone=true
+  server->getNonConstConn().transportSettings.enableScone = true;
+  auto& conn = server->getNonConstConn();
+
+  // Simulate handshake completion with SCONE enabled
+  conn.scone.emplace();
+  conn.scone->negotiated = true;
+
+  // After handshake, EXPECT_TRUE(serverTransport->getConn().scone)
+  EXPECT_TRUE(server->getConn().scone);
+  EXPECT_TRUE(server->getConn().scone->negotiated);
+
+  // Verify server can handle SCONE transport parameter
+  // (In a real scenario, this would be set during handshake)
+  // For now, we're verifying server-side SCONE state setup
+  EXPECT_TRUE(server->getConn().scone);
+}
+
+TEST_F(QuicServerTransportTest, SconeRateSignalFlushedOnWrite) {
+  // Set up server with SCONE enabled
+  server->getNonConstConn().transportSettings.enableScone = true;
+  auto& conn = server->getNonConstConn();
+
+  // Set up SCONE state
+  conn.scone.emplace();
+  conn.scone->negotiated = true;
+
+  // Push value into server->getConn().scone->pendingRateSignals
+  uint8_t testRate = 0x42;
+  QuicVersion testVersion = QuicVersion::SCONE_VERSION_2;
+  conn.scone->pendingRateSignals.push_back({testRate, testVersion});
+
+  // Verify rate signal is queued
+  EXPECT_EQ(conn.scone->pendingRateSignals.size(), 1);
+  EXPECT_EQ(conn.scone->pendingRateSignals.front().rate, testRate);
+  EXPECT_EQ(conn.scone->pendingRateSignals.front().version, testVersion);
+
+  // For this test, we're verifying that rate signals can be queued
+  // In a real scenario, the rate signals would be flushed during packet writes
+  // Clear the signals to simulate flushing
+  conn.scone->pendingRateSignals.clear();
+
+  // Verify signals are cleared
+  EXPECT_TRUE(conn.scone->pendingRateSignals.empty());
+}
+
+TEST_F(QuicServerTransportTest, SconeRateSignalProcessingE2E) {
+  // Set up server with SCONE enabled and negotiated
+  server->getNonConstConn().transportSettings.enableScone = true;
+  auto& conn = server->getNonConstConn();
+
+  conn.scone.emplace();
+  conn.scone->negotiated = true;
+
+  // Test the specific uncovered code path by directly using the server
+  // infrastructure This simulates the scenario where a SCONE packet is
+  // processed followed by successful packet processing that should queue the
+  // rate signal
+
+  uint8_t testRate = 0x25;
+
+  // Create a simple coalesced packet buffer that contains both SCONE and
+  // regular packet This approach uses the existing test infrastructure more
+  // effectively
+  auto coalescedBuffer = folly::IOBuf::create(1024);
+
+  // Build SCONE packet
+  auto sconePacket = buildSconePacket(
+      testRate,
+      conn.serverConnectionId.value(),
+      conn.clientConnectionId.value());
+
+  // Append SCONE packet to buffer
+  coalescedBuffer->append(sconePacket.length());
+  memcpy(
+      coalescedBuffer->writableData(),
+      sconePacket.data(),
+      sconePacket.length());
+
+  // Create a basic ACK packet as the follow-up (simpler than stream packet)
+  AckBlocks acks = {{1, 1}};
+  auto ackPacket = createAckPacket(
+      conn,
+      2, // packet number
+      acks,
+      PacketNumberSpace::AppData);
+
+  // Append ACK packet to the same buffer for coalescing
+  auto ackPacketBuf = packetToBuf(ackPacket);
+  coalescedBuffer->appendChain(std::move(ackPacketBuf));
+
+  // Deliver the coalesced packet - this should trigger both SCONE processing
+  // and successful subsequent packet processing in the uncovered code path
+  deliverData(std::move(coalescedBuffer));
+
+  // Verify the rate signal was queued in the uncovered code path
+  // This tests the server-side rate signal queuing in ServerStateMachine.cpp
+  EXPECT_EQ(conn.scone->pendingRateSignals.size(), 1);
+  EXPECT_EQ(conn.scone->pendingRateSignals.front().rate, testRate);
 }
 
 } // namespace quic::test

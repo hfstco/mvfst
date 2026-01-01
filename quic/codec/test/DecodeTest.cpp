@@ -26,8 +26,7 @@ class DecodeTest : public Test {};
 
 ShortHeader makeHeader() {
   PacketNum packetNum = 100;
-  return ShortHeader(
-      ProtectionType::KeyPhaseZero, getTestConnectionId(), packetNum);
+  return {ProtectionType::KeyPhaseZero, getTestConnectionId(), packetNum};
 }
 
 // NormalizedAckBlocks are in order needed.
@@ -263,7 +262,7 @@ TEST_F(DecodeTest, DifferentCIDLength) {
 
 TEST_F(DecodeTest, VersionNegotiationPacketBadPacketTest) {
   ConnectionId connId = getTestConnectionId();
-  QuicVersionType version = static_cast<QuicVersionType>(QuicVersion::MVFST);
+  auto version = static_cast<QuicVersionType>(QuicVersion::MVFST);
 
   auto buf = folly::IOBuf::create(10);
   folly::io::Appender appender(buf.get(), 10);

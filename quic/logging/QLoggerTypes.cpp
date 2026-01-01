@@ -10,6 +10,8 @@
 #include <quic/QuicException.h>
 #include <quic/logging/QLoggerConstants.h>
 
+#include <utility>
+
 namespace quic {
 
 folly::dynamic PaddingFrameLog::toDynamic() const {
@@ -157,6 +159,12 @@ folly::dynamic StreamFrameLog::toDynamic() const {
   d["frame_type"] = toQlogString(FrameType::STREAM);
   d["stream_id"] = folly::to<std::string>(streamId);
   d["offset"] = offset;
+  // per draft-ietf-quic-qlog-quic-events-12 sec 8.13.8 len is optional
+  if (len > 0) {
+    folly::dynamic raw = folly::dynamic::object();
+    raw["length"] = len;
+    d["raw"] = std::move(raw);
+  }
   return d;
 }
 
@@ -532,8 +540,7 @@ folly::dynamic QLogTransportSummaryEvent::toDynamic() const {
       finalPacketLossTimeReorderingThreshDividend;
   data["used_zero_rtt"] = usedZeroRtt;
   data["quic_version"] =
-      static_cast<std::underlying_type<decltype(quicVersion)>::type>(
-          quicVersion);
+      static_cast<std::underlying_type_t<decltype(quicVersion)>>(quicVersion);
   data["initial_packets_received"] = initialPacketsReceived;
   data["unique_initial_crypto_frames_received"] =
       uniqueInitialCryptoFramesReceived;
@@ -973,13 +980,13 @@ QLogMetricUpdateEvent::QLogMetricUpdateEvent(
       mrtt{mrttIn},
       srtt{srttIn},
       ackDelay{ackDelayIn},
-      rttVar{rttVarIn},
-      congestionWindow{congestionWindowIn},
-      bytesInFlight{bytesInFlightIn},
-      ssthresh{ssthreshIn},
-      packetsInFlight{packetsInFlightIn},
-      pacingRateBytesPerSec{pacingRateBytesPerSecIn},
-      ptoCount{ptoCountIn} {
+      rttVar{std::move(rttVarIn)},
+      congestionWindow{std::move(congestionWindowIn)},
+      bytesInFlight{std::move(bytesInFlightIn)},
+      ssthresh{std::move(ssthreshIn)},
+      packetsInFlight{std::move(packetsInFlightIn)},
+      pacingRateBytesPerSec{std::move(pacingRateBytesPerSecIn)},
+      ptoCount{std::move(ptoCountIn)} {
   eventType = QLogEventType::MetricUpdate;
   refTime = refTimeIn;
 }

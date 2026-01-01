@@ -52,7 +52,7 @@ class QuicTransportException : public std::runtime_error {
 
   explicit QuicTransportException(const char* msg, TransportErrorCode errCode);
 
-  TransportErrorCode errorCode() const noexcept {
+  [[nodiscard]] TransportErrorCode errorCode() const noexcept {
     return errCode_;
   }
 
@@ -70,7 +70,7 @@ class QuicInternalException : public std::runtime_error {
       folly::StringPiece msg,
       LocalErrorCode errCode);
 
-  LocalErrorCode errorCode() const noexcept {
+  [[nodiscard]] LocalErrorCode errorCode() const noexcept {
     return errorCode_;
   }
 
@@ -87,7 +87,7 @@ class QuicApplicationException : public std::runtime_error {
       const char* msg,
       ApplicationErrorCode errorCode);
 
-  ApplicationErrorCode errorCode() const noexcept {
+  [[nodiscard]] ApplicationErrorCode errorCode() const noexcept {
     return errorCode_;
   }
 
@@ -112,14 +112,8 @@ std::string toString(const QuicError& error);
 std::vector<TransportErrorCode> getAllTransportErrorCodes();
 std::vector<LocalErrorCode> getAllLocalErrorCodes();
 
-inline std::ostream& operator<<(std::ostream& os, const QuicErrorCode& error) {
-  os << toString(error);
-  return os;
-}
+std::ostream& operator<<(std::ostream& os, const QuicErrorCode& error);
 
-inline std::ostream& operator<<(std::ostream& os, const QuicError& error) {
-  os << toString(error);
-  return os;
-}
+std::ostream& operator<<(std::ostream& os, const QuicError& error);
 
 } // namespace quic

@@ -18,6 +18,7 @@
 #include <quic/congestion_control/CongestionController.h>
 #include <quic/congestion_control/PacketProcessor.h>
 #include <quic/congestion_control/ThrottlingSignalProvider.h>
+#include <quic/datagram/DatagramFlowManager.h>
 #include <quic/handshake/HandshakeLayer.h>
 #include <quic/logging/QLogger.h>
 #include <quic/observer/SocketObserverTypes.h>
@@ -34,6 +35,7 @@
 #include <quic/state/StreamData.h>
 #include <quic/state/TransportSettings.h>
 
+#include <folly/container/F14Map.h>
 #include <folly/io/async/DelayedDestruction.h>
 #include <quic/common/Optional.h>
 
@@ -207,7 +209,7 @@ struct Pacer {
   /**
    * Getter API of the most recent write batch size.
    */
-  virtual uint64_t getCachedWriteBatchSize() const = 0;
+  [[nodiscard]] virtual uint64_t getCachedWriteBatchSize() const = 0;
 
   virtual void onPacketSent() = 0;
   virtual void onPacketsLoss() = 0;
@@ -634,7 +636,7 @@ struct QuicConnectionStateBase : public folly::DelayedDestruction {
   /**
    * Returns the SocketObserverContainer or nullptr if not available.
    */
-  SocketObserverContainer* getSocketObserverContainer() const {
+  [[nodiscard]] SocketObserverContainer* getSocketObserverContainer() const {
     if (const auto observerContainerLocked = observerContainer.lock()) {
       return observerContainerLocked.get();
     }
@@ -680,8 +682,18 @@ struct QuicConnectionStateBase : public folly::DelayedDestruction {
     uint32_t maxWriteBufferSize{kDefaultMaxDatagramsBuffered};
     // Buffers Incoming Datagrams
     CircularDeque<ReadDatagram> readBuffer;
-    // Buffers Outgoing Datagrams
-    CircularDeque<BufQueue> writeBuffer;
+
+    // Manages outgoing datagrams across multiple flows
+    DatagramFlowManager flowManager;
+
+    DatagramState();
+    ~DatagramState() = default;
+
+    // Move-only (due to DatagramFlowManager being move-only)
+    DatagramState(DatagramState&&) = default;
+    DatagramState& operator=(DatagramState&&) = default;
+    DatagramState(const DatagramState&) = delete;
+    DatagramState& operator=(const DatagramState&) = delete;
   };
 
   DatagramState datagramState;
@@ -747,6 +759,19 @@ struct QuicConnectionStateBase : public folly::DelayedDestruction {
 
   // Is the stream buffer low after the next write
   bool imminentStreamCompletion{false};
+
+  struct SconeRateSignal {
+    uint8_t rate;
+    QuicVersion version;
+  };
+
+  struct SconeState {
+    CircularDeque<SconeRateSignal> pendingRateSignals;
+    bool negotiated{false};
+    bool sentThisLoop{false};
+  };
+
+  Optional<SconeState> scone;
 
   // Careful Resume. TODO
   Optional<uint64_t> maybeSavedCongestionWindow;

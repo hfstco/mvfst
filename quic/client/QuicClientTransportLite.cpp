@@ -62,8 +62,7 @@ QuicClientTransportLite::QuicClientTransportLite(
     : QuicTransportBaseLite(
           evb,
           std::move(socket),
-          useConnectionEndWithErrorCallback),
-      happyEyeballsConnAttemptDelayTimeout_(this) {
+          useConnectionEndWithErrorCallback) {
   DCHECK(handshakeFactory);
   auto tempConn =
       std::make_unique<QuicClientConnectionState>(std::move(handshakeFactory));
@@ -121,11 +120,7 @@ QuicClientTransportLite::~QuicClientTransportLite() {
   // closeImpl may have been called earlier with drain = true, so force close.
   closeUdpSocket();
 
-  if (clientConn_->happyEyeballsState.secondSocket) {
-    auto sock = std::move(clientConn_->happyEyeballsState.secondSocket);
-    sock->pauseRead();
-    (void)sock->close();
-  }
+  cleanupHappyEyeballsState();
 }
 
 quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacket(
@@ -135,6 +130,11 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacket(
   // Process the arriving UDP packet, which may have coalesced QUIC packets.
   {
     BufQueue& udpData = udpPacket.buf;
+
+    // Track subsequent packet processing for conditional SCONE rate signal
+    // usage (spec requirement)
+    bool subsequentPacketProcessedSuccessfully = false;
+    pendingSconeRateSignal_.reset();
 
     if (!conn_->version) {
       // We only check for version negotiation packets before the version
@@ -159,11 +159,29 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacket(
       if (!res.has_value()) {
         return res;
       }
+      subsequentPacketProcessedSuccessfully = true;
     }
     VLOG_IF(4, !udpData.empty())
         << "Leaving " << udpData.chainLength()
         << " bytes unprocessed after attempting to process "
         << kMaxNumCoalescedPackets << " packets.";
+
+    // Apply SCONE rate signal only if subsequent packet was processed
+    // successfully (per spec)
+    if (pendingSconeRateSignal_.has_value() &&
+        subsequentPacketProcessedSuccessfully && conn_->scone) {
+      conn_->scone->pendingRateSignals.push_back(
+          pendingSconeRateSignal_.value());
+      VLOG(4) << "SCONE rate signal "
+              << static_cast<int>(pendingSconeRateSignal_.value().rate)
+              << " queued after successful packet processing";
+      pendingSconeRateSignal_.reset();
+    } else if (
+        pendingSconeRateSignal_.has_value() &&
+        !subsequentPacketProcessedSuccessfully) {
+      VLOG(4) << "Got SCONE but failed to process subsequent packet";
+      pendingSconeRateSignal_.reset();
+    }
   }
 
   // Process any deferred pending 1RTT and handshake packets if we have keys.
@@ -261,13 +279,7 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacketData(
       return {};
     }
 
-    if (happyEyeballsEnabled_) {
-      happyEyeballsOnDataReceived(
-          *clientConn_,
-          happyEyeballsConnAttemptDelayTimeout_,
-          socket_,
-          peerAddress);
-    }
+    happyEyeballsOnDataReceivedIfEnabled(peerAddress);
     // Set the destination connection ID to be the value from the source
     // connection id of the retry packet
     clientConn_->initialDestinationConnectionId =
@@ -327,6 +339,19 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacketData(
         std::move(codecError->error.message)));
   }
 
+  if (auto* sp = parsedPacket.sconePacket()) {
+    if (conn_->qLogger) {
+      conn_->qLogger->addTransportStateUpdate(
+          fmt::format("scone_received:rate={}", static_cast<int>(sp->rate)));
+    }
+
+    if (conn_->scone && sp->rate != kSconeNoAdvice) {
+      pendingSconeRateSignal_ = QuicConnectionStateBase::SconeRateSignal{
+          sp->rate, static_cast<QuicVersion>(sp->version)};
+    }
+    return {};
+  }
+
   RegularQuicPacket* regularOptional = parsedPacket.regularPacket();
   if (!regularOptional) {
     VLOG(4) << "Packet parse error for " << *this;
@@ -358,14 +383,7 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacketData(
         TransportErrorCode::PROTOCOL_VIOLATION, "Packet has no frames"));
   }
 
-  if (happyEyeballsEnabled_) {
-    CHECK(socket_);
-    happyEyeballsOnDataReceived(
-        *clientConn_,
-        happyEyeballsConnAttemptDelayTimeout_,
-        socket_,
-        peerAddress);
-  }
+  happyEyeballsOnDataReceivedIfEnabled(peerAddress);
 
   LongHeader* longHeader = regularOptional->header.asLong();
   ShortHeader* shortHeader = regularOptional->header.asShort();
@@ -889,6 +907,16 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacketData(
           return quic::make_unexpected(maxStreamsUni.error());
         }
 
+        if (conn_->transportSettings.enableScone) {
+          bool serverSupportsScone =
+              getSconeSupportedParameter(serverParams->parameters);
+          if (serverSupportsScone) {
+            conn_->scone.emplace(QuicConnectionStateBase::SconeState{});
+            conn_->scone->negotiated = true;
+            VLOG(4) << "SCONE negotiated successfully with server " << *this;
+          }
+        }
+
         auto processResult = processServerInitialParams(
             *clientConn_, serverParams.value(), packetNum);
         if (!processResult.has_value()) {
@@ -1263,6 +1291,11 @@ QuicClientTransportLite::startCryptoHandshake() {
     CHECK(maybeEncodedDirectEncapParam)
         << "Failed to encode direct encap param";
     customTransportParameters_.push_back(*maybeEncodedDirectEncapParam);
+  }
+
+  if (conn_->transportSettings.enableScone) {
+    VLOG(4) << "Sending SCONE transport parameter";
+    customTransportParameters_.push_back(encodeSconeSupportedParameter());
   }
 
   auto paramsExtension = std::make_shared<ClientTransportParametersExtension>(
@@ -1886,35 +1919,42 @@ void QuicClientTransportLite::onNotifyDataAvailable(
 
 void QuicClientTransportLite::
     happyEyeballsConnAttemptDelayTimeoutExpired() noexcept {
-  // Declare 0-RTT data as lost so that they will be retransmitted over the
-  // second socket.
-  happyEyeballsStartSecondSocket(clientConn_->happyEyeballsState);
-  // If this gets called from the write path then we haven't added the packets
-  // to the outstanding packet list yet.
-  runOnEvbAsync([&](auto) {
-    auto result = markZeroRttPacketsLost(*conn_, markPacketLoss);
-    LOG_IF(ERROR, !result.has_value())
-        << "Failed to mark 0-RTT packets as lost.";
-  });
+  // Empty implementation for Lite class
+  // Overridden in Full class with actual Happy Eyeballs logic
+}
+
+void QuicClientTransportLite::cleanupHappyEyeballsState() {
+  // Empty implementation for Lite class
+  // Overridden in Full class with actual cleanup logic
+}
+
+void QuicClientTransportLite::startHappyEyeballsIfEnabled() {
+  // Empty implementation for Lite class
+  // Overridden in Full class with actual Happy Eyeballs initialization
+}
+
+void QuicClientTransportLite::happyEyeballsOnDataReceivedIfEnabled(
+    const folly::SocketAddress& /* peerAddress */) {
+  // Empty implementation for Lite class
+  // Overridden in Full class with actual Happy Eyeballs data received logic
+}
+
+void QuicClientTransportLite::cancelHappyEyeballsConnAttemptDelayTimeout() {
+  // Empty implementation for Lite class
+  // Overridden in Full class with actual timeout cancellation
+}
+
+bool QuicClientTransportLite::happyEyeballsAddPeerAddressIfEnabled(
+    const folly::SocketAddress& /* peerAddress */) {
+  // Empty implementation for Lite class
+  // Overridden in Full class with actual peer address addition logic
+  return false;
 }
 
 void QuicClientTransportLite::start(
     ConnectionSetupCallback* connSetupCb,
     ConnectionCallback* connCb) {
-  if (happyEyeballsEnabled_) {
-    // TODO Supply v4 delay amount from somewhere when we want to tune this
-    startHappyEyeballs(
-        *clientConn_,
-        evb_.get(),
-        happyEyeballsCachedFamily_,
-        happyEyeballsConnAttemptDelayTimeout_,
-        happyEyeballsCachedFamily_ == AF_UNSPEC
-            ? kHappyEyeballsV4Delay
-            : kHappyEyeballsConnAttemptDelayWithCache,
-        this,
-        this,
-        socketOptions_);
-  }
+  startHappyEyeballsIfEnabled();
 
   CHECK(conn_->peerAddress.isInitialized());
 
@@ -1979,12 +2019,7 @@ void QuicClientTransportLite::addNewPeerAddress(
         peerAddress.getPort());
   }
 
-  if (happyEyeballsEnabled_) {
-    conn_->udpSendPacketLen = std::min(
-        conn_->udpSendPacketLen,
-        (peerAddress.getFamily() == AF_INET6 ? kDefaultV6UDPSendPacketLen
-                                             : kDefaultV4UDPSendPacketLen));
-    happyEyeballsAddPeerAddress(*clientConn_, peerAddress);
+  if (happyEyeballsAddPeerAddressIfEnabled(peerAddress)) {
     return;
   }
 
@@ -1999,21 +2034,6 @@ void QuicClientTransportLite::setLocalAddress(
     folly::SocketAddress localAddress) {
   CHECK(localAddress.isInitialized());
   conn_->localAddress = std::move(localAddress);
-}
-
-void QuicClientTransportLite::setHappyEyeballsEnabled(
-    bool happyEyeballsEnabled) {
-  happyEyeballsEnabled_ = happyEyeballsEnabled;
-}
-
-void QuicClientTransportLite::setHappyEyeballsCachedFamily(
-    sa_family_t cachedFamily) {
-  happyEyeballsCachedFamily_ = cachedFamily;
-}
-
-void QuicClientTransportLite::addNewSocket(
-    std::unique_ptr<QuicAsyncUDPSocket> socket) {
-  happyEyeballsAddSocket(*clientConn_, std::move(socket));
 }
 
 void QuicClientTransportLite::setHostname(const std::string& hostname) {
@@ -2054,7 +2074,7 @@ quic::Expected<void, QuicError> QuicClientTransportLite::adjustGROBuffers() {
 }
 
 void QuicClientTransportLite::closeTransport() {
-  cancelTimeout(&happyEyeballsConnAttemptDelayTimeout_);
+  cancelHappyEyeballsConnAttemptDelayTimeout();
 }
 
 void QuicClientTransportLite::unbindConnection() {

@@ -17,7 +17,7 @@
 
 #include <folly/chrono/Clock.h>
 #include <folly/io/Cursor.h>
-#include <folly/io/IOBuf.h>
+#include <quic/QuicTypealiases.h>
 #include <quic/common/third-party/enum.h>
 #include <sys/types.h>
 #include <chrono>
@@ -48,14 +48,7 @@ class SocketAddress;
 
 namespace quic {
 
-using ByteRange = folly::ByteRange;
-using MutableByteRange = folly::MutableByteRange;
-using BufHelpers = folly::IOBuf; // For stuff like BufHelpers::create, etc.
-using Buf = folly::IOBuf; // Used when we're not wrapping the buffer in an
-                          // std::unique_ptr
-using BufPtr = std::unique_ptr<Buf>;
 using AddressRange = folly::Range<folly::SocketAddress const*>;
-using BufEq = folly::IOBufEqualTo;
 using Cursor = folly::io::Cursor;
 using Clock = std::chrono::steady_clock;
 using TimePoint = std::chrono::time_point<Clock>;
@@ -425,6 +418,9 @@ enum class QuicVersion : uint32_t {
   MVFST_EXPERIMENTAL4 = 0xfaceb014,
   MVFST_EXPERIMENTAL5 = 0xfaceb015,
   MVFST_PRIMING = 0xfacefeed, // Reserved for priming
+  // SCONE (Standard Communication with Network Elements) versions
+  SCONE_VERSION_1 = 0x6f7dc0fd,
+  SCONE_VERSION_2 = 0xef7dc0fd,
 };
 
 using QuicVersionType = std::underlying_type<QuicVersion>::type;
@@ -502,6 +498,7 @@ constexpr std::string_view kCongestionControlCopaStr = "copa";
 constexpr std::string_view kCongestionControlCopa2Str = "copa2";
 constexpr std::string_view kCongestionControlNewRenoStr = "newreno";
 constexpr std::string_view kCongestionControlStaticCwndStr = "staticcwnd";
+constexpr std::string_view kCongestionControlCustomStr = "custom";
 constexpr std::string_view kCongestionControlNoneStr = "none";
 
 constexpr DurationRep kPersistentCongestionThreshold = 3;
@@ -514,6 +511,7 @@ enum class CongestionControlType : uint8_t {
   BBR2,
   BBRTesting,
   StaticCwnd,
+  Custom,
   None,
   // NOTE: MAX should always be at the end
   MAX
@@ -681,6 +679,10 @@ constexpr uint16_t kProbedPathGracePeriodInSRTT = 3;
 // after migration.
 constexpr uint16_t kClientTimeToKeepOldPathAfterMigration = 2;
 
+// Maximum number of consecutive migration failures (path validation failures
+// on the current path) before closing the connection.
+constexpr uint32_t kMaxConsecutiveMigrationFailures = 5;
+
 constexpr auto kMinimumNumOfParamsInTheTicket = 8;
 
 constexpr auto kStatelessResetTokenSecretLength = 32;
@@ -719,8 +721,12 @@ constexpr uint16_t kMaxDatagramFrameSize = 65535;
 // Maximum overhead for a QUIC packet containing a single datagram frame
 // i.e. Max Short Header + Max Datagram Frame Header
 constexpr uint16_t kMaxDatagramPacketOverhead = 25 + 16;
+// DATAGRAM frame type (0x31) always encodes as 1 byte
+constexpr uint64_t kDatagramFrameTypeSize = 1;
 // The Maximum number of datagrams (in/out) to buffer
 constexpr uint32_t kDefaultMaxDatagramsBuffered = 75;
+// Default flow ID for all datagrams
+constexpr uint32_t kDefaultDatagramFlowId = 0;
 
 // Minimum interval between new session tickets sent by the server in
 // milliseconds
@@ -845,6 +851,8 @@ constexpr uint8_t kEcnCE = 0b11;
 // Config for randomly skipping one in N packet sequence numbers
 constexpr uint16_t kSkipOneInNPacketSequenceNumber = 1000;
 constexpr uint16_t kDistanceToClearSkippedPacketNumber = 1000;
+
+constexpr uint8_t kSconeNoAdvice = 0x7F;
 } // namespace quic
 
 // Restore Windows NO_ERROR macro if it was previously defined
