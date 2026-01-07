@@ -5,6 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include <quic/common/MvfstLogging.h>
 #include <quic/server/QuicServer.h>
 
 #include <folly/Random.h>
@@ -19,10 +20,6 @@
 #include <quic/server/SlidingWindowRateLimiter.h>
 #include <iterator>
 
-FOLLY_GFLAGS_DEFINE_bool(
-    qs_io_uring_use_async_recv,
-    true,
-    "io_uring backend use async recv");
 FOLLY_GFLAGS_DEFINE_int32(
     qs_conn_id_version,
     0,
@@ -214,7 +211,7 @@ void QuicServer::initializeImpl(
 }
 
 void QuicServer::initializeWorkers(bool useDefaultTransport) {
-  VLOG(4) << "Initializing workers";
+  MVVLOG(4) << "Initializing workers";
   CHECK(workers_.empty());
   // iterate in the order of insertion in vector
   auto workerEvbs = workerEvbs_.rlock();
@@ -233,16 +230,8 @@ void QuicServer::initializeWorkers(bool useDefaultTransport) {
 }
 
 std::unique_ptr<QuicServerWorker> QuicServer::newWorkerWithoutSocket() {
-  QuicServerWorker::SetEventCallback sec;
-  if (FLAGS_qs_io_uring_use_async_recv) {
-    sec = backendSupportsMultishotCallback_
-        ? QuicServerWorker::SetEventCallback::RECVMSG_MULTISHOT
-        : QuicServerWorker::SetEventCallback::RECVMSG;
-  } else {
-    sec = QuicServerWorker::SetEventCallback::NONE;
-  }
   auto worker = std::make_unique<QuicServerWorker>(
-      this->shared_from_this(), transportSettings_, sec);
+      this->shared_from_this(), transportSettings_);
   worker->setNewConnectionSocketFactory(socketFactory_.get());
   worker->setSupportedVersions(supportedVersions_);
   worker->rejectNewConnections(rejectNewConnections_);
@@ -309,14 +298,15 @@ void QuicServer::bindWorkersToSocket(const folly::SocketAddress& address) {
             if (idx == 0) {
               self->boundAddress_ = worker->getAddress();
             }
-            VLOG(4) << "Set up dup()'ed fd for address=" << self->boundAddress_
-                    << " on workerId=" << (int)worker->getWorkerId();
+            MVVLOG(4) << "Set up dup()'ed fd for address="
+                      << self->boundAddress_
+                      << " on workerId=" << (int)worker->getWorkerId();
             worker->applyAllSocketOptions();
           } else {
-            VLOG(4) << "No valid takenover fd found for address="
-                    << self->boundAddress_ << ". binding on worker=" << worker
-                    << " workerId=" << (int)worker->getWorkerId()
-                    << " processId=" << (int)processId;
+            MVVLOG(4) << "No valid takenover fd found for address="
+                      << self->boundAddress_ << ". binding on worker=" << worker
+                      << " workerId=" << (int)worker->getWorkerId()
+                      << " processId=" << (int)processId;
             worker->setSocket(std::move(workerSocket));
             worker->bind(self->boundAddress_, self->bindOptions_);
             if (idx == 0) {
@@ -324,7 +314,7 @@ void QuicServer::bindWorkersToSocket(const folly::SocketAddress& address) {
             }
           }
           if (idx == (numWorkers - 1)) {
-            VLOG(4) << "Initialized all workers in the eventbase";
+            MVVLOG(4) << "Initialized all workers in the eventbase";
             self->initialized_ = true;
             folly::call_once(
                 self->startDone_, [self]() { self->startDoneBaton_.post(); });
@@ -377,7 +367,7 @@ void QuicServer::allowBeingTakenOver(const folly::SocketAddress& addr) {
       worker->allowBeingTakenOver(std::move(localListenSocket), addr);
     });
   }
-  VLOG(4) << "Bind all workers in the eventbase to takeover handler port";
+  MVVLOG(4) << "Bind all workers in the eventbase to takeover handler port";
   takeoverHandlerInitialized_ = true;
 }
 
@@ -427,7 +417,7 @@ void QuicServer::routeDataToWorker(
   if (!initialized_) {
     // drop the packet if we are not initialized. This is a janky memory
     // barrier.
-    VLOG(4) << "Dropping data since quic-server is not initialized";
+    MVVLOG(4) << "Dropping data since quic-server is not initialized";
     if (workerPtr_) {
       QUIC_STATS(
           workerPtr_->getTransportStatsCallback(),
@@ -438,7 +428,7 @@ void QuicServer::routeDataToWorker(
   }
 
   if (shutdown_) {
-    VLOG(4) << "Dropping data since quic server is shutdown";
+    MVVLOG(4) << "Dropping data since quic server is shutdown";
     if (workerPtr_) {
       QUIC_STATS(
           workerPtr_->getTransportStatsCallback(),
@@ -576,11 +566,11 @@ void QuicServer::setHostId(uint32_t hostId) noexcept {
   // TODO(damlaj): T205141168; lift commmented checkRunningInThread check below
   // checkRunningInThread(mainThreadId_);
   if (hostId_ == hostId) {
-    LOG(WARNING) << "HostId is already set to " << hostId;
+    MVLOG_WARNING << "HostId is already set to " << hostId;
     return;
   }
   hostId_ = hostId;
-  VLOG(4) << "Setting hostId to " << hostId_ << " for quic server ";
+  MVVLOG(4) << "Setting hostId to " << hostId_ << " for quic server ";
   if (initialized_) {
     runOnAllWorkersSync(
         [hostId](auto worker) mutable { worker->setHostId(hostId); });
@@ -592,8 +582,8 @@ void QuicServer::setConnectionIdVersion(
   checkRunningInThread(mainThreadId_);
   CHECK(!initialized_) << kQuicServerNotInitialized << __func__;
   if (FLAGS_qs_conn_id_version) {
-    LOG(ERROR) << "Connection Id Version has been set to " << (int)cidVersion_
-               << " by --qs_conn_id_version from the command line.";
+    MVLOG_ERROR << "Connection Id Version has been set to " << (int)cidVersion_
+                << " by --qs_conn_id_version from the command line.";
   } else {
     cidVersion_ = cidVersion;
   }
@@ -738,7 +728,7 @@ void QuicServer::addTransportFactory(
     if (it != evbToWorkers_.end()) {
       it->second->setTransportFactory(acceptor);
     } else {
-      VLOG(3) << "Couldn't find associated worker for the given eventbase";
+      MVVLOG(3) << "Couldn't find associated worker for the given eventbase";
     }
   });
 }
@@ -815,8 +805,8 @@ bool QuicServer::addAcceptObserver(
       it->second->addAcceptObserver(observer);
       success = true;
     } else {
-      VLOG(3) << "Couldn't find associated worker for the given eventbase, "
-              << "unable to add AcceptObserver";
+      MVVLOG(3) << "Couldn't find associated worker for the given eventbase, "
+                << "unable to add AcceptObserver";
       success = false;
     }
   });
@@ -838,8 +828,8 @@ bool QuicServer::removeAcceptObserver(
     if (it != evbToWorkers_.end()) {
       success = it->second->removeAcceptObserver(observer);
     } else {
-      VLOG(3) << "Couldn't find associated worker for the given eventbase, "
-              << "unable to remove AcceptObserver";
+      MVVLOG(3) << "Couldn't find associated worker for the given eventbase, "
+                << "unable to remove AcceptObserver";
       success = false;
     }
   });

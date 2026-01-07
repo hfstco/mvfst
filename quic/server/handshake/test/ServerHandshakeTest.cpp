@@ -17,6 +17,7 @@
 #include <folly/io/async/ScopedEventBaseThread.h>
 
 #include <quic/QuicConstants.h>
+#include <quic/common/MvfstLogging.h>
 #include <quic/common/StringUtils.h>
 #include <quic/common/test/TestUtils.h>
 #include <quic/fizz/client/handshake/FizzClientExtensions.h>
@@ -28,6 +29,8 @@
 #include <quic/server/handshake/AppToken.h>
 #include <quic/server/handshake/ServerHandshake.h>
 #include <quic/state/StateData.h>
+
+#include <memory>
 
 using namespace std;
 using namespace testing;
@@ -104,10 +107,10 @@ class ServerHandshakeTest : public Test {
             kDefaultUDPSendPacketLen,
             kDefaultActiveConnectionIdLimit,
             ConnectionId::createZeroLength());
-    fizzClient.reset(new fizz::client::FizzClient<
-                     ServerHandshakeTest,
-                     fizz::client::ClientStateMachine>(
-        clientState, clientReadBuffer, readAeadOptions, *this, dg.get()));
+    fizzClient = std::make_unique<fizz::client::FizzClient<
+        ServerHandshakeTest,
+        fizz::client::ClientStateMachine>>(
+        clientState, clientReadBuffer, readAeadOptions, *this, dg.get());
     std::vector<QuicVersion> supportedVersions = {getVersion()};
     auto params = std::make_shared<ServerTransportParametersExtension>(
         getVersion(),
@@ -132,7 +135,7 @@ class ServerHandshakeTest : public Test {
 
     ON_CALL(serverCallback, onCryptoEventAvailable())
         .WillByDefault(Invoke([this]() {
-          VLOG(1) << "onCryptoEventAvailable";
+          MVVLOG(1) << "onCryptoEventAvailable";
           processCryptoEvents();
         }));
     auto cachedPsk = clientCtx->getPsk(hostname);
@@ -148,10 +151,10 @@ class ServerHandshakeTest : public Test {
   void processCryptoEvents() {
     auto handshakeStateResult = setHandshakeState();
     if (handshakeStateResult.hasError()) {
-      VLOG(1) << "server exception " << handshakeStateResult.error().message;
+      MVVLOG(1) << "server exception " << handshakeStateResult.error().message;
       ex = quic::make_unexpected(handshakeStateResult.error());
       if (!inRoundScope_ && !handshakeCv.ready()) {
-        VLOG(1) << "Posting handshake cv";
+        MVVLOG(1) << "Posting handshake cv";
         handshakeCv.post();
       }
       return;
@@ -163,14 +166,14 @@ class ServerHandshakeTest : public Test {
       if (writableBytes->empty()) {
         break;
       }
-      VLOG(1) << "server->client bytes="
-              << writableBytes->computeChainDataLength();
+      MVVLOG(1) << "server->client bytes="
+                << writableBytes->computeChainDataLength();
       clientReadBuffer.append(std::move(writableBytes));
       fizzClient->newTransportData();
     } while (!waitForData);
 
     if (!inRoundScope_ && !handshakeCv.ready()) {
-      VLOG(1) << "Posting handshake cv";
+      MVVLOG(1) << "Posting handshake cv";
       handshakeCv.post();
     }
   }
@@ -208,8 +211,8 @@ class ServerHandshakeTest : public Test {
       if (writableBytes->empty()) {
         break;
       }
-      VLOG(1) << "server->client bytes="
-              << writableBytes->computeChainDataLength();
+      MVVLOG(1) << "server->client bytes="
+                << writableBytes->computeChainDataLength();
       clientReadBuffer.append(std::move(writableBytes));
       fizzClient->newTransportData();
     } while (!waitForData);
@@ -474,7 +477,7 @@ class AsyncRejectingTicketCipher : public fizz::server::TicketCipher {
     } else {
       encryptAsync_ = false;
       return std::move(encryptFuture_).deferValue([](auto&&) {
-        VLOG(1) << "got ticket async";
+        MVVLOG(1) << "got ticket async";
         return folly::makeSemiFuture<folly::Optional<
             std::pair<std::unique_ptr<folly::IOBuf>, std::chrono::seconds>>>(
             std::make_pair(folly::IOBuf::create(0), 2s));
@@ -507,7 +510,7 @@ class AsyncRejectingTicketCipher : public fizz::server::TicketCipher {
     } else {
       decryptAsync_ = false;
       return std::move(decryptFuture_).deferValue([&](auto&&) {
-        VLOG(1) << "triggered reject";
+        MVVLOG(1) << "triggered reject";
         if (error_) {
           throw std::runtime_error("test decrypt error");
         }

@@ -6,6 +6,7 @@
  */
 
 #include <quic/client/QuicClientTransportLite.h>
+#include <quic/common/MvfstLogging.h>
 
 #include <folly/portability/Sockets.h>
 
@@ -21,6 +22,7 @@
 #include <quic/handshake/CryptoFactory.h>
 #include <quic/happyeyeballs/QuicHappyEyeballsFunctions.h>
 #include <quic/logging/QLoggerConstants.h>
+#include <quic/logging/QLoggerMacros.h>
 #include <quic/loss/QuicLossFunctions.h>
 #include <quic/state/AckHandlers.h>
 #include <quic/state/DatagramHandlers.h>
@@ -70,7 +72,7 @@ QuicClientTransportLite::QuicClientTransportLite(
   conn_.reset(tempConn.release());
 
   if (connectionIdSize > kMaxConnectionIdSize) {
-    LOG(ERROR) << "Source connection ID size is too large, truncating.";
+    MVLOG_ERROR << "Source connection ID size is too large, truncating.";
     connectionIdSize = kMaxConnectionIdSize;
   }
   auto srcConnId = connectionIdSize > 0
@@ -89,11 +91,9 @@ QuicClientTransportLite::QuicClientTransportLite(
       clientConn_->initialDestinationConnectionId;
   conn_->clientChosenDestConnectionId =
       clientConn_->initialDestinationConnectionId;
-  VLOG(4) << "initial dcid: "
-          << clientConn_->initialDestinationConnectionId->hex();
-  if (conn_->qLogger) {
-    conn_->qLogger->setDcid(conn_->clientChosenDestConnectionId);
-  }
+  MVVLOG(4) << "initial dcid: "
+            << clientConn_->initialDestinationConnectionId->hex();
+  QLOG(*conn_, setDcid, conn_->clientChosenDestConnectionId);
 
   conn_->readCodec->setCodecParameters(CodecParameters(
       conn_->peerAckDelayExponent,
@@ -103,11 +103,11 @@ QuicClientTransportLite::QuicClientTransportLite(
 
   conn_->pathManager->setPathValidationCallback(this);
 
-  VLOG(10) << "client created " << *conn_;
+  MVVLOG(10) << "client created " << *conn_;
 }
 
 QuicClientTransportLite::~QuicClientTransportLite() {
-  VLOG(10) << "Destroyed connection to server=" << conn_->peerAddress;
+  MVVLOG(10) << "Destroyed connection to server=" << conn_->peerAddress;
   // The caller probably doesn't need the conn callback after destroying the
   // transport.
   resetConnectionCallbacks();
@@ -142,9 +142,9 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacket(
       auto versionNegotiation =
           conn_->readCodec->tryParsingVersionNegotiation(udpData);
       if (versionNegotiation) {
-        VLOG(4) << "Got version negotiation packet from peer=" << peerAddress
-                << " versions=" << std::hex << versionNegotiation->versions
-                << " " << *this;
+        MVVLOG(4) << "Got version negotiation packet from peer=" << peerAddress
+                  << " versions=" << std::hex << versionNegotiation->versions
+                  << " " << *this;
 
         return quic::make_unexpected(QuicError(
             LocalErrorCode::NEW_VERSION_NEGOTIATED,
@@ -161,7 +161,7 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacket(
       }
       subsequentPacketProcessedSuccessfully = true;
     }
-    VLOG_IF(4, !udpData.empty())
+    MVVLOG_IF(4, !udpData.empty())
         << "Leaving " << udpData.chainLength()
         << " bytes unprocessed after attempting to process "
         << kMaxNumCoalescedPackets << " packets.";
@@ -236,23 +236,21 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacketData(
   if (statelessReset) {
     const auto& token = clientConn_->statelessResetToken;
     if (statelessReset->token == token) {
-      VLOG(4) << "Received Stateless Reset " << *this;
+      MVVLOG(4) << "Received Stateless Reset " << *this;
       conn_->peerConnectionError = QuicError(
           QuicErrorCode(LocalErrorCode::CONNECTION_RESET),
           toString(LocalErrorCode::CONNECTION_RESET).str());
       return quic::make_unexpected(
           QuicError(LocalErrorCode::NO_ERROR, "Stateless Reset Received"));
     }
-    VLOG(4) << "Drop StatelessReset for bad connId or token " << *this;
+    MVVLOG(4) << "Drop StatelessReset for bad connId or token " << *this;
     // Don't treat this as a fatal error, just ignore the packet.
     return {};
   }
 
   RetryPacket* retryPacket = parsedPacket.retryPacket();
   if (retryPacket) {
-    if (conn_->qLogger) {
-      conn_->qLogger->addPacket(*retryPacket, packetSize, true);
-    }
+    QLOG(*conn_, addPacket, *retryPacket, packetSize, true);
 
     // we reject retry packet if our initial has been processed or we've rx'd a
     // prior retry packet; note that initialAckState is reset to nullptr only
@@ -262,8 +260,8 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacketData(
         !clientConn_->retryToken.empty();
 
     if (shouldRejectRetryPacket) {
-      VLOG(4) << "Server incorrectly issued a retry packet; dropping retry "
-              << *this;
+      MVVLOG(4) << "Server incorrectly issued a retry packet; dropping retry "
+                << *this;
       // Not a fatal error, just ignore the packet.
       return {};
     }
@@ -273,8 +271,8 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacketData(
 
     if (!clientConn_->clientHandshakeLayer->verifyRetryIntegrityTag(
             *originalDstConnId, *retryPacket)) {
-      VLOG(4) << "The integrity tag in the retry packet was invalid. "
-              << "Dropping bad retry packet. " << *this;
+      MVVLOG(4) << "The integrity tag in the retry packet was invalid. "
+                << "Dropping bad retry packet. " << *this;
       // Not a fatal error, just ignore the packet.
       return {};
     }
@@ -324,10 +322,11 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacketData(
             udpPacket.timings,
             udpPacket.tosValue),
         peerAddress);
-    if (conn_->qLogger) {
-      conn_->qLogger->addPacketBuffered(
-          cipherUnavailable->protectionType, packetSize);
-    }
+    QLOG(
+        *conn_,
+        addPacketBuffered,
+        cipherUnavailable->protectionType,
+        packetSize);
     // Packet buffered, not an error
     return {};
   }
@@ -354,12 +353,10 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacketData(
 
   RegularQuicPacket* regularOptional = parsedPacket.regularPacket();
   if (!regularOptional) {
-    VLOG(4) << "Packet parse error for " << *this;
+    MVVLOG(4) << "Packet parse error for " << *this;
     QUIC_STATS(
         statsCallback_, onPacketDropped, PacketDropReason::PARSE_ERROR_CLIENT);
-    if (conn_->qLogger) {
-      conn_->qLogger->addPacketDrop(packetSize, kParse);
-    }
+    QLOG(*conn_, addPacketDrop, packetSize, kParse);
     // If this was a protocol violation, we would return a codec error instead.
     // Ignore this case as something that caused a non-codec parse error.
     return {};
@@ -369,16 +366,16 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacketData(
     // This is either a packet that has no data (long-header parsed but no data
     // found) or a regular packet with a short header and no frames. Both are
     // protocol violations.
-    LOG(ERROR) << "Packet has no frames " << *this;
+    MVLOG_ERROR << "Packet has no frames " << *this;
     QUIC_STATS(
         conn_->statsCallback,
         onPacketDropped,
         PacketDropReason::PROTOCOL_VIOLATION);
-    if (conn_->qLogger) {
-      conn_->qLogger->addPacketDrop(
-          packetSize,
-          PacketDropReason(PacketDropReason::PROTOCOL_VIOLATION)._to_string());
-    }
+    QLOG(
+        *conn_,
+        addPacketDrop,
+        packetSize,
+        PacketDropReason(PacketDropReason::PROTOCOL_VIOLATION)._to_string());
     return quic::make_unexpected(QuicError(
         TransportErrorCode::PROTOCOL_VIOLATION, "Packet has no frames"));
   }
@@ -398,9 +395,7 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacketData(
       protectionLevel == ProtectionType::KeyPhaseOne;
 
   auto& regularPacket = *regularOptional;
-  if (conn_->qLogger) {
-    conn_->qLogger->addPacket(regularPacket, packetSize);
-  }
+  QLOG(*conn_, addPacket, regularPacket, packetSize);
   if (!isProtectedPacket) {
     for (auto& quicFrame : regularPacket.frames) {
       auto isPadding = quicFrame.asPaddingFrame();
@@ -472,8 +467,8 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacketData(
     // The server is using a new CID for the current path.
     conn_->clientConnectionId = destinationCidInPacket;
     conn_->readCodec->setClientConnectionId(conn_->clientConnectionId.value());
-    VLOG(4) << "The server switched its dest cid to: "
-            << destinationCidInPacket.hex();
+    MVVLOG(4) << "The server switched its dest cid to: "
+              << destinationCidInPacket.hex();
   }
 
   // Add the packet to the AckState associated with the packet number space.
@@ -518,15 +513,15 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacketData(
       case QuicWriteFrame::Type::WriteAckFrame: {
         const WriteAckFrame& frame = *packetFrame.asWriteAckFrame();
         DCHECK(!frame.ackBlocks.empty());
-        VLOG(4) << "Client received ack for largestAcked="
-                << frame.ackBlocks.front().end << " " << *this;
+        MVVLOG(4) << "Client received ack for largestAcked="
+                  << frame.ackBlocks.front().end << " " << *this;
         commonAckVisitorForAckFrame(ackState, frame);
         break;
       }
       case QuicWriteFrame::Type::RstStreamFrame: {
         const RstStreamFrame& frame = *packetFrame.asRstStreamFrame();
-        VLOG(4) << "Client received ack for reset frame stream="
-                << frame.streamId << " " << *this;
+        MVVLOG(4) << "Client received ack for reset frame stream="
+                  << frame.streamId << " " << *this;
 
         auto stream =
             conn_->streamManager->getStream(frame.streamId).value_or(nullptr);
@@ -544,10 +539,10 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacketData(
           return quic::make_unexpected(ackedStreamResult.error());
         }
         auto& ackedStream = ackedStreamResult.value();
-        VLOG(4) << "Client got ack for stream=" << frame.streamId
-                << " offset=" << frame.offset << " fin=" << frame.fin
-                << " data=" << frame.len
-                << " closed=" << (ackedStream == nullptr) << " " << *this;
+        MVVLOG(4) << "Client got ack for stream=" << frame.streamId
+                  << " offset=" << frame.offset << " fin=" << frame.fin
+                  << " data=" << frame.len
+                  << " closed=" << (ackedStream == nullptr) << " " << *this;
         if (ackedStream) {
           return sendAckSMHandler(*ackedStream, frame);
         }
@@ -575,8 +570,8 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacketData(
   for (auto& quicFrame : regularPacket.frames) {
     switch (quicFrame.type()) {
       case QuicFrame::Type::ReadAckFrame: {
-        VLOG(10) << "Client received ack frame in packet=" << packetNum << " "
-                 << *this;
+        MVVLOG(10) << "Client received ack frame in packet=" << packetNum << " "
+                   << *this;
         ReadAckFrame& ackFrame = *quicFrame.asReadAckFrame();
 
         if (ackFrame.frameType == FrameType::ACK_EXTENDED &&
@@ -609,8 +604,8 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacketData(
       }
       case QuicFrame::Type::RstStreamFrame: {
         RstStreamFrame& frame = *quicFrame.asRstStreamFrame();
-        VLOG(10) << "Client received reset stream=" << frame.streamId << " "
-                 << *this;
+        MVVLOG(10) << "Client received reset stream=" << frame.streamId << " "
+                   << *this;
         if (frame.reliableSize.has_value()) {
           // We're not yet supporting the handling of RESET_STREAM_AT frames
           return quic::make_unexpected(QuicError(
@@ -636,9 +631,10 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacketData(
         pktHasRetransmittableData = true;
         pktHasCryptoData = true;
         ReadCryptoFrame& cryptoFrame = *quicFrame.asReadCryptoFrame();
-        VLOG(10) << "Client received crypto data offset=" << cryptoFrame.offset
-                 << " len=" << cryptoFrame.data->computeChainDataLength()
-                 << " packetNum=" << packetNum << " " << *this;
+        MVVLOG(10) << "Client received crypto data offset="
+                   << cryptoFrame.offset
+                   << " len=" << cryptoFrame.data->computeChainDataLength()
+                   << " packetNum=" << packetNum << " " << *this;
         auto appendResult = appendDataToReadBuffer(
             *getCryptoStream(*conn_->cryptoState, encryptionLevel),
             StreamBuffer(
@@ -650,11 +646,11 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacketData(
       }
       case QuicFrame::Type::ReadStreamFrame: {
         ReadStreamFrame& frame = *quicFrame.asReadStreamFrame();
-        VLOG(10) << "Client received stream data for stream=" << frame.streamId
-                 << " offset=" << frame.offset
-                 << " len=" << frame.data->computeChainDataLength()
-                 << " fin=" << frame.fin << " packetNum=" << packetNum << " "
-                 << *this;
+        MVVLOG(10) << "Client received stream data for stream="
+                   << frame.streamId << " offset=" << frame.offset
+                   << " len=" << frame.data->computeChainDataLength()
+                   << " fin=" << frame.fin << " packetNum=" << packetNum << " "
+                   << *this;
         auto streamResult = conn_->streamManager->getStream(frame.streamId);
         if (!streamResult.has_value()) {
           return quic::make_unexpected(streamResult.error());
@@ -662,8 +658,8 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacketData(
         auto& stream = streamResult.value();
         pktHasRetransmittableData = true;
         if (!stream) {
-          VLOG(10) << "Could not find stream=" << frame.streamId << " "
-                   << *conn_;
+          MVVLOG(10) << "Could not find stream=" << frame.streamId << " "
+                     << *conn_;
           break;
         }
         auto readResult =
@@ -676,8 +672,8 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacketData(
       case QuicFrame::Type::ReadNewTokenFrame: {
         ReadNewTokenFrame& newTokenFrame = *quicFrame.asReadNewTokenFrame();
         std::string tokenStr = newTokenFrame.token->toString();
-        VLOG(10) << "client received new token token="
-                 << quic::hexlify(tokenStr);
+        MVVLOG(10) << "client received new token token="
+                   << quic::hexlify(tokenStr);
         if (newTokenCallback_) {
           newTokenCallback_(std::move(tokenStr));
         }
@@ -685,8 +681,8 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacketData(
       }
       case QuicFrame::Type::MaxDataFrame: {
         MaxDataFrame& connWindowUpdate = *quicFrame.asMaxDataFrame();
-        VLOG(10) << "Client received max data offset="
-                 << connWindowUpdate.maximumData << " " << *this;
+        MVVLOG(10) << "Client received max data offset="
+                   << connWindowUpdate.maximumData << " " << *this;
         pktHasRetransmittableData = true;
         handleConnWindowUpdate(*conn_, connWindowUpdate, packetNum);
         break;
@@ -694,10 +690,10 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacketData(
       case QuicFrame::Type::MaxStreamDataFrame: {
         MaxStreamDataFrame& streamWindowUpdate =
             *quicFrame.asMaxStreamDataFrame();
-        VLOG(10) << "Client received max stream data stream="
-                 << streamWindowUpdate.streamId
-                 << " offset=" << streamWindowUpdate.maximumData << " "
-                 << *this;
+        MVVLOG(10) << "Client received max stream data stream="
+                   << streamWindowUpdate.streamId
+                   << " offset=" << streamWindowUpdate.maximumData << " "
+                   << *this;
         if (isReceivingStream(conn_->nodeType, streamWindowUpdate.streamId)) {
           return quic::make_unexpected(QuicError(
               TransportErrorCode::STREAM_STATE_ERROR,
@@ -717,7 +713,7 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacketData(
         break;
       }
       case QuicFrame::Type::DataBlockedFrame: {
-        VLOG(10) << "Client received blocked " << *this;
+        MVVLOG(10) << "Client received blocked " << *this;
         pktHasRetransmittableData = true;
         handleConnBlocked(*conn_);
         break;
@@ -726,8 +722,8 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacketData(
         // peer wishes to send data, but is unable to due to stream-level flow
         // control
         StreamDataBlockedFrame& blocked = *quicFrame.asStreamDataBlockedFrame();
-        VLOG(10) << "Client received blocked stream=" << blocked.streamId << " "
-                 << *this;
+        MVVLOG(10) << "Client received blocked stream=" << blocked.streamId
+                   << " " << *this;
         pktHasRetransmittableData = true;
         auto streamResult = conn_->streamManager->getStream(blocked.streamId);
         if (!streamResult.has_value()) {
@@ -743,8 +739,8 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacketData(
         // peer wishes to open a stream, but is unable to due to the maximum
         // stream limit set by us
         StreamsBlockedFrame& blocked = *quicFrame.asStreamsBlockedFrame();
-        VLOG(10) << "Client received stream blocked limit="
-                 << blocked.streamLimit << " " << *this;
+        MVVLOG(10) << "Client received stream blocked limit="
+                   << blocked.streamLimit << " " << *this;
         // TODO implement handler for it
         break;
       }
@@ -752,7 +748,7 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacketData(
         ConnectionCloseFrame& connFrame = *quicFrame.asConnectionCloseFrame();
         auto errMsg = fmt::format(
             "Client closed by peer reason={}", connFrame.reasonPhrase);
-        VLOG(4) << errMsg << " " << *this;
+        MVVLOG(4) << errMsg << " " << *this;
         // we want to deliver app callbacks with the peer supplied error,
         // but send a NO_ERROR to the peer.
         conn_->peerConnectionError =
@@ -785,8 +781,8 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacketData(
       }
       case QuicFrame::Type::DatagramFrame: {
         DatagramFrame& frame = *quicFrame.asDatagramFrame();
-        VLOG(10) << "Client received datagram data: " << "len=" << frame.length
-                 << " " << *this;
+        MVVLOG(10) << "Client received datagram data: " << "len="
+                   << frame.length << " " << *this;
         // Datagram isn't retransmittable. But we would like to ack them early.
         // So, make Datagram frames count towards ack policy
         pktHasRetransmittableData = true;
@@ -851,9 +847,7 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacketData(
       clientConn_->zeroRttRejected = handshakeLayer->getZeroRttRejected();
       if (clientConn_->zeroRttRejected.has_value() &&
           *clientConn_->zeroRttRejected) {
-        if (conn_->qLogger) {
-          conn_->qLogger->addTransportStateUpdate(kZeroRttRejected);
-        }
+        QLOG(*conn_, addTransportStateUpdate, kZeroRttRejected);
         QUIC_STATS(conn_->statsCallback, onZeroRttRejected);
         handshakeLayer->removePsk(hostname_);
         if (!handshakeLayer->getCanResendZeroRtt().value_or(false)) {
@@ -862,9 +856,7 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacketData(
               "Zero-rtt attempted but the early parameters do not match the handshake parameters"));
         }
       } else if (clientConn_->zeroRttRejected.has_value()) {
-        if (conn_->qLogger) {
-          conn_->qLogger->addTransportStateUpdate(kZeroRttAccepted);
-        }
+        QLOG(*conn_, addTransportStateUpdate, kZeroRttAccepted);
         QUIC_STATS(conn_->statsCallback, onZeroRttAccepted);
         conn_->usedZeroRtt = true;
       }
@@ -892,7 +884,7 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacketData(
                 .peerAdvertisedInitialMaxStreamOffsetBidiRemote;
         auto originalPeerInitialStreamOffsetUni =
             conn_->flowControlState.peerAdvertisedInitialMaxStreamOffsetUni;
-        VLOG(10) << "Client negotiated transport params " << *this;
+        MVVLOG(10) << "Client negotiated transport params " << *this;
         auto maxStreamsBidi = getIntegerParameter(
             TransportParameterId::initial_max_streams_bidi,
             serverParams->parameters);
@@ -1046,9 +1038,7 @@ quic::Expected<void, QuicError> QuicClientTransportLite::onReadData(
     // If we are closed, then we shouldn't process new network data.
     QUIC_STATS(
         statsCallback_, onPacketDropped, PacketDropReason::CLIENT_STATE_CLOSED);
-    if (conn_->qLogger) {
-      conn_->qLogger->addPacketDrop(0, kAlreadyClosed);
-    }
+    QLOG(*conn_, addPacketDrop, 0, kAlreadyClosed);
     return {};
   }
   bool waitingForFirstPacket = !hasReceivedUdpPackets(*conn_);
@@ -1485,7 +1475,8 @@ quic::Expected<void, QuicError> QuicClientTransportLite::recvMsg(
     auto groResult = sock.getGRO();
     if (!groResult.has_value()) {
       // Non-fatal, just log and continue
-      LOG(WARNING) << "Failed to get GRO status: " << groResult.error().message;
+      MVLOG_WARNING << "Failed to get GRO status: "
+                    << groResult.error().message;
     } else {
       useGRO = groResult.value() > 0;
     }
@@ -1493,8 +1484,8 @@ quic::Expected<void, QuicError> QuicClientTransportLite::recvMsg(
     auto tsResult = sock.getTimestamping();
     if (!tsResult.has_value()) {
       // Non-fatal, just log and continue
-      LOG(WARNING) << "Failed to get timestamping status: "
-                   << tsResult.error().message;
+      MVLOG_WARNING << "Failed to get timestamping status: "
+                    << tsResult.error().message;
     } else {
       useTs = tsResult.value() > 0;
     }
@@ -1502,7 +1493,8 @@ quic::Expected<void, QuicError> QuicClientTransportLite::recvMsg(
     auto tosResult = sock.getRecvTos();
     if (!tosResult.has_value()) {
       // Non-fatal, just log and continue
-      LOG(WARNING) << "Failed to get TOS status: " << tosResult.error().message;
+      MVLOG_WARNING << "Failed to get TOS status: "
+                    << tosResult.error().message;
     } else {
       recvTos = tosResult.value();
     }
@@ -1568,7 +1560,8 @@ quic::Expected<void, QuicError> QuicClientTransportLite::recvMsg(
       server = folly::SocketAddress();
       server->setFromSockaddr(rawAddr, kAddrLen);
     }
-    VLOG(10) << "Got data from socket peer=" << *server << " len=" << bytesRead;
+    MVVLOG(10) << "Got data from socket peer=" << *server
+               << " len=" << bytesRead;
     readBuffer->append(bytesRead);
     if (params.gro > 0) {
       size_t len = bytesRead;
@@ -1761,7 +1754,8 @@ quic::Expected<void, QuicError> QuicClientTransportLite::recvMmsg(
           QuicAsyncUDPSocket::convertToSocketTimestampExt(*params.ts);
     }
 
-    VLOG(10) << "Got data from socket peer=" << *server << " len=" << bytesRead;
+    MVVLOG(10) << "Got data from socket peer=" << *server
+               << " len=" << bytesRead;
     readBuffer->append(bytesRead);
     if (params.gro > 0) {
       size_t len = bytesRead;
@@ -1958,9 +1952,7 @@ void QuicClientTransportLite::start(
 
   CHECK(conn_->peerAddress.isInitialized());
 
-  if (conn_->qLogger) {
-    conn_->qLogger->addTransportStateUpdate(kStart);
-  }
+  QLOG(*conn_, addTransportStateUpdate, kStart);
 
   setConnectionSetupCallback(connSetupCb);
   setConnectionCallback(connCb);
@@ -2050,15 +2042,15 @@ quic::Expected<void, QuicError> QuicClientTransportLite::adjustGROBuffers() {
       auto setResult = socket_->setGRO(true);
       if (!setResult.has_value()) {
         // Not a fatal error, just log and continue with default buffers
-        LOG(WARNING) << "Failed to enable GRO: " << setResult.error().message;
+        MVLOG_WARNING << "Failed to enable GRO: " << setResult.error().message;
         return {};
       }
 
       auto groResult = socket_->getGRO();
       if (!groResult.has_value()) {
         // Not a fatal error, just log and continue with default buffers
-        LOG(WARNING) << "Failed to get GRO status: "
-                     << groResult.error().message;
+        MVLOG_WARNING << "Failed to get GRO status: "
+                      << groResult.error().message;
         return {};
       }
 
@@ -2117,14 +2109,14 @@ void QuicClientTransportLite::onNetworkSwitch(
   // Start a probe and immediately migrate to the new path.
   auto probePathId = startPathProbe(std::move(newSock));
   if (probePathId.hasError()) {
-    VLOG(4) << "Failed to start path probe: " << probePathId.error();
+    MVVLOG(4) << "Failed to start path probe: " << probePathId.error();
     asyncClose(probePathId.error());
     return;
   }
 
   auto migrateResult = migrateConnection(probePathId.value());
   if (migrateResult.hasError()) {
-    VLOG(4) << "Failed to migrate connection: " << migrateResult.error();
+    MVVLOG(4) << "Failed to migrate connection: " << migrateResult.error();
     asyncClose(migrateResult.error());
     return;
   }
@@ -2261,9 +2253,7 @@ quic::Expected<void, QuicError> QuicClientTransportLite::migrateConnection(
     return quic::make_unexpected(adjustResult.error());
   }
 
-  if (conn_->qLogger) {
-    conn_->qLogger->addConnectionMigrationUpdate(true);
-  }
+  QLOG(*conn_, addConnectionMigrationUpdate, true);
 
   QUIC_STATS(conn_->statsCallback, onConnectionMigration);
 
@@ -2272,8 +2262,8 @@ quic::Expected<void, QuicError> QuicClientTransportLite::migrateConnection(
   auto removePathLambda = [conn = shared_from_this(), oldPathId]() {
     auto removePathRes = conn->clientConn_->pathManager->removePath(oldPathId);
     if (removePathRes.hasError()) {
-      LOG(WARNING) << "Failed to remove old path after migration. "
-                   << removePathRes.error();
+      MVLOG_WARNING << "Failed to remove old path after migration. "
+                    << removePathRes.error();
     }
   };
   auto delay = kClientTimeToKeepOldPathAfterMigration *
@@ -2301,9 +2291,7 @@ void QuicClientTransportLite::setTransportStatsCallback(
 }
 
 void QuicClientTransportLite::maybeQlogDatagram(size_t len) {
-  if (conn_->qLogger) {
-    conn_->qLogger->addDatagramReceived(len);
-  }
+  QLOG(*conn_, addDatagramReceived, len);
 }
 
 void QuicClientTransportLite::trackDatagramsReceived(
@@ -2321,7 +2309,7 @@ QuicClientTransportLite::maybeSendTransportKnobs() {
           setKnob(knob.space, knob.id, BufHelpers::copyBuffer(knob.blob));
       if (!res.has_value()) {
         if (res.error() != LocalErrorCode::KNOB_FRAME_UNSUPPORTED) {
-          LOG(ERROR) << "Unexpected error while sending knob frames";
+          MVLOG_ERROR << "Unexpected error while sending knob frames";
           return quic::make_unexpected(QuicError(
               QuicErrorCode(res.error()),
               "Unexpected error while sending knob frames"));
@@ -2390,7 +2378,7 @@ void QuicClientTransportLite::setCongestionControl(CongestionControlType type) {
     // for all transports.
     conn_->congestionControllerFactory =
         std::make_shared<DefaultCongestionControllerFactory>();
-    LOG(WARNING)
+    MVLOG_WARNING
         << "A congestion controller factory is not set. Using a default per-transport instance.";
   }
   QuicTransportBaseLite::setCongestionControl(type);
@@ -2479,8 +2467,8 @@ Optional<Handshake::TLSSummary> QuicClientTransportLite::getTLSSummary() const {
 void QuicClientTransportLite::onPathValidationResult(const PathInfo& pathInfo) {
   std::string statusStr =
       (pathInfo.status == PathStatus::Validated) ? "VALID" : "NOT VALID";
-  VLOG(4) << "onPathValidationResult: pathId=" << pathInfo.id
-          << ", status=" << statusStr;
+  MVVLOG(4) << "onPathValidationResult: pathId=" << pathInfo.id
+            << ", status=" << statusStr;
   if (auto it = pathValidationCallbacks_.find(pathInfo.id);
       it != pathValidationCallbacks_.end() && it->second) {
     it->second->onPathValidationResult(pathInfo);
@@ -2505,8 +2493,8 @@ void QuicClientTransportLite::onPathValidationResult(const PathInfo& pathInfo) {
           }
           auto removeRes = conn_->pathManager->removePath(pathId);
           if (removeRes.hasError()) {
-            LOG(WARNING) << "Failed to remove path " << pathId
-                         << " after validation: " << removeRes.error();
+            MVLOG_WARNING << "Failed to remove path " << pathId
+                          << " after validation: " << removeRes.error();
           }
         },
         /*thisIteration=*/true);

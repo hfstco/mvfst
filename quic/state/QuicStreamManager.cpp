@@ -5,7 +5,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include <quic/common/MvfstLogging.h>
 #include <quic/logging/QLogger.h>
+#include <quic/logging/QLoggerMacros.h>
 #include <quic/priority/HTTPPriorityQueue.h>
 #include <quic/state/QuicStreamManager.h>
 #include <quic/state/QuicStreamUtilities.h>
@@ -259,7 +261,7 @@ bool QuicStreamManager::consumeMaxLocalUnidirectionalStreamIdIncreased() {
 quic::Expected<void, LocalErrorCode> QuicStreamManager::setPriorityQueue(
     std::unique_ptr<PriorityQueue> queue) {
   if (!writeQueue().empty()) {
-    LOG(ERROR) << "Cannot change priority queue when the queue is not empty";
+    MVLOG_ERROR << "Cannot change priority queue when the queue is not empty";
     return quic::make_unexpected(LocalErrorCode::INTERNAL_ERROR);
   }
   writeQueue_ = std::move(queue);
@@ -269,8 +271,7 @@ quic::Expected<void, LocalErrorCode> QuicStreamManager::setPriorityQueue(
 bool QuicStreamManager::setStreamPriority(
     StreamId id,
     const PriorityQueue::Priority& newPriority,
-    bool connFlowControlOpen,
-    const std::shared_ptr<QLogger>& qLogger) {
+    bool connFlowControlOpen) {
   auto stream = findStream(id);
   if (stream) {
     if (writeQueue().equalPriority(stream->priority, newPriority)) {
@@ -278,10 +279,11 @@ bool QuicStreamManager::setStreamPriority(
     }
     stream->priority = newPriority;
     updateWritableStreams(*stream, connFlowControlOpen);
-    if (qLogger) {
-      qLogger->addPriorityUpdate(
-          id, writeQueue().toLogFields(stream->priority));
-    }
+    QLOG(
+        conn_,
+        addPriorityUpdate,
+        id,
+        writeQueue().toLogFields(stream->priority));
     return true;
   }
   return false;
@@ -407,8 +409,8 @@ QuicStreamManager::createNextBidirectionalStream(
     // type. Callers needing the precise QuicError should call createStream
     // directly.
     auto& error = streamResult.error();
-    LOG(WARNING) << "createStream failed: "
-                 << error.message; // Log the original error
+    MVLOG_WARNING << "createStream failed: "
+                  << error.message; // Log the original error
     if (error.code == TransportErrorCode::STREAM_LIMIT_ERROR) {
       return quic::make_unexpected(LocalErrorCode::STREAM_LIMIT_EXCEEDED);
     } else if (error.code == TransportErrorCode::STREAM_STATE_ERROR) {
@@ -439,7 +441,7 @@ QuicStreamManager::createNextUnidirectionalStream(
   } else {
     // Map QuicError to LocalErrorCode
     auto& error = streamResult.error();
-    LOG(WARNING) << "createStream failed: " << error.message;
+    MVLOG_WARNING << "createStream failed: " << error.message;
     if (error.code == TransportErrorCode::STREAM_LIMIT_ERROR) {
       return quic::make_unexpected(LocalErrorCode::STREAM_LIMIT_EXCEEDED);
     } else if (error.code == TransportErrorCode::STREAM_STATE_ERROR) {
@@ -475,8 +477,8 @@ QuicStreamState* FOLLY_NULLABLE QuicStreamManager::instantiatePeerStream(
       streams_.try_emplace(streamId, streamId, groupId, conn_);
 
   if (!inserted && it->second.groupId != groupId) {
-    LOG(ERROR) << "Stream " << streamId
-               << " already exists with different group ID";
+    MVLOG_ERROR << "Stream " << streamId
+                << " already exists with different group ID";
     return nullptr;
   }
 
@@ -745,8 +747,8 @@ quic::Expected<QuicStreamState*, QuicError> QuicStreamManager::createStream(
 
   if (!inserted) {
     // Propagate internal error as QuicError
-    LOG(ERROR) << "Failed to emplace stream " << streamId
-               << " after opening check";
+    MVLOG_ERROR << "Failed to emplace stream " << streamId
+                << " after opening check";
     return quic::make_unexpected(QuicError(
         TransportErrorCode::INTERNAL_ERROR,
         "Failed to emplace stream state after opening"));
@@ -761,10 +763,10 @@ quic::Expected<void, QuicError> QuicStreamManager::removeClosedStream(
     StreamId streamId) {
   auto it = streams_.find(streamId);
   if (it == streams_.end()) {
-    VLOG(10) << "Trying to remove already closed stream=" << streamId;
+    MVVLOG(10) << "Trying to remove already closed stream=" << streamId;
     return {};
   }
-  VLOG(10) << "Removing closed stream=" << streamId;
+  MVVLOG(10) << "Removing closed stream=" << streamId;
   DCHECK(it->second.inTerminalStates());
 
   // Clear from various tracking sets

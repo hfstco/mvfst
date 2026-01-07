@@ -7,8 +7,10 @@
 
 #include <folly/MapUtil.h>
 #include <folly/tracing/StaticTracepoint.h>
+#include <quic/common/MvfstLogging.h>
 #include <quic/congestion_control/CongestionControlFunctions.h>
 #include <quic/loss/QuicLossFunctions.h>
+#include <quic/observer/SocketObserverMacros.h>
 #include <quic/state/AckHandlers.h>
 #include <quic/state/AckedPacketIterator.h>
 #include <quic/state/QuicStateFunctions.h>
@@ -195,9 +197,9 @@ quic::Expected<AckEvent, QuicError> processAckFrame(
   };
   {
     const auto socketObserverContainer = conn.getSocketObserverContainer();
-    if (socketObserverContainer &&
-        socketObserverContainer->hasObserversForEvent<
-            SocketObserverInterface::Events::spuriousLossEvents>()) {
+    SOCKET_OBSERVER_IF(
+        socketObserverContainer,
+        SocketObserverInterface::Events::spuriousLossEvents) {
       spuriousLossEvent.emplace(ackReceiveTime);
     }
   }
@@ -210,8 +212,8 @@ quic::Expected<AckEvent, QuicError> processAckFrame(
         ackedPacketIterator->packet.header.getPacketNumberSpace();
     ackedPacketIterator->metadata.scheduledForDestruction = true;
     conn.outstandings.scheduledForDestructionCount++;
-    VLOG(10) << __func__ << " acked packetNum=" << currentPacketNum
-             << " space=" << currentPacketNumberSpace << conn;
+    MVVLOG(10) << __func__ << " acked packetNum=" << currentPacketNum
+               << " space=" << currentPacketNumberSpace << conn;
     // If we hit a packet which has been declared lost we need to count the
     // spurious loss and ignore all other processing.
     if (ackedPacketIterator->declaredLost) {
@@ -435,15 +437,16 @@ quic::Expected<AckEvent, QuicError> processAckFrame(
   // notify observers
   {
     const auto socketObserverContainer = conn.getSocketObserverContainer();
-    if (spuriousLossEvent && spuriousLossEvent->hasPackets() &&
-        socketObserverContainer &&
-        socketObserverContainer->hasObserversForEvent<
-            SocketObserverInterface::Events::spuriousLossEvents>()) {
-      socketObserverContainer->invokeInterfaceMethod<
-          SocketObserverInterface::Events::spuriousLossEvents>(
-          [spuriousLossEvent](auto observer, auto observed) {
-            observer->spuriousLossDetected(observed, *spuriousLossEvent);
-          });
+    if (spuriousLossEvent && spuriousLossEvent->hasPackets()) {
+      SOCKET_OBSERVER_IF(
+          socketObserverContainer,
+          SocketObserverInterface::Events::spuriousLossEvents) {
+        socketObserverContainer->invokeInterfaceMethod<
+            SocketObserverInterface::Events::spuriousLossEvents>(
+            [spuriousLossEvent](auto observer, auto observed) {
+              observer->spuriousLossDetected(observed, *spuriousLossEvent);
+            });
+      }
     }
   }
 
@@ -557,13 +560,13 @@ void parseAckReceiveTimestamps(
       // sent by peer.
       if (packetReceiveTimeStamps.size() >=
           maxReceiveTimestampsRequestedFromPeer) {
-        LOG(ERROR) << " Received more timestamps "
-                   << packetReceiveTimeStamps.size()
-                   << " than requested timestamps from peer: "
-                   << maxReceiveTimestampsRequestedFromPeer << " current PN "
-                   << receivedPacketNum << " largest PN "
-                   << frame.maybeLatestRecvdPacketNum.value() << " deltas  "
-                   << timeStampRange.deltas.size();
+        MVLOG_ERROR << " Received more timestamps "
+                    << packetReceiveTimeStamps.size()
+                    << " than requested timestamps from peer: "
+                    << maxReceiveTimestampsRequestedFromPeer << " current PN "
+                    << receivedPacketNum << " largest PN "
+                    << frame.maybeLatestRecvdPacketNum.value() << " deltas  "
+                    << timeStampRange.deltas.size();
         return;
       }
       receiveTimeStamp -= delta;
@@ -656,9 +659,9 @@ void updateRttForLargestAckedPacket(
     // notify observers
     {
       const auto socketObserverContainer = conn.getSocketObserverContainer();
-      if (socketObserverContainer &&
-          socketObserverContainer->hasObserversForEvent<
-              SocketObserverInterface::Events::rttSamples>()) {
+      SOCKET_OBSERVER_IF(
+          socketObserverContainer,
+          SocketObserverInterface::Events::rttSamples) {
         socketObserverContainer->invokeInterfaceMethod<
             SocketObserverInterface::Events::rttSamples>(
             [event = SocketObserverInterface::PacketRTT(

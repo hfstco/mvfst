@@ -38,13 +38,11 @@ mvfst_cpp_library(
     name = "server",
     srcs = [
         "QuicServer.cpp",
+        "QuicServerBackend.cpp",
         "QuicServerPacketRouter.cpp",
         "QuicServerTransport.cpp",
         "QuicServerWorker.cpp",
-    ] + select({
-        "DEFAULT": ["QuicServerBackendIoUring.cpp"],
-        "ovr_config//os:windows": ["QuicServerBackend.cpp"],
-    }),
+    ],
     headers = [
         "QuicReusePortUDPSocketFactory.h",
         "QuicServer.h",
@@ -67,6 +65,7 @@ mvfst_cpp_library(
         "//folly/system:hardware_concurrency",
         "//folly/system:thread_id",
         "//quic/codec:header_codec",
+        "//quic/common:mvfst_logging",
         "//quic/common:optional",
         "//quic/common:socket_util",
         "//quic/congestion_control:bbr",
@@ -80,12 +79,7 @@ mvfst_cpp_library(
         "//quic/server/handshake:token_generator",
         "//quic/server/third-party:siphash",
         "//quic/state:transport_settings_functions",
-    ] + select({
-        "DEFAULT": [
-            "//folly/io/async:io_uring_backend",
-        ],
-        "ovr_config//os:windows": [],
-    }),
+    ],
     exported_deps = [
         ":rate_limiter",
         "//fizz/record:record",

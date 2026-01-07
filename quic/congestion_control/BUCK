@@ -41,6 +41,7 @@ mvfst_cpp_library(
         "//quic/common:time_util",
     ],
     exported_deps = [
+        "//quic/common:mvfst_logging",
         "//quic/state:quic_state_machine",
     ],
 )
@@ -74,7 +75,7 @@ mvfst_cpp_library(
             ":copa",
             ":cubic",
         ],
-    }),
+    }) + ["//quic/common:mvfst_logging"],
     exported_deps = [
         "//quic:constants",
     ],
@@ -134,7 +135,9 @@ mvfst_cpp_library(
     deps = [
         ":ecn_l4s_tracker",
         "//folly:chrono",
+        "//quic/common:mvfst_logging",
         "//quic/logging:qlogger_constants",
+        "//quic/logging:qlogger_macros",
         "//quic/state:state_functions",
     ],
     exported_deps = [
@@ -156,7 +159,9 @@ mvfst_cpp_library(
     ],
     deps = [
         ":congestion_control_functions",
+        "//quic/common:mvfst_logging",
         "//quic/logging:qlogger_constants",
+        "//quic/logging:qlogger_macros",
     ],
     exported_deps = [
         ":congestion_controller",
@@ -176,8 +181,10 @@ mvfst_cpp_library(
     ],
     deps = [
         ":congestion_control_functions",
+        "//quic/common:mvfst_logging",
         "//quic/common:time_util",
         "//quic/logging:qlogger_constants",
+        "//quic/logging:qlogger_macros",
     ],
     exported_deps = [
         ":congestion_controller",
@@ -199,7 +206,9 @@ mvfst_cpp_library(
     ],
     deps = [
         ":congestion_control_functions",
+        "//quic/common:mvfst_logging",
         "//quic/logging:qlogger_constants",
+        "//quic/logging:qlogger_macros",
     ],
     exported_deps = [
         ":congestion_controller",
@@ -223,6 +232,7 @@ mvfst_cpp_library(
         "//quic:constants",
         "//quic/common:time_util",
         "//quic/logging:qlogger_constants",
+        "//quic/logging:qlogger_macros",
         "//quic/state:ack_frequency_functions",
     ],
     exported_deps = [
@@ -244,6 +254,8 @@ mvfst_cpp_library(
     ],
     deps = [
         ":congestion_control_functions",
+        "//quic/common:mvfst_logging",
+        "//quic/logging:qlogger_macros",
     ],
     exported_deps = [
         ":bandwidth",
@@ -276,6 +288,9 @@ mvfst_cpp_library(
     headers = [
         "BbrBandwidthSampler.h",
     ],
+    deps = [
+        "//quic/logging:qlogger_macros",
+    ],
     exported_deps = [
         ":bbr",
         "//quic/congestion_control/third_party:chromium_windowed_filter",
@@ -307,6 +322,8 @@ mvfst_cpp_library(
     ],
     deps = [
         ":congestion_control_functions",
+        "//quic/logging:qlogger_macros",
+        "//quic/observer:socket_observer_macros",
     ],
     exported_deps = [
         "//quic/state:quic_state_machine",
@@ -383,6 +400,8 @@ mvfst_cpp_library(
     ],
     deps = [
         "//quic:exception",
+        "//quic/logging:qlogger_macros",
+        "//quic/observer:socket_observer_macros",
     ],
     exported_deps = [
         ":packet_processor",

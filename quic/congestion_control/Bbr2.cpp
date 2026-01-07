@@ -5,9 +5,11 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include <quic/common/MvfstLogging.h>
 #include <quic/congestion_control/Bbr2.h>
 
 #include <quic/congestion_control/CongestionControlFunctions.h>
+#include <quic/logging/QLoggerMacros.h>
 #include <chrono>
 #include <cstdint>
 #include <limits>
@@ -61,7 +63,7 @@ Bbr2CongestionController::Bbr2CongestionController(
     if (conn_.pacer) {
       conn_.pacer->refreshPacingRate(cwndBytes_, 0us);
     } else {
-      LOG(WARNING) << "BBR2 was initialized on a connection without a pacer";
+      MVLOG_WARNING << "BBR2 was initialized on a connection without a pacer";
     }
   }
   enterStartup();
@@ -100,34 +102,36 @@ void Bbr2CongestionController::onPacketAckOrLoss(
     const AckEvent* FOLLY_NULLABLE ackEvent,
     const LossEvent* FOLLY_NULLABLE lossEvent) {
   SCOPE_EXIT {
-    if (conn_.qLogger) {
-      conn_.qLogger->addMetricUpdate(
-          conn_.lossState.lrtt,
-          conn_.lossState.mrtt,
-          conn_.lossState.srtt,
-          conn_.lossState.maybeLrttAckDelay.value_or(0us),
-          conn_.lossState.rttvar,
-          getCongestionWindow(),
-          conn_.lossState.inflightBytes,
-          std::nullopt,
-          std::nullopt,
-          std::nullopt,
-          conn_.lossState.ptoCount);
-      conn_.qLogger->addNetworkPathModelUpdate(
-          inflightLongTerm_.value_or(0),
-          inflightShortTerm_.value_or(0),
-          0, // bandwidthHi_ no longer available.
-          std::chrono::microseconds(1), // bandwidthHi_ no longer available.
-          bandwidthShortTerm_.has_value() ? bandwidthShortTerm_->units : 0,
-          bandwidthShortTerm_.has_value() ? bandwidthShortTerm_->interval
-                                          : std::chrono::microseconds(1));
-    }
+    QLOG(
+        conn_,
+        addMetricUpdate,
+        conn_.lossState.lrtt,
+        conn_.lossState.mrtt,
+        conn_.lossState.srtt,
+        conn_.lossState.maybeLrttAckDelay.value_or(0us),
+        conn_.lossState.rttvar,
+        getCongestionWindow(),
+        conn_.lossState.inflightBytes,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        conn_.lossState.ptoCount);
+    QLOG(
+        conn_,
+        addNetworkPathModelUpdate,
+        inflightLongTerm_.value_or(0),
+        inflightShortTerm_.value_or(0),
+        0, // bandwidthHi_ no longer available.
+        std::chrono::microseconds(1), // bandwidthHi_ no longer available.
+        bandwidthShortTerm_.has_value() ? bandwidthShortTerm_->units : 0,
+        bandwidthShortTerm_.has_value() ? bandwidthShortTerm_->interval
+                                        : std::chrono::microseconds(1));
   };
   SCOPE_EXIT {
-    VLOG(6) << "State=" << bbr2StateToString(state_)
-            << " inflight=" << conn_.lossState.inflightBytes
-            << " cwnd=" << getCongestionWindow() << "(gain=" << cwndGain_
-            << ")";
+    MVVLOG(6) << "State=" << bbr2StateToString(state_)
+              << " inflight=" << conn_.lossState.inflightBytes
+              << " cwnd=" << getCongestionWindow() << "(gain=" << cwndGain_
+              << ")";
   };
 
   if (lossEvent && lossEvent->lostPackets > 0) {
@@ -147,9 +151,7 @@ void Bbr2CongestionController::onPacketAckOrLoss(
     if (appLimited_ &&
         appLimitedLastSendTime_ <= ackEvent->largestNewlyAckedPacketSentTime) {
       appLimited_ = false;
-      if (conn_.qLogger) {
-        conn_.qLogger->addAppUnlimitedUpdate();
-      }
+      QLOG(conn_, addAppUnlimitedUpdate);
     }
 
     updateBandwidthSampleFromAck(*ackEvent);
@@ -219,9 +221,7 @@ bool Bbr2CongestionController::isAppLimited() const {
 void Bbr2CongestionController::setAppLimited() noexcept {
   appLimited_ = true;
   appLimitedLastSendTime_ = Clock::now();
-  if (conn_.qLogger) {
-    conn_.qLogger->addAppLimitedUpdate();
-  }
+  QLOG(conn_, addAppLimitedUpdate);
 }
 
 // Internals
@@ -323,12 +323,12 @@ void Bbr2CongestionController::setPacing() {
   }
   uint64_t pacingWindow =
       bandwidth_ * minRtt_ * pacingGain_ * (100 - kPacingMarginPercent) / 100;
-  VLOG(6) << "Setting pacing to "
-          << Bandwidth(pacingWindow, minRtt_).normalizedDescribe()
-          << " from bandwidth_=" << bandwidth_.normalizedDescribe()
-          << " pacingGain_=" << pacingGain_
-          << " kPacingMarginPercent=" << kPacingMarginPercent
-          << " units=" << pacingWindow << " interval=" << minRtt_.count();
+  MVVLOG(6) << "Setting pacing to "
+            << Bandwidth(pacingWindow, minRtt_).normalizedDescribe()
+            << " from bandwidth_=" << bandwidth_.normalizedDescribe()
+            << " pacingGain_=" << pacingGain_
+            << " kPacingMarginPercent=" << kPacingMarginPercent
+            << " units=" << pacingWindow << " interval=" << minRtt_.count();
 
   if (state_ == State::Startup && !fullBwReached_) {
     pacingWindow = std::max(
@@ -423,7 +423,7 @@ void Bbr2CongestionController::checkProbeRttDone() {
 
 void Bbr2CongestionController::restoreCwnd() {
   cwndBytes_ = std::max(cwndBytes_, previousCwndBytes_);
-  VLOG(6) << "Restored cwnd: " << cwndBytes_;
+  MVVLOG(6) << "Restored cwnd: " << cwndBytes_;
 }
 
 void Bbr2CongestionController::exitProbeRtt() {
@@ -440,8 +440,8 @@ void Bbr2CongestionController::updateLatestDeliverySignals() {
   lossRoundStart_ = false;
 
   bandwidthLatest_ = std::max(bandwidthLatest_, currentBwSample_);
-  VLOG(6) << "Bandwidth latest=" << bandwidthLatest_.normalizedDescribe()
-          << "  AppLimited=" << bandwidthLatest_.isAppLimited;
+  MVVLOG(6) << "Bandwidth latest=" << bandwidthLatest_.normalizedDescribe()
+            << "  AppLimited=" << bandwidthLatest_.isAppLimited;
   inflightLatest_ = std::max(inflightLatest_, currentAckMaxInflightBytes_);
 
   auto pkt = currentAckEvent_->getLargestNewlyAckedPacket();
@@ -463,8 +463,8 @@ void Bbr2CongestionController::updateCongestionSignals(
   // Update max bandwidth
   if (bandwidthLatest_ > maxBwFilter_.GetBest() ||
       !bandwidthLatest_.isAppLimited) {
-    VLOG(6) << "Updating bandwidth filter with sample: "
-            << bandwidthLatest_.normalizedDescribe();
+    MVVLOG(6) << "Updating bandwidth filter with sample: "
+              << bandwidthLatest_.normalizedDescribe();
     maxBwFilter_.Update(bandwidthLatest_, cycleCount_);
   }
 
@@ -599,8 +599,8 @@ void Bbr2CongestionController::enterDrain() {
 
 void Bbr2CongestionController::checkDrain() {
   if (state_ == State::Drain) {
-    VLOG(6) << "Current inflight" << conn_.lossState.inflightBytes
-            << " target inflight " << getTargetInflightWithGain(1.0);
+    MVVLOG(6) << "Current inflight" << conn_.lossState.inflightBytes
+              << " target inflight " << getTargetInflightWithGain(1.0);
   }
   if (state_ == State::Drain &&
       conn_.lossState.inflightBytes <= getTargetInflightWithGain(1.0)) {
@@ -868,8 +868,8 @@ void Bbr2CongestionController::boundBwForModel() {
       bandwidth_ = std::min(bandwidth_, *bandwidthShortTerm_);
     }
   }
-  if (conn_.qLogger && previousBw != bandwidth_) {
-    conn_.qLogger->addBandwidthEstUpdate(bandwidth_.units, bandwidth_.interval);
+  if (previousBw != bandwidth_) {
+    QLOG(conn_, addBandwidthEstUpdate, bandwidth_.units, bandwidth_.interval);
   }
 }
 
@@ -892,7 +892,7 @@ void Bbr2CongestionController::saveCwnd() {
   } else {
     previousCwndBytes_ = std::max(cwndBytes_, previousCwndBytes_);
   }
-  VLOG(6) << "Saved cwnd: " << previousCwndBytes_;
+  MVVLOG(6) << "Saved cwnd: " << previousCwndBytes_;
 }
 
 uint64_t Bbr2CongestionController::getTargetInflightWithGain(float gain) const {

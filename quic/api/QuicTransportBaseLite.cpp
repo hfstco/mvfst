@@ -8,11 +8,14 @@
 #include <quic/api/LoopDetectorCallback.h>
 #include <quic/api/QuicTransportBaseLite.h>
 #include <quic/api/QuicTransportFunctions.h>
+#include <quic/common/MvfstLogging.h>
 #include <quic/congestion_control/CongestionControllerFactory.h>
 #include <quic/congestion_control/EcnL4sTracker.h>
 #include <quic/congestion_control/PacerFactory.h>
 #include <quic/flowcontrol/QuicFlowController.h>
+#include <quic/logging/QLoggerMacros.h>
 #include <quic/loss/QuicLossFunctions.h>
+#include <quic/observer/SocketObserverMacros.h>
 #include <quic/state/QuicPacingFunctions.h>
 #include <quic/state/QuicStreamFunctions.h>
 #include <quic/state/stream/StreamSendHandlers.h>
@@ -98,10 +101,9 @@ void QuicTransportBaseLite::onNetworkData(
     auto originalAckVersion = currentAckStateVersion(*conn_);
 
     // handle PacketsReceivedEvent if requested by observers
-    if (getSocketObserverContainer() &&
-        getSocketObserverContainer()
-            ->hasObserversForEvent<
-                SocketObserverInterface::Events::packetsReceivedEvents>()) {
+    SOCKET_OBSERVER_IF(
+        getSocketObserverContainer(),
+        SocketObserverInterface::Events::packetsReceivedEvents) {
       auto builder = SocketObserverInterface::PacketsReceivedEvent::Builder()
                          .setReceiveLoopTime(TimePoint::clock::now())
                          .setNumPacketsReceived(networkData.getPackets().size())
@@ -134,7 +136,7 @@ void QuicTransportBaseLite::onNetworkData(
     for (auto& packet : packets) {
       auto res = onReadData(localAddress, std::move(packet), peerAddress);
       if (!res.has_value()) {
-        VLOG(4) << __func__ << " " << res.error().message << " " << *this;
+        MVVLOG(4) << __func__ << " " << res.error().message << " " << *this;
         exceptionCloseWhat_ = res.error().message;
         return closeImpl(res.error());
       }
@@ -178,7 +180,8 @@ void QuicTransportBaseLite::onNetworkData(
       // expected
       auto ecnResult = validateECNState();
       if (!ecnResult.has_value()) {
-        VLOG(4) << __func__ << " " << ecnResult.error().message << " " << *this;
+        MVVLOG(4) << __func__ << " " << ecnResult.error().message << " "
+                  << *this;
         exceptionCloseWhat_ = ecnResult.error().message;
         closeImpl(ecnResult.error());
       }
@@ -187,28 +190,28 @@ void QuicTransportBaseLite::onNetworkData(
       // however the write looper will not be set.
       auto result = writeSocketData();
       if (!result.has_value()) {
-        VLOG(4) << __func__ << " " << result.error().message << " " << *this;
+        MVVLOG(4) << __func__ << " " << result.error().message << " " << *this;
         exceptionCloseWhat_ = result.error().message;
         closeImpl(result.error());
       }
     }
   } catch (const QuicTransportException& ex) {
-    VLOG(4) << __func__ << " " << ex.what() << " " << *this;
+    MVVLOG(4) << __func__ << " " << ex.what() << " " << *this;
     exceptionCloseWhat_ = ex.what();
     return closeImpl(
         QuicError(QuicErrorCode(ex.errorCode()), std::string(ex.what())));
   } catch (const QuicInternalException& ex) {
-    VLOG(4) << __func__ << " " << ex.what() << " " << *this;
+    MVVLOG(4) << __func__ << " " << ex.what() << " " << *this;
     exceptionCloseWhat_ = ex.what();
     return closeImpl(
         QuicError(QuicErrorCode(ex.errorCode()), std::string(ex.what())));
   } catch (const QuicApplicationException& ex) {
-    VLOG(4) << __func__ << " " << ex.what() << " " << *this;
+    MVVLOG(4) << __func__ << " " << ex.what() << " " << *this;
     exceptionCloseWhat_ = ex.what();
     return closeImpl(
         QuicError(QuicErrorCode(ex.errorCode()), std::string(ex.what())));
   } catch (const std::exception& ex) {
-    VLOG(4) << __func__ << " " << ex.what() << " " << *this;
+    MVVLOG(4) << __func__ << " " << ex.what() << " " << *this;
     exceptionCloseWhat_ = ex.what();
     return closeImpl(QuicError(
         QuicErrorCode(TransportErrorCode::INTERNAL_ERROR),
@@ -231,7 +234,7 @@ void QuicTransportBaseLite::close(Optional<QuicError> errorCode) {
 void QuicTransportBaseLite::closeNow(Optional<QuicError> errorCode) {
   DCHECK(getEventBase() && getEventBase()->isInEventBaseThread());
   [[maybe_unused]] auto self = sharedGuard();
-  VLOG(4) << __func__ << " " << *this;
+  MVVLOG(4) << __func__ << " " << *this;
   errorCode = maybeSetGenericAppError(std::move(errorCode));
   closeImpl(std::move(errorCode), false);
   // the drain timeout may have been scheduled by a previous close, in which
@@ -335,8 +338,8 @@ QuicSocketLite::WriteResult QuicTransportBaseLite::writeChain(
         auto deliveryResult = registerDeliveryCallback(
             id, currentLargestWriteOffset + dataLength - 1, cb);
         if (!deliveryResult.has_value()) {
-          VLOG(4) << "Failed to register delivery callback: "
-                  << toString(deliveryResult.error());
+          MVVLOG(4) << "Failed to register delivery callback: "
+                    << toString(deliveryResult.error());
           exceptionCloseWhat_ = "Failed to register delivery callback";
           closeImpl(QuicError(
               deliveryResult.error(),
@@ -352,8 +355,8 @@ QuicSocketLite::WriteResult QuicTransportBaseLite::writeChain(
     }
     auto result = writeDataToQuicStream(*stream, std::move(data), eof);
     if (!result.has_value()) {
-      VLOG(4) << __func__ << " streamId=" << id << " " << result.error().message
-              << " " << *this;
+      MVVLOG(4) << __func__ << " streamId=" << id << " "
+                << result.error().message << " " << *this;
       exceptionCloseWhat_ = result.error().message;
       closeImpl(
           QuicError(result.error().code, std::string("writeChain() error")));
@@ -365,22 +368,22 @@ QuicSocketLite::WriteResult QuicTransportBaseLite::writeChain(
     }
     updateWriteLooper(true);
   } catch (const QuicTransportException& ex) {
-    VLOG(4) << __func__ << " streamId=" << id << " " << ex.what() << " "
-            << *this;
+    MVVLOG(4) << __func__ << " streamId=" << id << " " << ex.what() << " "
+              << *this;
     exceptionCloseWhat_ = ex.what();
     closeImpl(QuicError(
         QuicErrorCode(ex.errorCode()), std::string("writeChain() error")));
     return quic::make_unexpected(LocalErrorCode::TRANSPORT_ERROR);
   } catch (const QuicInternalException& ex) {
-    VLOG(4) << __func__ << " streamId=" << id << " " << ex.what() << " "
-            << *this;
+    MVVLOG(4) << __func__ << " streamId=" << id << " " << ex.what() << " "
+              << *this;
     exceptionCloseWhat_ = ex.what();
     closeImpl(QuicError(
         QuicErrorCode(ex.errorCode()), std::string("writeChain() error")));
     return quic::make_unexpected(ex.errorCode());
   } catch (const std::exception& ex) {
-    VLOG(4) << __func__ << " streamId=" << id << " " << ex.what() << " "
-            << *this;
+    MVVLOG(4) << __func__ << " streamId=" << id << " " << ex.what() << " "
+              << *this;
     exceptionCloseWhat_ = ex.what();
     closeImpl(QuicError(
         QuicErrorCode(TransportErrorCode::INTERNAL_ERROR),
@@ -731,7 +734,8 @@ QuicTransportBaseLite::read(StreamId id, size_t maxLen) {
     }
     auto readResult = readDataFromQuicStream(*stream, maxLen);
     if (!readResult.has_value()) {
-      VLOG(4) << "read() error " << readResult.error().message << " " << *this;
+      MVVLOG(4) << "read() error " << readResult.error().message << " "
+                << *this;
       exceptionCloseWhat_ = readResult.error().message;
       closeImpl(QuicError(
           QuicErrorCode(readResult.error().code), std::string("read() error")));
@@ -739,8 +743,8 @@ QuicTransportBaseLite::read(StreamId id, size_t maxLen) {
     }
     auto result = std::move(readResult.value());
     if (result.second) {
-      VLOG(10) << "Delivered eof to app for stream=" << stream->id << " "
-               << *this;
+      MVVLOG(10) << "Delivered eof to app for stream=" << stream->id << " "
+                 << *this;
       auto it = readCallbacks_.find(id);
       if (it != readCallbacks_.end()) {
         // it's highly unlikely that someone called read() without having a read
@@ -752,19 +756,19 @@ QuicTransportBaseLite::read(StreamId id, size_t maxLen) {
     return quic::Expected<std::pair<BufPtr, bool>, LocalErrorCode>(
         std::move(result));
   } catch (const QuicTransportException& ex) {
-    VLOG(4) << "read() error " << ex.what() << " " << *this;
+    MVVLOG(4) << "read() error " << ex.what() << " " << *this;
     exceptionCloseWhat_ = ex.what();
     closeImpl(
         QuicError(QuicErrorCode(ex.errorCode()), std::string("read() error")));
     return quic::make_unexpected(LocalErrorCode::TRANSPORT_ERROR);
   } catch (const QuicInternalException& ex) {
-    VLOG(4) << __func__ << " " << ex.what() << " " << *this;
+    MVVLOG(4) << __func__ << " " << ex.what() << " " << *this;
     exceptionCloseWhat_ = ex.what();
     closeImpl(
         QuicError(QuicErrorCode(ex.errorCode()), std::string("read() error")));
     return quic::make_unexpected(ex.errorCode());
   } catch (const std::exception& ex) {
-    VLOG(4) << "read()  error " << ex.what() << " " << *this;
+    MVVLOG(4) << "read()  error " << ex.what() << " " << *this;
     exceptionCloseWhat_ = ex.what();
     closeImpl(QuicError(
         QuicErrorCode(TransportErrorCode::INTERNAL_ERROR),
@@ -828,10 +832,7 @@ quic::Expected<void, LocalErrorCode> QuicTransportBaseLite::setStreamPriority(
   // It's not an error to prioritize a stream after it's sent its FIN - this
   // can reprioritize retransmissions.
   conn_->streamManager->setStreamPriority(
-      id,
-      priority,
-      getSendConnFlowControlBytesWire(*conn_) > 0,
-      conn_->qLogger);
+      id, priority, getSendConnFlowControlBytesWire(*conn_) > 0);
   return {};
 }
 
@@ -841,7 +842,7 @@ quic::Expected<void, LocalErrorCode> QuicTransportBaseLite::setMaxPacingRate(
     conn_->pacer->setMaxPacingRate(maxRateBytesPerSec);
     return {};
   } else {
-    LOG(WARNING)
+    MVLOG_WARNING
         << "Cannot set max pacing rate without a pacer. Pacing Enabled = "
         << conn_->transportSettings.pacingEnabled;
     return quic::make_unexpected(LocalErrorCode::PACER_NOT_AVAILABLE);
@@ -897,7 +898,7 @@ QuicTransportBaseLite::ByteEventMap& QuicTransportBaseLite::getByteEventMap(
     case ByteEvent::Type::TX:
       return txCallbacks_;
   }
-  LOG(FATAL) << "Unhandled case in getByteEventMap";
+  MVLOG_FATAL << "Unhandled case in getByteEventMap";
   folly::assume_unreachable();
 }
 
@@ -909,7 +910,7 @@ QuicTransportBaseLite::getByteEventMapConst(const ByteEvent::Type type) const {
     case ByteEvent::Type::TX:
       return txCallbacks_;
   }
-  LOG(FATAL) << "Unhandled case in getByteEventMapConst";
+  MVLOG_FATAL << "Unhandled case in getByteEventMapConst";
   folly::assume_unreachable();
 }
 
@@ -987,8 +988,8 @@ void QuicTransportBaseLite::updateWriteLooper(bool thisIteration) {
     return;
   }
   if (closeState_ == CloseState::CLOSED) {
-    VLOG(10) << nodeToString(conn_->nodeType)
-             << " stopping write looper because conn closed " << *this;
+    MVVLOG(10) << nodeToString(conn_->nodeType)
+               << " stopping write looper because conn closed " << *this;
     writeLooper_->stop();
     return;
   }
@@ -1002,17 +1003,17 @@ void QuicTransportBaseLite::updateWriteLooper(bool thisIteration) {
 
   auto writeDataReason = shouldWriteData(*conn_);
   if (writeDataReason != WriteDataReason::NO_WRITE) {
-    VLOG(10) << nodeToString(conn_->nodeType)
-             << " running write looper thisIteration=" << thisIteration << " "
-             << *this;
+    MVVLOG(10) << nodeToString(conn_->nodeType)
+               << " running write looper thisIteration=" << thisIteration << " "
+               << *this;
     writeLooper_->run(thisIteration);
     if (conn_->loopDetectorCallback) {
       conn_->writeDebugState.needsWriteLoopDetect =
           (conn_->loopDetectorCallback != nullptr);
     }
   } else {
-    VLOG(10) << nodeToString(conn_->nodeType) << " stopping write looper "
-             << *this;
+    MVVLOG(10) << nodeToString(conn_->nodeType) << " stopping write looper "
+               << *this;
     writeLooper_->stop();
     if (conn_->loopDetectorCallback) {
       conn_->writeDebugState.needsWriteLoopDetect = false;
@@ -1026,7 +1027,7 @@ void QuicTransportBaseLite::updateWriteLooper(bool thisIteration) {
 
 void QuicTransportBaseLite::updateReadLooper() {
   if (closeState_ != CloseState::OPEN) {
-    VLOG(10) << "Stopping read looper " << *this;
+    MVVLOG(10) << "Stopping read looper " << *this;
     readLooper_->stop();
     return;
   }
@@ -1051,10 +1052,10 @@ void QuicTransportBaseLite::updateReadLooper() {
       unidirIter !=
           conn_->streamManager->readableUnidirectionalStreams().end() ||
       !conn_->datagramState.readBuffer.empty()) {
-    VLOG(10) << "Scheduling read looper " << *this;
+    MVVLOG(10) << "Scheduling read looper " << *this;
     readLooper_->run();
   } else {
-    VLOG(10) << "Stopping read looper " << *this;
+    MVVLOG(10) << "Stopping read looper " << *this;
     readLooper_->stop();
   }
 }
@@ -1104,10 +1105,9 @@ void QuicTransportBaseLite::checkForClosedStream() {
   while (itr != conn_->streamManager->closedStreams().end()) {
     const auto& streamId = *itr;
 
-    if (getSocketObserverContainer() &&
-        getSocketObserverContainer()
-            ->hasObserversForEvent<
-                SocketObserverInterface::Events::streamEvents>()) {
+    SOCKET_OBSERVER_IF(
+        getSocketObserverContainer(),
+        SocketObserverInterface::Events::streamEvents) {
       getSocketObserverContainer()
           ->invokeInterfaceMethod<
               SocketObserverInterface::Events::streamEvents>(
@@ -1127,8 +1127,8 @@ void QuicTransportBaseLite::checkForClosedStream() {
         readCbIt->second.readCb != nullptr) {
       if (conn_->transportSettings.removeStreamAfterEomCallbackUnset ||
           !readCbIt->second.deliveredEOM) {
-        VLOG(10) << "Not closing stream=" << *itr
-                 << " because it has active read callback";
+        MVVLOG(10) << "Not closing stream=" << *itr
+                   << " because it has active read callback";
         ++itr;
         continue;
       }
@@ -1136,20 +1136,20 @@ void QuicTransportBaseLite::checkForClosedStream() {
     // If we have pending byte events, delay closing the stream
     auto numByteEventCb = getNumByteEventCallbacksForStream(*itr);
     if (numByteEventCb > 0) {
-      VLOG(10) << "Not closing stream=" << *itr << " because it has "
-               << numByteEventCb << " pending byte event callbacks";
+      MVVLOG(10) << "Not closing stream=" << *itr << " because it has "
+                 << numByteEventCb << " pending byte event callbacks";
       ++itr;
       continue;
     }
     // If we have active peek callback, delay closing the stream
     if (hasPeekCallback(*itr)) {
-      VLOG(10) << "Not closing stream=" << *itr
-               << " because it has active peek callback";
+      MVVLOG(10) << "Not closing stream=" << *itr
+                 << " because it has active peek callback";
       ++itr;
       continue;
     }
 
-    VLOG(10) << "Closing stream=" << *itr;
+    MVVLOG(10) << "Closing stream=" << *itr;
     if (connCallback_) {
       connCallback_->onStreamPreReaped(*itr);
     }
@@ -1178,26 +1178,26 @@ void QuicTransportBaseLite::writeSocketDataAndCatch() {
   try {
     auto result = writeSocketData();
     if (!result.has_value()) {
-      VLOG(4) << __func__ << " " << result.error().message << " " << *this;
+      MVVLOG(4) << __func__ << " " << result.error().message << " " << *this;
       exceptionCloseWhat_ = result.error().message;
       closeImpl(result.error());
       return;
     }
     processCallbacksAfterWriteData();
   } catch (const QuicTransportException& ex) {
-    VLOG(4) << __func__ << ex.what() << " " << *this;
+    MVVLOG(4) << __func__ << ex.what() << " " << *this;
     exceptionCloseWhat_ = ex.what();
     closeImpl(QuicError(
         QuicErrorCode(ex.errorCode()),
         std::string("writeSocketDataAndCatch()  error")));
   } catch (const QuicInternalException& ex) {
-    VLOG(4) << __func__ << ex.what() << " " << *this;
+    MVVLOG(4) << __func__ << ex.what() << " " << *this;
     exceptionCloseWhat_ = ex.what();
     closeImpl(QuicError(
         QuicErrorCode(ex.errorCode()),
         std::string("writeSocketDataAndCatch()  error")));
   } catch (const std::exception& ex) {
-    VLOG(4) << __func__ << " error=" << ex.what() << " " << *this;
+    MVVLOG(4) << __func__ << " error=" << ex.what() << " " << *this;
     exceptionCloseWhat_ = ex.what();
     closeImpl(QuicError(
         QuicErrorCode(TransportErrorCode::INTERNAL_ERROR),
@@ -1384,7 +1384,7 @@ void QuicTransportBaseLite::closeImpl(
     return;
   }
 
-  if (getSocketObserverContainer()) {
+  SOCKET_OBSERVER_IF_ANY(getSocketObserverContainer()) {
     SocketObserverInterface::CloseStartedEvent event;
     event.maybeCloseReason = errorCode;
     getSocketObserverContainer()->invokeInterfaceMethodAllObservers(
@@ -1395,8 +1395,8 @@ void QuicTransportBaseLite::closeImpl(
 
   drainConnection = drainConnection & conn_->transportSettings.shouldDrain;
 
-  uint64_t totalCryptoDataWritten = 0;
-  uint64_t totalCryptoDataRecvd = 0;
+  uint64_t totalCryptoDataWritten [[maybe_unused]] = 0;
+  uint64_t totalCryptoDataRecvd [[maybe_unused]] = 0;
   auto timeUntilLastInitialCryptoFrameReceived = std::chrono::milliseconds(0);
   if (conn_->cryptoState) {
     totalCryptoDataWritten +=
@@ -1416,36 +1416,36 @@ void QuicTransportBaseLite::closeImpl(
             conn_->connectionTime);
   }
 
-  if (conn_->qLogger) {
-    auto tlsSummary = conn_->handshakeLayer->getTLSSummary();
-    conn_->qLogger->addTransportSummary(
-        {conn_->lossState.totalBytesSent,
-         conn_->lossState.totalBytesRecvd,
-         conn_->flowControlState.sumCurWriteOffset,
-         conn_->flowControlState.sumMaxObservedOffset,
-         conn_->flowControlState.sumCurStreamBufferLen,
-         conn_->lossState.totalBytesRetransmitted,
-         conn_->lossState.totalStreamBytesCloned,
-         conn_->lossState.totalBytesCloned,
-         totalCryptoDataWritten,
-         totalCryptoDataRecvd,
-         conn_->congestionController
-             ? conn_->congestionController->getWritableBytes()
-             : std::numeric_limits<uint64_t>::max(),
-         getSendConnFlowControlBytesWire(*conn_),
-         conn_->lossState.totalPacketsSpuriouslyMarkedLost,
-         conn_->lossState.reorderingThreshold,
-         uint64_t(conn_->transportSettings.timeReorderingThreshDividend),
-         conn_->usedZeroRtt,
-         conn_->version.value_or(QuicVersion::MVFST_INVALID),
-         conn_->initialPacketsReceived,
-         conn_->uniqueInitialCryptoFramesReceived,
-         timeUntilLastInitialCryptoFrameReceived,
-         tlsSummary.alpn,
-         tlsSummary.namedGroup,
-         tlsSummary.pskType,
-         tlsSummary.echStatus});
-  }
+  [[maybe_unused]] auto tlsSummary = conn_->handshakeLayer->getTLSSummary();
+  QLOG(
+      *conn_,
+      addTransportSummary,
+      {conn_->lossState.totalBytesSent,
+       conn_->lossState.totalBytesRecvd,
+       conn_->flowControlState.sumCurWriteOffset,
+       conn_->flowControlState.sumMaxObservedOffset,
+       conn_->flowControlState.sumCurStreamBufferLen,
+       conn_->lossState.totalBytesRetransmitted,
+       conn_->lossState.totalStreamBytesCloned,
+       conn_->lossState.totalBytesCloned,
+       totalCryptoDataWritten,
+       totalCryptoDataRecvd,
+       conn_->congestionController
+           ? conn_->congestionController->getWritableBytes()
+           : std::numeric_limits<uint64_t>::max(),
+       getSendConnFlowControlBytesWire(*conn_),
+       conn_->lossState.totalPacketsSpuriouslyMarkedLost,
+       conn_->lossState.reorderingThreshold,
+       uint64_t(conn_->transportSettings.timeReorderingThreshDividend),
+       conn_->usedZeroRtt,
+       conn_->version.value_or(QuicVersion::MVFST_INVALID),
+       conn_->initialPacketsReceived,
+       conn_->uniqueInitialCryptoFramesReceived,
+       timeUntilLastInitialCryptoFrameReceived,
+       tlsSummary.alpn,
+       tlsSummary.namedGroup,
+       tlsSummary.pskType,
+       tlsSummary.echStatus});
 
   // TODO: truncate the error code string to be 1MSS only.
   closeState_ = CloseState::CLOSED;
@@ -1476,26 +1476,31 @@ void QuicTransportBaseLite::closeImpl(
   }
   isInvalidMigration = transportError &&
       *transportError == TransportErrorCode::INVALID_MIGRATION;
-  VLOG_IF(4, isReset) << "Closing transport due to stateless reset " << *this;
-  VLOG_IF(4, isAbandon) << "Closing transport due to abandoned connection "
-                        << *this;
+  MVVLOG_IF(4, isReset) << "Closing transport due to stateless reset " << *this;
+  MVVLOG_IF(4, isAbandon) << "Closing transport due to abandoned connection "
+                          << *this;
   if (errorCode) {
     conn_->localConnectionError = errorCode;
-    if (conn_->qLogger) {
-      conn_->qLogger->addConnectionClose(
-          conn_->localConnectionError->message,
-          errorCode->message,
-          drainConnection,
-          sendCloseImmediately);
-    }
-  } else if (conn_->qLogger) {
-    auto reason = fmt::format(
+    QLOG(
+        *conn_,
+        addConnectionClose,
+        conn_->localConnectionError->message,
+        errorCode->message,
+        drainConnection,
+        sendCloseImmediately);
+  } else {
+    [[maybe_unused]] auto reason = fmt::format(
         "Server: {}, Peer: isReset: {}, Peer: isAbandon: {}",
         kNoError,
         isReset,
         isAbandon);
-    conn_->qLogger->addConnectionClose(
-        kNoError, std::move(reason), drainConnection, sendCloseImmediately);
+    QLOG(
+        *conn_,
+        addConnectionClose,
+        kNoError,
+        std::move(reason),
+        drainConnection,
+        sendCloseImmediately);
   }
   cancelLossTimeout();
   cancelTimeout(&ackTimeout_);
@@ -1504,7 +1509,7 @@ void QuicTransportBaseLite::closeImpl(
   cancelTimeout(&keepaliveTimeout_);
   cancelTimeout(&excessWriteTimeout_);
 
-  VLOG(10) << "Stopping read looper due to immediate close " << *this;
+  MVVLOG(10) << "Stopping read looper due to immediate close " << *this;
   readLooper_->stop();
   writeLooper_->stop();
   cleanupPeekPingDatagramResources();
@@ -1560,8 +1565,8 @@ void QuicTransportBaseLite::closeImpl(
     // close directly.
     auto result = writeData();
     if (!result.has_value()) {
-      LOG(ERROR) << "close failed with error: " << result.error().message << " "
-                 << *this;
+      MVLOG_ERROR << "close failed with error: " << result.error().message
+                  << " " << *this;
     }
   }
   drainConnection =
@@ -1690,8 +1695,8 @@ quic::Expected<void, LocalErrorCode> QuicTransportBaseLite::resetStreamInternal(
     // Invoke state machine
     auto result = sendRstSMHandler(*stream, errorCode, maybeReliableSize);
     if (!result.has_value()) {
-      VLOG(4) << __func__ << " streamId=" << id << " " << result.error().message
-              << " " << *this;
+      MVVLOG(4) << __func__ << " streamId=" << id << " "
+                << result.error().message << " " << *this;
       exceptionCloseWhat_ = result.error().message;
       closeImpl(
           QuicError(result.error().code, std::string("resetStream() error")));
@@ -1711,22 +1716,22 @@ quic::Expected<void, LocalErrorCode> QuicTransportBaseLite::resetStreamInternal(
     pendingWriteCallbacks_.erase(id);
     QUIC_STATS(conn_->statsCallback, onQuicStreamReset, errorCode);
   } catch (const QuicTransportException& ex) {
-    VLOG(4) << __func__ << " streamId=" << id << " " << ex.what() << " "
-            << *this;
+    MVVLOG(4) << __func__ << " streamId=" << id << " " << ex.what() << " "
+              << *this;
     exceptionCloseWhat_ = ex.what();
     closeImpl(QuicError(
         QuicErrorCode(ex.errorCode()), std::string("resetStream() error")));
     return quic::make_unexpected(LocalErrorCode::TRANSPORT_ERROR);
   } catch (const QuicInternalException& ex) {
-    VLOG(4) << __func__ << " streamId=" << id << " " << ex.what() << " "
-            << *this;
+    MVVLOG(4) << __func__ << " streamId=" << id << " " << ex.what() << " "
+              << *this;
     exceptionCloseWhat_ = ex.what();
     closeImpl(QuicError(
         QuicErrorCode(ex.errorCode()), std::string("resetStream() error")));
     return quic::make_unexpected(ex.errorCode());
   } catch (const std::exception& ex) {
-    VLOG(4) << __func__ << " streamId=" << id << " " << ex.what() << " "
-            << *this;
+    MVVLOG(4) << __func__ << " streamId=" << id << " " << ex.what() << " "
+              << *this;
     exceptionCloseWhat_ = ex.what();
     closeImpl(QuicError(
         QuicErrorCode(TransportErrorCode::INTERNAL_ERROR),
@@ -1826,17 +1831,16 @@ void QuicTransportBaseLite::invokeStreamsAvailableCallbacks() {
 
 void QuicTransportBaseLite::handleKnobCallbacks() {
   if (!conn_->transportSettings.advertisedKnobFrameSupport) {
-    VLOG(4) << "Received knob frames without advertising support";
+    MVVLOG(4) << "Received knob frames without advertising support";
     conn_->pendingEvents.knobs.clear();
     return;
   }
 
   for (auto& knobFrame : conn_->pendingEvents.knobs) {
     if (knobFrame.knobSpace != kDefaultQuicTransportKnobSpace) {
-      if (getSocketObserverContainer() &&
-          getSocketObserverContainer()
-              ->hasObserversForEvent<
-                  SocketObserverInterface::Events::knobFrameEvents>()) {
+      SOCKET_OBSERVER_IF(
+          getSocketObserverContainer(),
+          SocketObserverInterface::Events::knobFrameEvents) {
         getSocketObserverContainer()
             ->invokeInterfaceMethod<
                 SocketObserverInterface::Events::knobFrameEvents>(
@@ -1861,10 +1865,9 @@ void QuicTransportBaseLite::handleAckEventCallbacks() {
     return; // nothing to do
   }
 
-  if (getSocketObserverContainer() &&
-      getSocketObserverContainer()
-          ->hasObserversForEvent<
-              SocketObserverInterface::Events::acksProcessedEvents>()) {
+  SOCKET_OBSERVER_IF(
+      getSocketObserverContainer(),
+      SocketObserverInterface::Events::acksProcessedEvents) {
     getSocketObserverContainer()
         ->invokeInterfaceMethod<
             SocketObserverInterface::Events::acksProcessedEvents>(
@@ -2117,7 +2120,7 @@ void QuicTransportBaseLite::closeUdpSocket() {
   if (!socket_) {
     return;
   }
-  if (getSocketObserverContainer()) {
+  SOCKET_OBSERVER_IF_ANY(getSocketObserverContainer()) {
     SocketObserverInterface::ClosingEvent event; // empty for now
     getSocketObserverContainer()->invokeInterfaceMethodAllObservers(
         [&event](auto observer, auto observed) {
@@ -2128,8 +2131,9 @@ void QuicTransportBaseLite::closeUdpSocket() {
   socket_ = nullptr;
   sock->pauseRead();
   auto closeResult = sock->close();
-  LOG_IF(ERROR, !closeResult.has_value())
-      << "close hit an error: " << closeResult.error().message;
+  if (!closeResult.has_value()) {
+    MVLOG_ERROR << "close hit an error: " << closeResult.error().message;
+  }
 }
 
 quic::Expected<StreamId, LocalErrorCode>
@@ -2157,10 +2161,9 @@ QuicTransportBaseLite::createStreamInternal(
   }
 
   const StreamId streamId = streamState->id;
-  if (getSocketObserverContainer() &&
-      getSocketObserverContainer()
-          ->hasObserversForEvent<
-              SocketObserverInterface::Events::streamEvents>()) {
+  SOCKET_OBSERVER_IF(
+      getSocketObserverContainer(),
+      SocketObserverInterface::Events::streamEvents) {
     getSocketObserverContainer()
         ->invokeInterfaceMethod<SocketObserverInterface::Events::streamEvents>(
             [event = SocketObserverInterface::StreamOpenEvent(
@@ -2200,19 +2203,19 @@ void QuicTransportBaseLite::lossTimeoutExpired() noexcept {
 
     pacedWriteDataToSocket();
   } catch (const QuicTransportException& ex) {
-    VLOG(4) << __func__ << " " << ex.what() << " " << *this;
+    MVVLOG(4) << __func__ << " " << ex.what() << " " << *this;
     exceptionCloseWhat_ = ex.what();
     closeImpl(QuicError(
         QuicErrorCode(ex.errorCode()),
         std::string("lossTimeoutExpired() error")));
   } catch (const QuicInternalException& ex) {
-    VLOG(4) << __func__ << " " << ex.what() << " " << *this;
+    MVVLOG(4) << __func__ << " " << ex.what() << " " << *this;
     exceptionCloseWhat_ = ex.what();
     closeImpl(QuicError(
         QuicErrorCode(ex.errorCode()),
         std::string("lossTimeoutExpired() error")));
   } catch (const std::exception& ex) {
-    VLOG(4) << __func__ << "  " << ex.what() << " " << *this;
+    MVVLOG(4) << __func__ << "  " << ex.what() << " " << *this;
     exceptionCloseWhat_ = ex.what();
     closeImpl(QuicError(
         QuicErrorCode(TransportErrorCode::INTERNAL_ERROR),
@@ -2221,7 +2224,7 @@ void QuicTransportBaseLite::lossTimeoutExpired() noexcept {
 }
 
 void QuicTransportBaseLite::idleTimeoutExpired(bool drain) noexcept {
-  VLOG(4) << __func__ << " " << *this;
+  MVVLOG(4) << __func__ << " " << *this;
   [[maybe_unused]] auto self = sharedGuard();
   // idle timeout is expired, just close the connection and drain or
   // send connection close immediately depending on 'drain'
@@ -2254,7 +2257,7 @@ void QuicTransportBaseLite::keepaliveTimeoutExpired() noexcept {
 
 void QuicTransportBaseLite::ackTimeoutExpired() noexcept {
   CHECK_NE(closeState_, CloseState::CLOSED);
-  VLOG(10) << __func__ << " " << *this;
+  MVVLOG(10) << __func__ << " " << *this;
   [[maybe_unused]] auto self = sharedGuard();
   updateAckStateOnAckTimeout(*conn_);
   pacedWriteDataToSocket();
@@ -2364,8 +2367,10 @@ void QuicTransportBaseLite::cancelAllAppCallbacks(
     readCallbacks_.erase(it);
   }
   // TODO: what if a call to readError installs a new read callback?
-  LOG_IF(ERROR, !readCallbacks_.empty())
-      << readCallbacks_.size() << " read callbacks remaining to be cleared";
+  if (!readCallbacks_.empty()) {
+    MVLOG_ERROR << readCallbacks_.size()
+                << " read callbacks remaining to be cleared";
+  }
 
   if (connWriteCallback_) {
     auto connWriteCallback = connWriteCallback_;
@@ -2564,8 +2569,8 @@ void QuicTransportBaseLite::invokeReadDataAndCallbacks(
       // if there is an error on the stream - it's not readable anymore, so
       // we cannot peek into it as well.
       self->conn_->streamManager->peekableStreams().erase(streamId);
-      VLOG(10) << "invoking read error callbacks on stream=" << streamId << " "
-               << *this;
+      MVVLOG(10) << "invoking read error callbacks on stream=" << streamId
+                 << " " << *this;
       if (!stream->groupId) {
         readCb->readError(streamId, QuicError(*stream->streamReadError));
       } else {
@@ -2574,8 +2579,8 @@ void QuicTransportBaseLite::invokeReadDataAndCallbacks(
       }
     } else if (
         readCb && callback->second.resumed && stream->hasReadableData()) {
-      VLOG(10) << "invoking read callbacks on stream=" << streamId << " "
-               << *this;
+      MVVLOG(10) << "invoking read callbacks on stream=" << streamId << " "
+                 << *this;
       if (!stream->groupId) {
         readCb->readAvailable(streamId);
       } else {
@@ -2610,8 +2615,8 @@ QuicTransportBaseLite::setReadCallbackInternal(
     StreamId id,
     ReadCallback* cb,
     Optional<ApplicationErrorCode> err) noexcept {
-  VLOG(4) << "Setting setReadCallback for stream=" << id << " cb=" << cb << " "
-          << *this;
+  MVVLOG(4) << "Setting setReadCallback for stream=" << id << " cb=" << cb
+            << " " << *this;
   auto readCbIt = readCallbacks_.find(id);
   if (readCbIt == readCallbacks_.end()) {
     // Don't allow initial setting of a nullptr callback.
@@ -2645,10 +2650,9 @@ QuicTransportBaseLite::getAdditionalCmsgsForAsyncUDPSocket() {
 }
 
 void QuicTransportBaseLite::notifyStartWritingFromAppRateLimited() {
-  if (getSocketObserverContainer() &&
-      getSocketObserverContainer()
-          ->hasObserversForEvent<
-              SocketObserverInterface::Events::appRateLimitedEvents>()) {
+  SOCKET_OBSERVER_IF(
+      getSocketObserverContainer(),
+      SocketObserverInterface::Events::appRateLimitedEvents) {
     getSocketObserverContainer()
         ->invokeInterfaceMethod<
             SocketObserverInterface::Events::appRateLimitedEvents>(
@@ -2678,10 +2682,9 @@ void QuicTransportBaseLite::notifyPacketsWritten(
     const uint64_t numPacketsWritten,
     const uint64_t numAckElicitingPacketsWritten,
     const uint64_t numBytesWritten) {
-  if (getSocketObserverContainer() &&
-      getSocketObserverContainer()
-          ->hasObserversForEvent<
-              SocketObserverInterface::Events::packetsWrittenEvents>()) {
+  SOCKET_OBSERVER_IF(
+      getSocketObserverContainer(),
+      SocketObserverInterface::Events::packetsWrittenEvents) {
     getSocketObserverContainer()
         ->invokeInterfaceMethod<
             SocketObserverInterface::Events::packetsWrittenEvents>(
@@ -2712,10 +2715,9 @@ void QuicTransportBaseLite::notifyPacketsWritten(
 }
 
 void QuicTransportBaseLite::notifyAppRateLimited() {
-  if (getSocketObserverContainer() &&
-      getSocketObserverContainer()
-          ->hasObserversForEvent<
-              SocketObserverInterface::Events::appRateLimitedEvents>()) {
+  SOCKET_OBSERVER_IF(
+      getSocketObserverContainer(),
+      SocketObserverInterface::Events::appRateLimitedEvents) {
     getSocketObserverContainer()
         ->invokeInterfaceMethod<
             SocketObserverInterface::Events::appRateLimitedEvents>(
@@ -2743,10 +2745,10 @@ void QuicTransportBaseLite::notifyAppRateLimited() {
 
 void QuicTransportBaseLite::onTransportKnobs(BufPtr knobBlob) {
   // Not yet implemented,
-  VLOG(4) << "Received transport knobs: "
-          << std::string(
-                 reinterpret_cast<const char*>(knobBlob->data()),
-                 knobBlob->length());
+  MVVLOG(4) << "Received transport knobs: "
+            << std::string(
+                   reinterpret_cast<const char*>(knobBlob->data()),
+                   knobBlob->length());
 }
 
 void QuicTransportBaseLite::processCallbacksAfterWriteData() {
@@ -2942,11 +2944,9 @@ void QuicTransportBaseLite::setCongestionControl(CongestionControlType type) {
     conn_->congestionController =
         conn_->congestionControllerFactory->makeCongestionController(
             *conn_, type);
-    if (conn_->qLogger) {
-      std::stringstream s;
-      s << "CCA set to " << congestionControlTypeToString(type);
-      conn_->qLogger->addTransportStateUpdate(s.str());
-    }
+    [[maybe_unused]] std::stringstream s;
+    s << "CCA set to " << congestionControlTypeToString(type);
+    QLOG(*conn_, addTransportStateUpdate, s.str());
   }
 }
 
@@ -2978,7 +2978,7 @@ quic::Expected<void, LocalErrorCode> QuicTransportBaseLite::setKnob(
     sendSimpleFrame(*conn_, KnobFrame(knobSpace, knobId, std::move(knobBlob)));
     return {};
   }
-  LOG(ERROR) << "Cannot set knob. Peer does not support the knob frame";
+  MVLOG_ERROR << "Cannot set knob. Peer does not support the knob frame";
   return quic::make_unexpected(LocalErrorCode::KNOB_FRAME_UNSUPPORTED);
 }
 
@@ -2993,7 +2993,7 @@ void QuicTransportBaseLite::validateCongestionAndPacing(
        type == CongestionControlType::BBRTesting ||
        type == CongestionControlType::BBR2) &&
       !conn_->transportSettings.pacingEnabled) {
-    LOG(ERROR) << "Unpaced BBR isn't supported";
+    MVLOG_ERROR << "Unpaced BBR isn't supported";
     type = CongestionControlType::Cubic;
   }
 
@@ -3073,14 +3073,14 @@ quic::Expected<void, QuicError> QuicTransportBaseLite::validateECNState() {
         conn_->ackStates.appDataAckState.ecnECT1CountEchoed == 0) {
       if (conn_->ecnState != ECNState::ValidatedECN) {
         conn_->ecnState = ECNState::ValidatedECN;
-        VLOG(4) << fmt::format(
+        MVVLOG(4) << fmt::format(
             "ECN validation successful. Marked {} of {} expected",
             markedPacketCount,
             minExpectedMarkedPacketsCount);
       }
     } else {
       conn_->ecnState = ECNState::FailedValidation;
-      VLOG(4) << fmt::format(
+      MVVLOG(4) << fmt::format(
           "ECN validation failed. Marked {} of {} expected",
           markedPacketCount,
           minExpectedMarkedPacketsCount);
@@ -3100,14 +3100,14 @@ quic::Expected<void, QuicError> QuicTransportBaseLite::validateECNState() {
           addPacketProcessor(conn_->ecnL4sTracker);
         }
         conn_->ecnState = ECNState::ValidatedL4S;
-        VLOG(4) << fmt::format(
+        MVVLOG(4) << fmt::format(
             "L4S validation successful. Marked {} of {} expected",
             markedPacketCount,
             minExpectedMarkedPacketsCount);
       }
     } else {
       conn_->ecnState = ECNState::FailedValidation;
-      VLOG(4) << fmt::format(
+      MVVLOG(4) << fmt::format(
           "L4S validation failed. Marked {} of {} expected",
           markedPacketCount,
           minExpectedMarkedPacketsCount);
@@ -3122,7 +3122,7 @@ quic::Expected<void, QuicError> QuicTransportBaseLite::validateECNState() {
       return result;
     }
 
-    VLOG(4) << "ECN validation failed. Disabling ECN";
+    MVVLOG(4) << "ECN validation failed. Disabling ECN";
     if (conn_->ecnL4sTracker) {
       conn_->packetProcessors.erase(
           std::remove(
@@ -3154,14 +3154,14 @@ void QuicTransportBaseLite::scheduleAckTimeout() {
               evb_->getTimerTickInterval()),
           timeMin(conn_->ackStates.maxAckDelay, factoredRtt));
       auto timeoutMs = folly::chrono::ceil<std::chrono::milliseconds>(timeout);
-      VLOG(10) << __func__ << " timeout=" << timeoutMs.count() << "ms"
-               << " factoredRtt=" << factoredRtt.count() << "us" << " "
-               << *this;
+      MVVLOG(10) << __func__ << " timeout=" << timeoutMs.count() << "ms"
+                 << " factoredRtt=" << factoredRtt.count() << "us" << " "
+                 << *this;
       scheduleTimeout(&ackTimeout_, timeoutMs);
     }
   } else {
     if (isTimeoutScheduled(&ackTimeout_)) {
-      VLOG(10) << __func__ << " cancel timeout " << *this;
+      MVVLOG(10) << __func__ << " cancel timeout " << *this;
       cancelTimeout(&ackTimeout_);
     }
   }
@@ -3173,7 +3173,7 @@ void QuicTransportBaseLite::schedulePathValidationTimeout() {
   }
   if (!conn_->pendingEvents.schedulePathValidationTimeout) {
     if (isTimeoutScheduled(&pathValidationTimeout_)) {
-      VLOG(10) << __func__ << " cancel timeout " << *this;
+      MVVLOG(10) << __func__ << " cancel timeout " << *this;
       // This means path validation succeeded, and we should have updated to
       // correct state
       cancelTimeout(&pathValidationTimeout_);
@@ -3185,8 +3185,8 @@ void QuicTransportBaseLite::schedulePathValidationTimeout() {
           ? std::chrono::ceil<std::chrono::milliseconds>(
                 *nextTimeout - Clock::now())
           : 0ms;
-      VLOG(10) << __func__ << " timeout=" << timeoutMs.count() << "ms "
-               << *this;
+      MVVLOG(10) << __func__ << " timeout=" << timeoutMs.count() << "ms "
+                 << *this;
       scheduleTimeout(&pathValidationTimeout_, timeoutMs);
     }
   }
@@ -3316,10 +3316,9 @@ void QuicTransportBaseLite::handleNewGroupedStreams(
 }
 
 void QuicTransportBaseLite::logStreamOpenEvent(StreamId streamId) {
-  if (getSocketObserverContainer() &&
-      getSocketObserverContainer()
-          ->hasObserversForEvent<
-              SocketObserverInterface::Events::streamEvents>()) {
+  SOCKET_OBSERVER_IF(
+      getSocketObserverContainer(),
+      SocketObserverInterface::Events::streamEvents) {
     getSocketObserverContainer()
         ->invokeInterfaceMethod<SocketObserverInterface::Events::streamEvents>(
             [event = SocketObserverInterface::StreamOpenEvent(

@@ -8,6 +8,8 @@
 #include <quic/congestion_control/EcnL4sTracker.h>
 
 #include <quic/QuicException.h>
+#include <quic/logging/QLoggerMacros.h>
+#include <quic/observer/SocketObserverMacros.h>
 
 namespace {
 using namespace std::chrono_literals;
@@ -56,16 +58,13 @@ void EcnL4sTracker::onPacketAck(const AckEvent* ackEvent) {
 
       if (newCEEchoed > 0) {
         // Log in qlogger
-        if (conn_.qLogger) {
-          conn_.qLogger->addL4sWeightUpdate(
-              l4sWeight_, newECT1Echoed, newCEEchoed);
-        }
+        QLOG(conn_, addL4sWeightUpdate, l4sWeight_, newECT1Echoed, newCEEchoed);
 
         // Inform observers
         auto observerContainer = conn_.getSocketObserverContainer();
-        if (observerContainer &&
-            observerContainer->hasObserversForEvent<
-                SocketObserverInterface::Events::l4sWeightUpdatedEvents>()) {
+        SOCKET_OBSERVER_IF(
+            observerContainer,
+            SocketObserverInterface::Events::l4sWeightUpdatedEvents) {
           observerContainer->invokeInterfaceMethod<
               SocketObserverInterface::Events::l4sWeightUpdatedEvents>(
               [event = quic::SocketObserverInterface::L4sWeightUpdateEvent(

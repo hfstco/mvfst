@@ -5,7 +5,10 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include <quic/common/MvfstLogging.h>
+#include <quic/logging/QLoggerMacros.h>
 #include <quic/loss/QuicLossFunctions.h>
+#include <quic/observer/SocketObserverMacros.h>
 #include <quic/state/QuicStreamFunctions.h>
 
 namespace quic {
@@ -44,7 +47,7 @@ bool isPersistentCongestion(
 }
 
 quic::Expected<void, QuicError> onPTOAlarm(QuicConnectionStateBase& conn) {
-  VLOG(10) << __func__ << " " << conn;
+  MVVLOG(10) << __func__ << " " << conn;
   if (conn.transportSettings.isPriming) {
     // No retransmits in Priming mode
     return {};
@@ -52,13 +55,13 @@ quic::Expected<void, QuicError> onPTOAlarm(QuicConnectionStateBase& conn) {
   QUIC_STATS(conn.statsCallback, onPTO);
   conn.lossState.ptoCount++;
   conn.lossState.totalPTOCount++;
-  if (conn.qLogger) {
-    conn.qLogger->addLossAlarm(
-        conn.lossState.largestSent.value_or(0),
-        conn.lossState.ptoCount,
-        conn.outstandings.numOutstanding(),
-        kPtoAlarm);
-  }
+  QLOG(
+      conn,
+      addLossAlarm,
+      conn.lossState.largestSent.value_or(0),
+      conn.lossState.ptoCount,
+      conn.outstandings.numOutstanding(),
+      kPtoAlarm);
   if (conn.lossState.ptoCount >= conn.transportSettings.maxNumPTOs) {
     return quic::make_unexpected(QuicError(
         QuicErrorCode(LocalErrorCode::CONNECTION_ABANDONED),
@@ -72,8 +75,9 @@ quic::Expected<void, QuicError> onPTOAlarm(QuicConnectionStateBase& conn) {
     conn.lossState.attemptedEarlyRetransmit0Rtt = true;
     auto markResult = markZeroRttPacketsLost(conn, markPacketLoss);
     if (!markResult.has_value()) {
-      VLOG(3) << "Closing connection due to error marking 0-RTT packets lost: "
-              << markResult.error().message;
+      MVVLOG(3)
+          << "Closing connection due to error marking 0-RTT packets lost: "
+          << markResult.error().message;
       return markResult;
     }
   }
@@ -131,9 +135,9 @@ quic::Expected<void, QuicError> markPacketLoss(
         // an update to avoid stalling the peer.
         streamResult = conn.streamManager->getStream(frame.streamId);
         if (!streamResult.has_value()) {
-          VLOG(4) << "Failed to get stream " << frame.streamId
-                  << " in markPacketLoss (MaxStreamDataFrame): "
-                  << streamResult.error().message;
+          MVVLOG(4) << "Failed to get stream " << frame.streamId
+                    << " in markPacketLoss (MaxStreamDataFrame): "
+                    << streamResult.error().message;
           return quic::make_unexpected(streamResult.error());
         }
         auto* stream = streamResult.value();
@@ -165,9 +169,9 @@ quic::Expected<void, QuicError> markPacketLoss(
         }
         streamResult = conn.streamManager->getStream(frame.streamId);
         if (!streamResult.has_value()) {
-          VLOG(4) << "Failed to get stream " << frame.streamId
-                  << " in markPacketLoss (WriteStreamFrame): "
-                  << streamResult.error().message;
+          MVVLOG(4) << "Failed to get stream " << frame.streamId
+                    << " in markPacketLoss (WriteStreamFrame): "
+                    << streamResult.error().message;
           return quic::make_unexpected(streamResult.error());
         }
         auto* stream = streamResult.value();
@@ -216,9 +220,9 @@ quic::Expected<void, QuicError> markPacketLoss(
         }
         streamResult = conn.streamManager->getStream(frame.streamId);
         if (!streamResult.has_value()) {
-          VLOG(4) << "Failed to get stream " << frame.streamId
-                  << " in markPacketLoss (RstStreamFrame): "
-                  << streamResult.error().message;
+          MVVLOG(4) << "Failed to get stream " << frame.streamId
+                    << " in markPacketLoss (RstStreamFrame): "
+                    << streamResult.error().message;
           return quic::make_unexpected(streamResult.error());
         }
         auto* stream = streamResult.value();
@@ -235,9 +239,9 @@ quic::Expected<void, QuicError> markPacketLoss(
         }
         streamResult = conn.streamManager->getStream(frame.streamId);
         if (!streamResult.has_value()) {
-          VLOG(4) << "Failed to get stream " << frame.streamId
-                  << " in markPacketLoss (StreamDataBlockedFrame): "
-                  << streamResult.error().message;
+          MVVLOG(4) << "Failed to get stream " << frame.streamId
+                    << " in markPacketLoss (StreamDataBlockedFrame): "
+                    << streamResult.error().message;
           return quic::make_unexpected(streamResult.error());
         }
         auto* stream = streamResult.value();
@@ -355,7 +359,7 @@ quic::Expected<bool, QuicError> processOutstandingsForLoss(
       --conn.outstandings.packetCount[currentPacketNumberSpace];
     }
 
-    VLOG(10) << __func__ << " lost packetNum=" << currentPacketNum;
+    MVVLOG(10) << __func__ << " lost packetNum=" << currentPacketNum;
     // Rather than erasing here, instead mark the packet as lost so we can
     // determine if this was spurious later.
     conn.lossState.totalPacketsMarkedLost++;
@@ -399,17 +403,17 @@ detectLossPackets(
   std::chrono::microseconds delayUntilLost = rttSample *
       conn.transportSettings.timeReorderingThreshDividend /
       conn.transportSettings.timeReorderingThreshDivisor;
-  VLOG(10) << __func__ << " outstanding=" << conn.outstandings.numOutstanding()
-           << " largestAcked=" << ackState.largestAckedByPeer.value_or(0)
-           << " delayUntilLost=" << delayUntilLost.count() << "us" << " "
-           << conn;
+  MVVLOG(10) << __func__
+             << " outstanding=" << conn.outstandings.numOutstanding()
+             << " largestAcked=" << ackState.largestAckedByPeer.value_or(0)
+             << " delayUntilLost=" << delayUntilLost.count() << "us" << " "
+             << conn;
   CongestionController::LossEvent lossEvent(lossTime);
   Optional<SocketObserverInterface::LossEvent> observerLossEvent;
   {
     const auto socketObserverContainer = conn.getSocketObserverContainer();
-    if (socketObserverContainer &&
-        socketObserverContainer->hasObserversForEvent<
-            SocketObserverInterface::Events::lossEvents>()) {
+    SOCKET_OBSERVER_IF(
+        socketObserverContainer, SocketObserverInterface::Events::lossEvents) {
       observerLossEvent.emplace(lossTime);
     }
   }
@@ -437,15 +441,16 @@ detectLossPackets(
 
   {
     const auto socketObserverContainer = conn.getSocketObserverContainer();
-    if (observerLossEvent && observerLossEvent->hasPackets() &&
-        socketObserverContainer &&
-        socketObserverContainer->hasObserversForEvent<
-            SocketObserverInterface::Events::lossEvents>()) {
-      socketObserverContainer
-          ->invokeInterfaceMethod<SocketObserverInterface::Events::lossEvents>(
-              [&](auto observer, auto observed) {
-                observer->packetLossDetected(observed, *observerLossEvent);
-              });
+    if (observerLossEvent && observerLossEvent->hasPackets()) {
+      SOCKET_OBSERVER_IF(
+          socketObserverContainer,
+          SocketObserverInterface::Events::lossEvents) {
+        socketObserverContainer->invokeInterfaceMethod<
+            SocketObserverInterface::Events::lossEvents>(
+            [&](auto observer, auto observed) {
+              observer->packetLossDetected(observed, *observerLossEvent);
+            });
+      }
     }
   }
 
@@ -465,20 +470,20 @@ detectLossPackets(
   if (shouldSetTimer && earliest != conn.outstandings.packets.end()) {
     // We are eligible to set a loss timer and there are a few packets which
     // are unacked, so we can set the early retransmit timer for them.
-    VLOG(10) << __func__ << " early retransmit timer outstanding="
-             << conn.outstandings.packets.empty() << " delayUntilLost"
-             << delayUntilLost.count() << "us" << " " << conn;
+    MVVLOG(10) << __func__ << " early retransmit timer outstanding="
+               << conn.outstandings.packets.empty() << " delayUntilLost"
+               << delayUntilLost.count() << "us" << " " << conn;
     getLossTime(conn, pnSpace) = delayUntilLost + earliest->metadata.time;
   }
 
   if (lossEvent.largestLostPacketNum.has_value()) {
     DCHECK(lossEvent.largestLostSentTime && lossEvent.smallestLostSentTime);
-    if (conn.qLogger) {
-      conn.qLogger->addPacketsLost(
-          lossEvent.largestLostPacketNum.value(),
-          lossEvent.lostBytes,
-          lossEvent.lostPackets);
-    }
+    QLOG(
+        conn,
+        addPacketsLost,
+        lossEvent.largestLostPacketNum.value(),
+        lossEvent.lostBytes,
+        lossEvent.lostPackets);
 
     conn.lossState.rtxCount += lossEvent.lostPackets;
     if (conn.congestionController) {
@@ -511,16 +516,16 @@ handleAckForLoss(
 
   conn.pendingEvents.setLossDetectionAlarm =
       conn.outstandings.numOutstanding() > 0;
-  VLOG(10) << __func__ << " largestAckedInPacket="
-           << ack.largestNewlyAckedPacket.value_or(0)
-           << " setLossDetectionAlarm="
-           << conn.pendingEvents.setLossDetectionAlarm
-           << " outstanding=" << conn.outstandings.numOutstanding()
-           << " initialPackets="
-           << conn.outstandings.packetCount[PacketNumberSpace::Initial]
-           << " handshakePackets="
-           << conn.outstandings.packetCount[PacketNumberSpace::Handshake] << " "
-           << conn;
+  MVVLOG(10) << __func__ << " largestAckedInPacket="
+             << ack.largestNewlyAckedPacket.value_or(0)
+             << " setLossDetectionAlarm="
+             << conn.pendingEvents.setLossDetectionAlarm
+             << " outstanding=" << conn.outstandings.numOutstanding()
+             << " initialPackets="
+             << conn.outstandings.packetCount[PacketNumberSpace::Initial]
+             << " handshakePackets="
+             << conn.outstandings.packetCount[PacketNumberSpace::Handshake]
+             << " " << conn;
 
   return lossEventResult.value();
 }
