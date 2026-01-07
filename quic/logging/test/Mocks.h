@@ -34,9 +34,9 @@ class MockQLogger : public QLogger {
   MOCK_METHOD(
      void,
      addCarefulResumePhaseUpdated,
-     (std::string oldPhase, std::string newPhase, uint32_t pipesize, uint32_t first_unvalidated_packet,
-      uint32_t last_unvalidated_packet, uint32_t congestion_window, uint32_t ssthresh,
-      uint32_t saved_congestion_window, float32_t saved_rtt, std::string trigger));
+     (std::string oldPhase, std::string newPhase, uint64_t pipesize, uint64_t first_unvalidated_packet,
+      uint64_t last_unvalidated_packet, uint64_t congestion_window, uint64_t ssthresh,
+      uint64_t saved_congestion_window, uint64_t saved_rtt, std::string trigger));
   MOCK_METHOD(
       void,
       addPacingMetricUpdate,
