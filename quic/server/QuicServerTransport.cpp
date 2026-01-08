@@ -66,7 +66,7 @@ QuicServerTransport::QuicServerTransport(
           .setCryptoFactory(std::move(cryptoFactory))
           .build());
   auto addrResult = socket_->address();
-  CHECK(addrResult.has_value());
+  MVCHECK(addrResult.has_value());
   tempConn->serverAddr = addrResult.value();
   serverConn_ = tempConn.get();
   conn_.reset(tempConn.release());
@@ -141,7 +141,7 @@ void QuicServerTransport::setTransportStatsCallback(
 
 void QuicServerTransport::setConnectionIdAlgo(
     ConnectionIdAlgo* connIdAlgo) noexcept {
-  CHECK(connIdAlgo);
+  MVCHECK(connIdAlgo);
   if (serverConn_) {
     serverConn_->connIdAlgo = connIdAlgo;
   }
@@ -149,7 +149,7 @@ void QuicServerTransport::setConnectionIdAlgo(
 
 void QuicServerTransport::setServerConnectionIdRejector(
     ServerConnectionIdRejector* connIdRejector) noexcept {
-  CHECK(connIdRejector);
+  MVCHECK(connIdRejector);
   if (serverConn_) {
     serverConn_->connIdRejector = connIdRejector;
   }
@@ -252,7 +252,7 @@ quic::Expected<void, QuicError> QuicServerTransport::writeData() {
     }
     updateLargestReceivedUdpPacketsAtLastCloseSent(*conn_);
     if (conn_->oneRttWriteCipher) {
-      CHECK(conn_->oneRttWriteHeaderCipher);
+      MVCHECK(conn_->oneRttWriteHeaderCipher);
       writeShortClose(
           *socket_,
           *conn_,
@@ -262,7 +262,7 @@ quic::Expected<void, QuicError> QuicServerTransport::writeData() {
           *conn_->oneRttWriteHeaderCipher);
     }
     if (conn_->handshakeWriteCipher) {
-      CHECK(conn_->handshakeWriteHeaderCipher);
+      MVCHECK(conn_->handshakeWriteHeaderCipher);
       writeLongClose(
           *socket_,
           *conn_,
@@ -275,7 +275,7 @@ quic::Expected<void, QuicError> QuicServerTransport::writeData() {
           version);
     }
     if (conn_->initialWriteCipher) {
-      CHECK(conn_->initialHeaderCipher);
+      MVCHECK(conn_->initialHeaderCipher);
       writeLongClose(
           *socket_,
           *conn_,
@@ -322,7 +322,7 @@ quic::Expected<void, QuicError> QuicServerTransport::writeData() {
     }
   }
   if (conn_->oneRttWriteCipher) {
-    CHECK(conn_->oneRttWriteHeaderCipher);
+    MVCHECK(conn_->oneRttWriteHeaderCipher);
     auto writeLoopBeginTime = Clock::now();
     auto nonDsrPath =
         [&](auto limit) -> quic::Expected<WriteQuicDataResult, QuicError> {
@@ -399,7 +399,7 @@ void QuicServerTransport::unbindConnection() {
   if (routingCb_) {
     auto routingCb = routingCb_;
     routingCb_ = nullptr;
-    CHECK(conn_->clientChosenDestConnectionId);
+    MVCHECK(conn_->clientChosenDestConnectionId);
     if (conn_->serverConnectionId) {
       auto connectionIds =
           conn_->selfConnectionIds; // We pass a copy as this transport might be
@@ -665,8 +665,8 @@ QuicServerTransport::maybeWriteNewSessionTicket() {
 
     // Keep connection state in sync with what was written to the session ticket
     serverConn_->tokenSourceAddresses = appToken.sourceAddresses;
-    if (conn_->earlyDataAppParamsGetter) {
-      appToken.appParams = conn_->earlyDataAppParamsGetter();
+    if (conn_->earlyDataAppParamsHandler) {
+      appToken.appParams = conn_->earlyDataAppParamsHandler->get();
     }
     auto result =
         serverConn_->serverHandshakeLayer->writeNewSessionTicket(appToken);
@@ -719,7 +719,7 @@ void QuicServerTransport::maybeIssueConnectionIds() {
   if (!conn_->transportSettings.disableMigration &&
       (conn_->selfConnectionIds.size() < maximumIdsToIssue) &&
       serverConn_->serverHandshakeLayer->isHandshakeDone()) {
-    CHECK(conn_->transportSettings.statelessResetTokenSecret.has_value());
+    MVCHECK(conn_->transportSettings.statelessResetTokenSecret.has_value());
 
     // Make sure size of selfConnectionIds is not larger than maximumIdsToIssue
     for (size_t i = conn_->selfConnectionIds.size(); i < maximumIdsToIssue;
@@ -729,7 +729,7 @@ void QuicServerTransport::maybeIssueConnectionIds() {
         return;
       }
 
-      CHECK(routingCb_);
+      MVCHECK(routingCb_);
       routingCb_->onConnectionIdAvailable(
           shared_from_this(), newConnIdData->connId);
 
@@ -777,7 +777,7 @@ void QuicServerTransport::registerTransportKnobParamHandler(
 }
 
 void QuicServerTransport::setBufAccessor(BufAccessor* bufAccessor) {
-  CHECK(bufAccessor);
+  MVCHECK(bufAccessor);
   conn_->bufAccessor = bufAccessor;
 }
 
@@ -1217,20 +1217,6 @@ void QuicServerTransport::registerAllTransportKnobParamHandlers() {
             autotuneReceiveStreamFlowControl;
         MVVLOG(3) << "AUTOTUNE_RECV_STREAM_FLOW_CONTROL KnobParam received: "
                   << autotuneReceiveStreamFlowControl;
-        return {};
-      });
-  registerTransportKnobParamHandler(
-      static_cast<uint64_t>(
-          TransportKnobParamId::INFLIGHT_REORDERING_THRESHOLD),
-      [](QuicServerTransport& serverTransport,
-         TransportKnobParam::Val value) -> quic::Expected<void, QuicError> {
-        bool inflightReorderingThreshold =
-            static_cast<bool>(std::get<uint64_t>(value));
-        auto server_conn = serverTransport.serverConn_;
-        server_conn->transportSettings.useInflightReorderingThreshold =
-            inflightReorderingThreshold;
-        MVVLOG(3) << "INFLIGHT_REORDERING_THRESHOLD KnobParam received: "
-                  << inflightReorderingThreshold;
         return {};
       });
   registerTransportKnobParamHandler(

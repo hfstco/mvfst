@@ -32,6 +32,15 @@ using namespace testing;
 
 namespace quic::test {
 
+namespace {
+void connPacketDestroyFn(void* ctx, const OutstandingPacketWrapper& pkt) {
+  auto* conn = static_cast<QuicConnectionStateBase*>(ctx);
+  for (auto& packetProcessor : conn->packetProcessors) {
+    packetProcessor->onPacketDestroyed(pkt);
+  }
+}
+} // namespace
+
 struct AckHandlersTestParam {
   PacketNumberSpace pnSpace;
   FrameType frameType;
@@ -317,368 +326,6 @@ TEST_P(AckHandlersTest, TestAckWithECN) {
   }
 }
 
-TEST_P(AckHandlersTest, TestSpuriousLossFullRemoval) {
-  QuicServerConnectionState conn(
-      FizzServerQuicHandshakeContext::Builder().build());
-  auto mockCongestionController = std::make_unique<MockCongestionController>();
-  conn.congestionController = std::move(mockCongestionController);
-  ASSERT_FALSE(
-      conn.streamManager->setMaxLocalBidirectionalStreams(100).hasError());
-  conn.transportSettings.removeFromLossBufferOnSpurious = true;
-
-  auto noopLossVisitor =
-      [](auto&, auto, auto&, bool) -> quic::Expected<void, quic::QuicError> {
-    return {};
-  };
-
-  StreamId streamId = 1;
-  auto streamState = conn.streamManager->createStream(streamId).value();
-  ChainedByteRangeHead data;
-  auto iob = folly::IOBuf::createChain(200, 200);
-  iob->append(200);
-  data.append(iob);
-  ASSERT_EQ(data.chainLength(), 200);
-  auto streamBuffer =
-      std::make_unique<WriteStreamBuffer>(std::move(data), 0, false);
-  streamState->insertIntoLossBuffer(std::move(streamBuffer));
-
-  TimePoint startTime = Clock::now();
-  auto regularPacket = createNewPacket(0, GetParam().pnSpace);
-  WriteStreamFrame frame(streamId, 0, 200, false);
-  regularPacket.frames.emplace_back(frame);
-  conn.outstandings.packetCount[regularPacket.header.getPacketNumberSpace()]++;
-  OutstandingPacketWrapper sentPacket(
-      std::move(regularPacket),
-      startTime,
-      0,
-      1,
-      0,
-      0,
-      1,
-      quic::LossState(),
-      0,
-      OutstandingPacketMetadata::DetailsPerStream());
-  conn.outstandings.packets.emplace_back(std::move(sentPacket));
-
-  // setting a very low reordering threshold to force loss by reorder
-  conn.lossState.reorderingThreshold = 1;
-  // setting time out parameters higher than the time at which
-  // detectLossPackets is called to make sure there are no losses by timeout
-  conn.lossState.srtt = 400ms;
-  conn.lossState.lrtt = 350ms;
-  conn.transportSettings.timeReorderingThreshDividend = 1.0;
-  conn.transportSettings.timeReorderingThreshDivisor = 1.0;
-  TimePoint checkTime = startTime + 20ms;
-
-  // Update the ackState
-  // Both largestAckedByPeer (packet num) and
-  // exercise loss by reorder path
-  auto& ackState = getAckState(conn, GetParam().pnSpace);
-  ackState.largestAckedByPeer = 4;
-  ASSERT_FALSE(
-      detectLossPackets(
-          conn, ackState, noopLossVisitor, checkTime, GetParam().pnSpace)
-          .hasError());
-
-  // Here we receive the spurious loss packets in a late ack
-  ReadAckFrame ackFrame;
-  ackFrame.largestAcked = 2;
-  ackFrame.ackBlocks.emplace_back(0, 2);
-
-  auto ackResult = processAckFrame(
-      conn,
-      GetParam().pnSpace,
-      ackFrame,
-      [](auto&) -> quic::Expected<void, quic::QuicError> { return {}; },
-      [](const auto&, const auto&) -> quic::Expected<void, quic::QuicError> {
-        return {};
-      },
-      [](auto&, auto, auto&, bool) -> quic::Expected<void, quic::QuicError> {
-        return {};
-      },
-      startTime + 30ms);
-  ASSERT_FALSE(ackResult.hasError());
-
-  EXPECT_TRUE(streamState->lossBuffer.empty());
-  ASSERT_FALSE(streamState->ackedIntervals.empty());
-  EXPECT_EQ(streamState->ackedIntervals.front().start, 0);
-  EXPECT_EQ(streamState->ackedIntervals.front().end, 199);
-}
-
-TEST_P(AckHandlersTest, TestSpuriousLossSplitMiddleRemoval) {
-  QuicServerConnectionState conn(
-      FizzServerQuicHandshakeContext::Builder().build());
-  auto mockCongestionController = std::make_unique<MockCongestionController>();
-  conn.congestionController = std::move(mockCongestionController);
-  ASSERT_FALSE(
-      conn.streamManager->setMaxLocalBidirectionalStreams(100).hasError());
-  conn.transportSettings.removeFromLossBufferOnSpurious = true;
-
-  auto noopLossVisitor =
-      [](auto&, auto, auto&, bool) -> quic::Expected<void, quic::QuicError> {
-    return {};
-  };
-
-  StreamId streamId = 1;
-  auto streamState = conn.streamManager->createStream(streamId).value();
-  ChainedByteRangeHead data;
-  auto iob = folly::IOBuf::createChain(200, 200);
-  iob->append(200);
-  data.append(iob);
-  ASSERT_EQ(data.chainLength(), 200);
-  auto streamBuffer =
-      std::make_unique<WriteStreamBuffer>(std::move(data), 0, false);
-  streamState->insertIntoLossBuffer(std::move(streamBuffer));
-
-  TimePoint startTime = Clock::now();
-  auto regularPacket = createNewPacket(0, GetParam().pnSpace);
-  WriteStreamFrame frame(streamId, 50, 50, false);
-  regularPacket.frames.emplace_back(frame);
-  conn.outstandings.packetCount[regularPacket.header.getPacketNumberSpace()]++;
-  OutstandingPacketWrapper sentPacket(
-      std::move(regularPacket),
-      startTime,
-      0,
-      1,
-      0,
-      0,
-      1,
-      quic::LossState(),
-      0,
-      OutstandingPacketMetadata::DetailsPerStream());
-  conn.outstandings.packets.emplace_back(std::move(sentPacket));
-
-  // setting a very low reordering threshold to force loss by reorder
-  conn.lossState.reorderingThreshold = 1;
-  // setting time out parameters higher than the time at which
-  // detectLossPackets is called to make sure there are no losses by timeout
-  conn.lossState.srtt = 400ms;
-  conn.lossState.lrtt = 350ms;
-  conn.transportSettings.timeReorderingThreshDividend = 1.0;
-  conn.transportSettings.timeReorderingThreshDivisor = 1.0;
-  TimePoint checkTime = startTime + 20ms;
-
-  // Update the ackState
-  // Both largestAckedByPeer (packet num) and
-  // exercise loss by reorder path
-  auto& ackState = getAckState(conn, GetParam().pnSpace);
-  ackState.largestAckedByPeer = 4;
-  ASSERT_FALSE(
-      detectLossPackets(
-          conn, ackState, noopLossVisitor, checkTime, GetParam().pnSpace)
-          .hasError());
-
-  // Here we receive the spurious loss packets in a late ack
-  ReadAckFrame ackFrame;
-  ackFrame.largestAcked = 2;
-  ackFrame.ackBlocks.emplace_back(0, 2);
-
-  auto ackResult = processAckFrame(
-      conn,
-      GetParam().pnSpace,
-      ackFrame,
-      [](auto&) -> quic::Expected<void, quic::QuicError> { return {}; },
-      [](const auto&, const auto&) -> quic::Expected<void, quic::QuicError> {
-        return {};
-      },
-      [](auto&, auto, auto&, bool) -> quic::Expected<void, quic::QuicError> {
-        return {};
-      },
-      startTime + 30ms);
-  ASSERT_FALSE(ackResult.hasError());
-
-  ASSERT_EQ(streamState->lossBuffer.size(), 2);
-  EXPECT_EQ(streamState->lossBuffer[0].offset, 0);
-  EXPECT_EQ(streamState->lossBuffer[0].data.chainLength(), 50);
-  EXPECT_EQ(streamState->lossBuffer[0].eof, false);
-  EXPECT_EQ(streamState->lossBuffer[1].offset, 100);
-  EXPECT_EQ(streamState->lossBuffer[1].data.chainLength(), 100);
-  EXPECT_EQ(streamState->lossBuffer[1].eof, false);
-  ASSERT_FALSE(streamState->ackedIntervals.empty());
-  EXPECT_EQ(streamState->ackedIntervals.front().start, 50);
-  EXPECT_EQ(streamState->ackedIntervals.front().end, 99);
-}
-
-TEST_P(AckHandlersTest, TestSpuriousLossTrimFrontRemoval) {
-  QuicServerConnectionState conn(
-      FizzServerQuicHandshakeContext::Builder().build());
-  auto mockCongestionController = std::make_unique<MockCongestionController>();
-  conn.congestionController = std::move(mockCongestionController);
-  ASSERT_FALSE(
-      conn.streamManager->setMaxLocalBidirectionalStreams(100).hasError());
-  conn.transportSettings.removeFromLossBufferOnSpurious = true;
-
-  auto noopLossVisitor =
-      [](auto&, auto, auto&, bool) -> quic::Expected<void, quic::QuicError> {
-    return {};
-  };
-
-  StreamId streamId = 1;
-  auto streamState = conn.streamManager->createStream(streamId).value();
-  ChainedByteRangeHead data;
-  auto iob = folly::IOBuf::createChain(200, 200);
-  iob->append(200);
-  data.append(iob);
-  ASSERT_EQ(data.chainLength(), 200);
-  auto streamBuffer =
-      std::make_unique<WriteStreamBuffer>(std::move(data), 0, false);
-  streamState->insertIntoLossBuffer(std::move(streamBuffer));
-
-  TimePoint startTime = Clock::now();
-  auto regularPacket = createNewPacket(0, GetParam().pnSpace);
-  WriteStreamFrame frame(streamId, 0, 50, false);
-  regularPacket.frames.emplace_back(frame);
-  conn.outstandings.packetCount[regularPacket.header.getPacketNumberSpace()]++;
-  OutstandingPacketWrapper sentPacket(
-      std::move(regularPacket),
-      startTime,
-      0,
-      1,
-      0,
-      0,
-      1,
-      quic::LossState(),
-      0,
-      OutstandingPacketMetadata::DetailsPerStream());
-  conn.outstandings.packets.emplace_back(std::move(sentPacket));
-
-  // setting a very low reordering threshold to force loss by reorder
-  conn.lossState.reorderingThreshold = 1;
-  // setting time out parameters higher than the time at which
-  // detectLossPackets is called to make sure there are no losses by timeout
-  conn.lossState.srtt = 400ms;
-  conn.lossState.lrtt = 350ms;
-  conn.transportSettings.timeReorderingThreshDividend = 1.0;
-  conn.transportSettings.timeReorderingThreshDivisor = 1.0;
-  TimePoint checkTime = startTime + 20ms;
-
-  // Update the ackState
-  // Both largestAckedByPeer (packet num) and
-  // exercise loss by reorder path
-  auto& ackState = getAckState(conn, GetParam().pnSpace);
-  ackState.largestAckedByPeer = 4;
-  ASSERT_FALSE(
-      detectLossPackets(
-          conn, ackState, noopLossVisitor, checkTime, GetParam().pnSpace)
-          .hasError());
-
-  // Here we receive the spurious loss packets in a late ack
-  ReadAckFrame ackFrame;
-  ackFrame.largestAcked = 2;
-  ackFrame.ackBlocks.emplace_back(0, 2);
-
-  ASSERT_FALSE(
-      processAckFrame(
-          conn,
-          GetParam().pnSpace,
-          ackFrame,
-          [](auto&) -> quic::Expected<void, quic::QuicError> { return {}; },
-          [](const auto&, const auto&)
-              -> quic::Expected<void, quic::QuicError> { return {}; },
-          [](auto&, auto, auto&, bool)
-              -> quic::Expected<void, quic::QuicError> { return {}; },
-          startTime + 30ms)
-          .hasError());
-
-  ASSERT_EQ(streamState->lossBuffer.size(), 1);
-  EXPECT_EQ(streamState->lossBuffer[0].offset, 50);
-  EXPECT_EQ(streamState->lossBuffer[0].data.chainLength(), 150);
-  EXPECT_EQ(streamState->lossBuffer[0].eof, false);
-  ASSERT_FALSE(streamState->ackedIntervals.empty());
-  EXPECT_EQ(streamState->ackedIntervals.front().start, 0);
-  EXPECT_EQ(streamState->ackedIntervals.front().end, 49);
-}
-
-TEST_P(AckHandlersTest, TestSpuriousLossSplitFrontRemoval) {
-  QuicServerConnectionState conn(
-      FizzServerQuicHandshakeContext::Builder().build());
-  auto mockCongestionController = std::make_unique<MockCongestionController>();
-  conn.congestionController = std::move(mockCongestionController);
-  ASSERT_FALSE(
-      conn.streamManager->setMaxLocalBidirectionalStreams(100).hasError());
-  conn.transportSettings.removeFromLossBufferOnSpurious = true;
-
-  auto noopLossVisitor =
-      [](auto&, auto, auto&, bool) -> quic::Expected<void, quic::QuicError> {
-    return {};
-  };
-
-  StreamId streamId = 1;
-  auto streamState = conn.streamManager->createStream(streamId).value();
-  ChainedByteRangeHead data;
-  auto iob = folly::IOBuf::createChain(200, 200);
-  iob->append(200);
-  data.append(iob);
-  ASSERT_EQ(data.chainLength(), 200);
-  auto streamBuffer =
-      std::make_unique<WriteStreamBuffer>(std::move(data), 0, false);
-  streamState->insertIntoLossBuffer(std::move(streamBuffer));
-
-  TimePoint startTime = Clock::now();
-  auto regularPacket = createNewPacket(0, GetParam().pnSpace);
-  WriteStreamFrame frame(streamId, 50, 150, false);
-  regularPacket.frames.emplace_back(frame);
-  conn.outstandings.packetCount[regularPacket.header.getPacketNumberSpace()]++;
-  OutstandingPacketWrapper sentPacket(
-      std::move(regularPacket),
-      startTime,
-      0,
-      1,
-      0,
-      0,
-      1,
-      quic::LossState(),
-      0,
-      OutstandingPacketMetadata::DetailsPerStream());
-  conn.outstandings.packets.emplace_back(std::move(sentPacket));
-
-  // setting a very low reordering threshold to force loss by reorder
-  conn.lossState.reorderingThreshold = 1;
-  // setting time out parameters higher than the time at which
-  // detectLossPackets is called to make sure there are no losses by timeout
-  conn.lossState.srtt = 400ms;
-  conn.lossState.lrtt = 350ms;
-  conn.transportSettings.timeReorderingThreshDividend = 1.0;
-  conn.transportSettings.timeReorderingThreshDivisor = 1.0;
-  TimePoint checkTime = startTime + 20ms;
-
-  // Update the ackState
-  // Both largestAckedByPeer (packet num) and
-  // exercise loss by reorder path
-  auto& ackState = getAckState(conn, GetParam().pnSpace);
-  ackState.largestAckedByPeer = 4;
-  ASSERT_FALSE(
-      detectLossPackets(
-          conn, ackState, noopLossVisitor, checkTime, GetParam().pnSpace)
-          .hasError());
-
-  // Here we receive the spurious loss packets in a late ack
-  ReadAckFrame ackFrame;
-  ackFrame.largestAcked = 2;
-  ackFrame.ackBlocks.emplace_back(0, 2);
-
-  ASSERT_FALSE(
-      processAckFrame(
-          conn,
-          GetParam().pnSpace,
-          ackFrame,
-          [](auto&) -> quic::Expected<void, quic::QuicError> { return {}; },
-          [](const auto&, const auto&)
-              -> quic::Expected<void, quic::QuicError> { return {}; },
-          [](auto&, auto, auto&, bool)
-              -> quic::Expected<void, quic::QuicError> { return {}; },
-          startTime + 30ms)
-          .hasError());
-
-  ASSERT_EQ(streamState->lossBuffer.size(), 1);
-  EXPECT_EQ(streamState->lossBuffer[0].offset, 0);
-  EXPECT_EQ(streamState->lossBuffer[0].data.chainLength(), 50);
-  EXPECT_EQ(streamState->lossBuffer[0].eof, false);
-  ASSERT_FALSE(streamState->ackedIntervals.empty());
-  EXPECT_EQ(streamState->ackedIntervals.front().start, 50);
-  EXPECT_EQ(streamState->ackedIntervals.front().end, 199);
-}
-
 TEST_P(AckHandlersTest, TestPacketDestructionAcks) {
   QuicServerConnectionState conn(
       FizzServerQuicHandshakeContext::Builder().build());
@@ -693,12 +340,6 @@ TEST_P(AckHandlersTest, TestPacketDestructionAcks) {
   StreamId currentStreamId = 10;
   auto sentTime = Clock::now();
   conn.lossState.reorderingThreshold = 15;
-  std::function<void(const quic::OutstandingPacketWrapper&)> packetDestroyFn =
-      [&conn](const quic::OutstandingPacketWrapper& pkt) {
-        for (auto& packetProcessor : conn.packetProcessors) {
-          packetProcessor->onPacketDestroyed(pkt);
-        }
-      };
 
   for (PacketNum packetNum = 1; packetNum <= 3; packetNum++) {
     RegularQuicWritePacket regularPacket =
@@ -719,7 +360,8 @@ TEST_P(AckHandlersTest, TestPacketDestructionAcks) {
         0,
         OutstandingPacketMetadata::DetailsPerStream(),
         0us,
-        packetDestroyFn);
+        &conn,
+        &connPacketDestroyFn);
   }
   EXPECT_EQ(conn.outstandings.packets.size(), 3);
 
@@ -775,12 +417,6 @@ TEST_P(AckHandlersTest, TestPacketDestructionSpuriousLoss) {
 
   StreamId currentStreamId = 10;
   //   conn.lossState.reorderingThreshold = 1;
-  std::function<void(const quic::OutstandingPacketWrapper&)> packetDestroyFn =
-      [&conn](const quic::OutstandingPacketWrapper& pkt) {
-        for (auto& packetProcessor : conn.packetProcessors) {
-          packetProcessor->onPacketDestroyed(pkt);
-        }
-      };
 
   for (PacketNum packetNum = 1; packetNum <= 3; packetNum++) {
     RegularQuicWritePacket regularPacket =
@@ -801,7 +437,8 @@ TEST_P(AckHandlersTest, TestPacketDestructionSpuriousLoss) {
         0,
         OutstandingPacketMetadata::DetailsPerStream(),
         0us,
-        packetDestroyFn);
+        &conn,
+        &connPacketDestroyFn);
   }
   EXPECT_EQ(conn.outstandings.packets.size(), 3);
   // Update the ackState
@@ -868,7 +505,8 @@ TEST_P(AckHandlersTest, TestPacketDestructionSpuriousLoss) {
         0,
         OutstandingPacketMetadata::DetailsPerStream(),
         0us,
-        packetDestroyFn);
+        &conn,
+        &connPacketDestroyFn);
   }
 
   // Send ACK for #4, which should clear # 1 as well.
@@ -921,12 +559,6 @@ TEST_P(AckHandlersTest, TestPacketDestructionBigDeque) {
   StreamId currentStreamId = 10;
   auto sentTime = Clock::now();
   conn.lossState.reorderingThreshold = 15;
-  std::function<void(const quic::OutstandingPacketWrapper&)> packetDestroyFn =
-      [&conn](const quic::OutstandingPacketWrapper& pkt) {
-        for (auto& packetProcessor : conn.packetProcessors) {
-          packetProcessor->onPacketDestroyed(pkt);
-        }
-      };
 
   // send 1000 packets, starting at packet 1
   for (PacketNum packetNum = 1; packetNum <= 1000; packetNum++) {
@@ -948,7 +580,8 @@ TEST_P(AckHandlersTest, TestPacketDestructionBigDeque) {
         0,
         OutstandingPacketMetadata::DetailsPerStream(),
         0us,
-        packetDestroyFn);
+        &conn,
+        &connPacketDestroyFn);
   }
   EXPECT_EQ(conn.outstandings.packets.size(), 1000);
 

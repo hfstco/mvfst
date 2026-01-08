@@ -5,6 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include <quic/common/MvfstLogging.h>
 #include <quic/priority/RoundRobin.h>
 
 namespace {
@@ -14,29 +15,13 @@ static constexpr size_t kDestroyIndexThreshold = 10;
 
 namespace quic {
 
-void RoundRobin::advanceAfterNext(size_t n) {
-  if (advanceType_ == AdvanceType::Bytes) {
-    current_ = 0;
-  }
-  advanceType_ = AdvanceType::Nexts;
-  advanceAfter_ = n;
-}
-
-void RoundRobin::advanceAfterBytes(uint64_t bytes) {
-  if (advanceType_ == AdvanceType::Nexts) {
-    current_ = 0;
-  }
-  advanceType_ = AdvanceType::Bytes;
-  advanceAfter_ = bytes;
-}
-
 bool RoundRobin::empty() const {
   return list_.empty();
 }
 
 // The caller needs to verify it never inserts a duplicate
 void RoundRobin::insert(quic::PriorityQueue::Identifier value) {
-  DCHECK(!erase(value)) << "Duplicate value";
+  MVDCHECK(!erase(value), "Duplicate value");
   // Insert new integer at the tail of the list
   if (!useIndexMap_ && list_.size() >= kBuildIndexThreshold) {
     useIndexMap_ = true;
@@ -68,7 +53,6 @@ bool RoundRobin::erase(quic::PriorityQueue::Identifier value) {
     // the most likely erase is from next or next - 1
     if (*nextIt_ == value) {
       erase(nextIt_);
-      current_ = 0;
       return true;
     }
 
@@ -91,23 +75,18 @@ bool RoundRobin::erase(quic::PriorityQueue::Identifier value) {
 
 quic::PriorityQueue::Identifier RoundRobin::getNext(
     const quic::Optional<uint64_t>& bytes) {
-  CHECK(!list_.empty());
+  MVCHECK(!list_.empty());
   auto ret = *nextIt_;
   consume(bytes);
   return ret;
 }
 
 [[nodiscard]] quic::PriorityQueue::Identifier RoundRobin::peekNext() const {
-  CHECK(!list_.empty());
+  MVCHECK(!list_.empty());
   return *nextIt_;
 }
 
-void RoundRobin::consume(const quic::Optional<uint64_t>& bytes) {
-  if (advanceType_ == AdvanceType::Bytes) {
-    current_ += bytes.value_or(0);
-  } else {
-    current_++;
-  }
+void RoundRobin::consume(const quic::Optional<uint64_t>& /* bytes */) {
   maybeAdvance();
 }
 
@@ -118,7 +97,6 @@ void RoundRobin::clear() {
     useIndexMap_ = false;
   }
   nextIt_ = list_.end();
-  current_ = 0;
 }
 
 void RoundRobin::erase(ListType::iterator eraseIt) {
@@ -127,7 +105,6 @@ void RoundRobin::erase(ListType::iterator eraseIt) {
     if (nextIt_ == list_.end()) {
       nextIt_ = list_.begin();
     }
-    current_ = 0;
   } else {
     list_.erase(eraseIt);
   }
@@ -138,13 +115,10 @@ void RoundRobin::erase(ListType::iterator eraseIt) {
 }
 
 void RoundRobin::maybeAdvance() {
-  CHECK(!list_.empty());
-  if (current_ >= advanceAfter_) {
-    ++nextIt_;
-    current_ = 0;
-    if (nextIt_ == list_.end()) {
-      nextIt_ = list_.begin();
-    }
+  MVCHECK(!list_.empty());
+  ++nextIt_;
+  if (nextIt_ == list_.end()) {
+    nextIt_ = list_.begin();
   }
 }
 

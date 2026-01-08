@@ -430,8 +430,7 @@ quic::Expected<bool, QuicError> StreamFrameScheduler::writeStreamLossBuffers(
         bufferLen, // writeBufferLen -- only the len of the single buffer.
         bufferLen, // flowControlLen -- not relevant, already flow controlled.
         buffer->eof,
-        std::nullopt /* skipLenHint */,
-        stream.groupId);
+        std::nullopt /* skipLenHint */);
     if (!res.has_value()) {
       return quic::make_unexpected(res.error());
     }
@@ -501,7 +500,7 @@ quic::Expected<StreamId, QuicError> StreamFrameScheduler::writeStreamsHelper(
   // writing at the next stream when building the next packet.
   while (writableStreamItr != wrapper.cend()) {
     auto stream = conn_.streamManager->findStream(*writableStreamItr);
-    CHECK(stream);
+    MVCHECK(stream);
     auto writeResult = writeSingleStream(builder, *stream, connWritableBytes);
     if (!writeResult.has_value()) {
       return quic::make_unexpected(writeResult.error());
@@ -540,7 +539,7 @@ writeDatagramFrame(
   if (!res.has_value()) {
     return quic::make_unexpected(res.error());
   }
-  CHECK_GT(res.value(), 0);
+  MVCHECK_GT(res.value(), 0);
   QUIC_STATS(conn.statsCallback, onDatagramWrite, popResult.datagramLen);
   // Return popResult directly; buf has been moved into the DatagramFrame above
   return popResult;
@@ -584,10 +583,10 @@ quic::Expected<void, QuicError> StreamFrameScheduler::writeStreamsHelper(
       }
     } else {
       // Handle streams
-      CHECK(id.isStreamID());
+      MVCHECK(id.isStreamID());
       auto streamId = id.asStreamID();
-      auto stream = CHECK_NOTNULL(conn_.streamManager->findStream(streamId));
-      CHECK(stream) << "streamId=" << streamId;
+      auto stream = MVCHECK_NOTNULL(conn_.streamManager->findStream(streamId));
+      MVCHECK(stream, "streamId=" << streamId);
       // TODO: this is counting STREAM frame overhead against the stream itself
       auto lastWriteBytes = builder.remainingSpaceInPkt();
       auto writeResult = writeSingleStream(builder, *stream, connWritableBytes);
@@ -621,7 +620,7 @@ quic::Expected<void, QuicError> StreamFrameScheduler::writeStreamsHelper(
 
 quic::Expected<void, QuicError> StreamFrameScheduler::writeStreams(
     PacketBuilderInterface& builder) {
-  DCHECK(conn_.streamManager->hasWritable());
+  MVDCHECK(conn_.streamManager->hasWritable());
   uint64_t connWritableBytes = getSendConnFlowControlBytesWire(conn_);
   // Write the control streams first as a naive binary priority mechanism.
   const auto& controlWriteQueue = conn_.streamManager->controlWriteQueue();
@@ -667,7 +666,7 @@ quic::Expected<bool, QuicError> StreamFrameScheduler::writeStreamFrame(
 
   // hasWritableData is the condition which has to be satisfied for the
   // stream to be in writableList
-  CHECK(stream.hasWritableData());
+  MVCHECK(stream.hasWritableData());
 
   uint64_t flowControlLen =
       std::min(getSendStreamFlowControlBytesWire(stream), connWritableBytes);
@@ -682,8 +681,7 @@ quic::Expected<bool, QuicError> StreamFrameScheduler::writeStreamFrame(
       bufferLen,
       flowControlLen,
       canWriteFin,
-      std::nullopt /* skipLenHint */,
-      stream.groupId);
+      std::nullopt /* skipLenHint */);
   if (!res.has_value()) {
     return quic::make_unexpected(res.error());
   }
@@ -715,8 +713,9 @@ quic::Expected<bool, QuicError> RstStreamScheduler::writeRsts(
     auto streamId = resetStream.first;
     QuicStreamState* streamState =
         conn_.streamManager->getStream(streamId).value_or(nullptr);
-    CHECK(streamState) << "Stream " << streamId
-                       << " not found when going through resets";
+    MVCHECK(
+        streamState,
+        "Stream " << streamId << " not found when going through resets");
     if (streamState->pendingWrites.empty()) {
       //    We only write a RESET_STREAM or RESET_STREAM_AT frame for a stream
       //    once we've written out all data that needs to be delivered reliably.
@@ -802,7 +801,7 @@ bool PingFrameScheduler::hasPingFrame() const {
 bool PingFrameScheduler::writePing(PacketBuilderInterface& builder) {
   auto writeFrameResult = writeFrame(PingFrame(), builder);
   // We shouldn't ever error on a PING.
-  CHECK(writeFrameResult.has_value());
+  MVCHECK(writeFrameResult.has_value());
   return writeFrameResult.value() != 0;
 }
 
@@ -905,7 +904,9 @@ quic::Expected<void, QuicError> BlockedScheduler::writeBlockedFrames(
     }
   }
   for (const auto& blockedStream : conn_.streamManager->blockedStreams()) {
-    auto bytesWrittenResult = writeFrame(blockedStream.second, builder);
+    // Reconstruct frame from streamId (key) and offset (value)
+    StreamDataBlockedFrame frame(blockedStream.first, blockedStream.second);
+    auto bytesWrittenResult = writeFrame(frame, builder);
     if (!bytesWrittenResult.has_value()) {
       return quic::make_unexpected(bytesWrittenResult.error());
     }
@@ -974,7 +975,7 @@ bool ImmediateAckFrameScheduler::writeImmediateAckFrame(
     PacketBuilderInterface& builder) {
   auto result = writeFrame(ImmediateAckFrame(), builder);
   // We shouldn't ever error on an IMMEDIATE_ACK.
-  CHECK(result.has_value());
+  MVCHECK(result.has_value());
   return result.value() != 0;
 }
 
@@ -1039,7 +1040,7 @@ CloningScheduler::scheduleFramesForPacket(
           header,
           getAckState(conn_, builderPnSpace).largestAckedByPeer.value_or(0));
     } else {
-      CHECK(conn_.bufAccessor && conn_.bufAccessor->ownsBuffer());
+      MVCHECK(conn_.bufAccessor && conn_.bufAccessor->ownsBuffer());
       internalBuilder = std::make_unique<InplaceQuicPacketBuilder>(
           *conn_.bufAccessor,
           conn_.udpSendPacketLen,
@@ -1146,7 +1147,7 @@ CloningScheduler::scheduleFramesForPacket(
       // further down the write path, or be sent out and then dropped at
       // peer when peer fail to parse them.
       internalBuilder.reset();
-      CHECK(conn_.bufAccessor && conn_.bufAccessor->ownsBuffer());
+      MVCHECK(conn_.bufAccessor && conn_.bufAccessor->ownsBuffer());
       conn_.bufAccessor->trimEnd(conn_.bufAccessor->length() - prevSize);
     }
   }

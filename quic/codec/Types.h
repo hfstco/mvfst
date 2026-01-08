@@ -15,6 +15,7 @@
 #include <quic/common/BufUtil.h>
 #include <quic/common/CircularDeque.h>
 #include <quic/common/IntervalSet.h>
+#include <quic/common/MvfstLogging.h>
 #include <quic/common/NetworkData.h>
 #include <quic/common/Optional.h>
 #include <quic/common/Variant.h>
@@ -29,7 +30,6 @@
 namespace quic {
 
 using StreamId = uint64_t;
-using StreamGroupId = StreamId;
 
 enum class PacketNumberSpace : uint8_t {
   Initial,
@@ -461,7 +461,6 @@ struct ReadNewTokenFrame {
 */
 struct WriteStreamFrame {
   StreamId streamId;
-  OptionalIntegral<StreamGroupId> streamGroupId;
   uint64_t offset;
   uint64_t len;
   bool fin;
@@ -470,17 +469,12 @@ struct WriteStreamFrame {
       StreamId streamIdIn,
       uint64_t offsetIn,
       uint64_t lenIn,
-      bool finIn,
-      OptionalIntegral<StreamGroupId> streamGroupIdIn = std::nullopt)
-      : streamId(streamIdIn),
-        streamGroupId(streamGroupIdIn),
-        offset(offsetIn),
-        len(lenIn),
-        fin(finIn) {}
+      bool finIn)
+      : streamId(streamIdIn), offset(offsetIn), len(lenIn), fin(finIn) {}
 
   bool operator==(const WriteStreamFrame& rhs) const {
     return streamId == rhs.streamId && offset == rhs.offset && len == rhs.len &&
-        fin == rhs.fin && streamGroupId == rhs.streamGroupId;
+        fin == rhs.fin;
   }
 };
 
@@ -489,7 +483,6 @@ struct WriteStreamFrame {
  */
 struct ReadStreamFrame {
   StreamId streamId;
-  OptionalIntegral<StreamGroupId> streamGroupId;
   uint64_t offset;
   BufPtr data;
   bool fin;
@@ -498,21 +491,14 @@ struct ReadStreamFrame {
       StreamId streamIdIn,
       uint64_t offsetIn,
       BufPtr dataIn,
-      bool finIn,
-      OptionalIntegral<StreamGroupId> streamGroupIdIn = std::nullopt)
+      bool finIn)
       : streamId(streamIdIn),
-        streamGroupId(streamGroupIdIn),
         offset(offsetIn),
         data(std::move(dataIn)),
         fin(finIn) {}
 
-  ReadStreamFrame(
-      StreamId streamIdIn,
-      uint64_t offsetIn,
-      bool finIn,
-      OptionalIntegral<StreamGroupId> streamGroupIdIn = std::nullopt)
+  ReadStreamFrame(StreamId streamIdIn, uint64_t offsetIn, bool finIn)
       : streamId(streamIdIn),
-        streamGroupId(streamGroupIdIn),
         offset(offsetIn),
         data(BufHelpers::create(0)),
         fin(finIn) {}
@@ -525,7 +511,6 @@ struct ReadStreamFrame {
       data = other.data->clone();
     }
     fin = other.fin;
-    streamGroupId = other.streamGroupId;
   }
 
   ReadStreamFrame(ReadStreamFrame&& other) noexcept {
@@ -533,7 +518,6 @@ struct ReadStreamFrame {
     offset = other.offset;
     data = std::move(other.data);
     fin = other.fin;
-    streamGroupId = other.streamGroupId;
   }
 
   ReadStreamFrame& operator=(const ReadStreamFrame& other) {
@@ -543,7 +527,6 @@ struct ReadStreamFrame {
       data = other.data->clone();
     }
     fin = other.fin;
-    streamGroupId = other.streamGroupId;
     return *this;
   }
 
@@ -552,15 +535,13 @@ struct ReadStreamFrame {
     offset = other.offset;
     data = std::move(other.data);
     fin = other.fin;
-    streamGroupId = other.streamGroupId;
     return *this;
   }
 
   bool operator==(const ReadStreamFrame& other) const {
     BufEq eq;
     return streamId == other.streamId && offset == other.offset &&
-        fin == other.fin && eq(data, other.data) &&
-        streamGroupId == other.streamGroupId;
+        fin == other.fin && eq(data, other.data);
   }
 };
 
@@ -746,14 +727,14 @@ struct DatagramFrame {
 
   explicit DatagramFrame(size_t len, BufPtr buf)
       : length(len), data(std::move(buf)) {
-    CHECK_EQ(length, data.chainLength());
+    MVCHECK_EQ(length, data.chainLength());
   }
 
   // Variant requirement:
   DatagramFrame(const DatagramFrame& other)
       : length(other.length),
         data(other.data.front() ? other.data.front()->clone() : nullptr) {
-    CHECK_EQ(length, data.chainLength());
+    MVCHECK_EQ(length, data.chainLength());
   }
 
   bool operator==(const DatagramFrame& other) const {
@@ -763,7 +744,7 @@ struct DatagramFrame {
     if (data.empty() && other.data.empty()) {
       return true;
     }
-    CHECK(data.front() && other.data.front());
+    MVCHECK(data.front() && other.data.front());
     BufEq eq;
     return eq(*data.front(), *other.data.front());
   }
@@ -1150,7 +1131,6 @@ struct StreamTypeField {
    public:
     Builder() : field_(static_cast<uint8_t>(FrameType::STREAM)) {}
 
-    Builder& switchToStreamGroups();
     Builder& setFin();
     Builder& setOffset();
     Builder& setLength();

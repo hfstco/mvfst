@@ -215,8 +215,6 @@ BETTER_ENUM(
     KEY_UPDATE_INTERVAL = 0x10007,
     // Controls autotune flow control on streams.
     AUTOTUNE_RECV_STREAM_FLOW_CONTROL = 0x10009,
-    // Controls whether to use the inflight reordering heuristic.
-    INFLIGHT_REORDERING_THRESHOLD = 0x1000A,
     // Controls pacer's min burst size.
     PACER_MIN_BURST_PACKETS = 0x1000B,
     // Controls  write connection data packets limit.
@@ -276,15 +274,6 @@ enum class FrameType : uint64_t {
   KNOB = 0x1550,
   IMMEDIATE_ACK = 0xAC,
   ACK_FREQUENCY = 0xAF,
-  // Stream groups.
-  GROUP_STREAM = 0x32,
-  GROUP_STREAM_FIN = 0x33,
-  GROUP_STREAM_LEN = 0x34,
-  GROUP_STREAM_LEN_FIN = 0x35,
-  GROUP_STREAM_OFF = 0x36,
-  GROUP_STREAM_OFF_FIN = 0x37,
-  GROUP_STREAM_OFF_LEN = 0x38,
-  GROUP_STREAM_OFF_LEN_FIN = 0x39,
   ACK_RECEIVE_TIMESTAMPS = 0xB0,
   ACK_EXTENDED = 0xB1
 };
@@ -514,7 +503,7 @@ enum class CongestionControlType : uint8_t {
   // NOTE: MAX should always be at the end
   MAX
 };
-std::string_view congestionControlTypeToString(CongestionControlType type);
+std::string congestionControlTypeToString(CongestionControlType type);
 std::optional<CongestionControlType> congestionControlStrToType(
     std::string_view str);
 
@@ -801,9 +790,9 @@ enum class NoReadReason {
   STALE_DATA,
 };
 
-std::string_view writeDataReasonString(WriteDataReason reason);
-std::string_view writeNoWriteReasonString(NoWriteReason reason);
-std::string_view readNoReadReasonString(NoReadReason reason);
+std::string writeDataReasonString(WriteDataReason reason);
+std::string writeNoWriteReasonString(NoWriteReason reason);
+std::string readNoReadReasonString(NoReadReason reason);
 
 /**
  * Filter the versions that are currently supported.

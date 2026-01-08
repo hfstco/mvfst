@@ -7,6 +7,7 @@
 
 #include <quic/codec/QuicInteger.h>
 #include <quic/common/Expected.h>
+#include <quic/common/MvfstLogging.h>
 #include <quic/state/OutstandingPacket.h>
 #include <quic/state/QuicStreamUtilities.h>
 #include <quic/state/StateData.h>
@@ -43,14 +44,6 @@ QuicStreamState::QuicStreamState(StreamId idIn, QuicConnectionStateBase& connIn)
     }
   }
   priority = connIn.transportSettings.defaultPriority;
-}
-
-QuicStreamState::QuicStreamState(
-    StreamId idIn,
-    const OptionalIntegral<StreamGroupId>& groupIdIn,
-    QuicConnectionStateBase& connIn)
-    : QuicStreamState(idIn, connIn) {
-  groupId = groupIdIn;
 }
 
 std::ostream& operator<<(std::ostream& os, const QuicConnectionStateBase& st) {
@@ -124,8 +117,8 @@ QuicConnectionStateBase::getNextAvailablePeerConnectionId() {
 
   for (auto& cidData : peerConnectionIds) {
     if (!cidData.inUse) {
-      CHECK(cidData.connId != currentPeerCid)
-          << "Current CID not marked in use";
+      MVCHECK(
+          cidData.connId != currentPeerCid, "Current CID not marked in use");
       cidData.inUse = true;
       return cidData.connId;
     }

@@ -110,7 +110,7 @@ void updateAckSendStateOnRecvPacket(
     bool pktHasRetransmittableData,
     bool pktHasCryptoData,
     bool initPktNumSpace) {
-  DCHECK(!pktHasCryptoData || pktHasRetransmittableData);
+  MVDCHECK(!pktHasCryptoData || pktHasRetransmittableData);
   auto thresh = kNonRtxRxPacketsPendingBeforeAck;
   if (pktHasRetransmittableData || ackState.numRxPacketsRecvd) {
     if (ackState.tolerance.has_value()) {
@@ -206,9 +206,9 @@ AckState& getAckState(
     PacketNumberSpace pnSpace) noexcept {
   switch (pnSpace) {
     case PacketNumberSpace::Initial:
-      return *CHECK_NOTNULL(conn.ackStates.initialAckState.get());
+      return *MVCHECK_NOTNULL(conn.ackStates.initialAckState.get());
     case PacketNumberSpace::Handshake:
-      return *CHECK_NOTNULL(conn.ackStates.handshakeAckState.get());
+      return *MVCHECK_NOTNULL(conn.ackStates.handshakeAckState.get());
     case PacketNumberSpace::AppData:
       return conn.ackStates.appDataAckState;
   }
@@ -220,9 +220,9 @@ const AckState& getAckState(
     PacketNumberSpace pnSpace) noexcept {
   switch (pnSpace) {
     case PacketNumberSpace::Initial:
-      return *CHECK_NOTNULL(conn.ackStates.initialAckState.get());
+      return *MVCHECK_NOTNULL(conn.ackStates.initialAckState.get());
     case PacketNumberSpace::Handshake:
-      return *CHECK_NOTNULL(conn.ackStates.handshakeAckState.get());
+      return *MVCHECK_NOTNULL(conn.ackStates.handshakeAckState.get());
     case PacketNumberSpace::AppData:
       return conn.ackStates.appDataAckState;
   }
@@ -464,28 +464,13 @@ Expected<uint64_t, IntervalSetError> addPacketToAckState(
   }
 }
 
-bool checkCustomRetransmissionProfilesEnabled(
-    const QuicConnectionStateBase& conn) {
-  return conn.transportSettings.advertisedMaxStreamGroups > 0;
-}
-
 /**
- * Checks if the retransmission policy on the stream group prohibits
- * retransmissions.
+ * Checks if retransmissions are disabled for this stream.
  */
 bool streamRetransmissionDisabled(
-    QuicConnectionStateBase& conn,
+    QuicConnectionStateBase& /* conn */,
     const QuicStreamState& stream) {
-  bool noRetransmissions = false;
-  if (checkCustomRetransmissionProfilesEnabled(conn) && stream.groupId) {
-    // Check stream group retransmission policy.
-    const auto it = conn.retransmissionPolicies.find(*stream.groupId);
-    if (it != conn.retransmissionPolicies.cend()) {
-      const auto& retransmissionPolicy = it->second;
-      noRetransmissions = retransmissionPolicy.disableRetransmission;
-    }
-  }
-  return noRetransmissions;
+  return stream.retransmissionDisabled_;
 }
 
 } // namespace quic

@@ -7,13 +7,13 @@
 
 #pragma once
 
-#include <algorithm>
+#include <quic/common/MvfstLogging.h>
 #include <cstdint>
 #include <limits>
-#include <queue>
 
 #include <folly/Likely.h>
 #include <glog/logging.h>
+#include <quic/common/CircularDeque.h>
 #include <quic/common/Expected.h>
 
 namespace quic {
@@ -38,9 +38,11 @@ struct Interval {
   }
 
   Interval(const T& s, const T& e) : start(s), end(e) {
-    CHECK_LE(start, end) << "Trying to construct invalid interval";
-    CHECK_LE(end, std::numeric_limits<T>::max() - unitValue())
-        << "Interval bound too large";
+    MVCHECK_LE(start, end, "Trying to construct invalid interval");
+    MVCHECK_LE(
+        end,
+        std::numeric_limits<T>::max() - unitValue(),
+        "Interval bound too large");
   }
 
   // Safe constructor that returns Expected instead of CHECKing
@@ -76,7 +78,7 @@ struct Interval {
 template <
     typename T,
     T Unit = (T)1,
-    template <typename... I> class Container = std::deque>
+    template <typename... I> class Container = CircularDeque>
 class IntervalSet : private Container<Interval<T, Unit>> {
  public:
   using interval_type = Interval<T, Unit>;

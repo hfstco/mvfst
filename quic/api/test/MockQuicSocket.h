@@ -152,12 +152,9 @@ class MockQuicSocket : public QuicSocket {
       setConnectionCallback,
       (folly::MaybeManagedPtr<ConnectionCallback>));
 
-  void setEarlyDataAppParamsFunctions(
-      std::function<bool(const Optional<std::string>&, const BufPtr&)>
-          validator,
-      std::function<BufPtr()> getter) override {
-    earlyDataAppParamsValidator_ = std::move(validator);
-    earlyDataAppParamsGetter_ = std::move(getter);
+  void setEarlyDataAppParamsHandler(
+      EarlyDataAppParamsHandler* handler) override {
+    earlyDataAppParamsHandler_ = handler;
   }
 
   MOCK_METHOD((quic::Expected<void, LocalErrorCode>), pauseRead, (StreamId));
@@ -305,8 +302,7 @@ class MockQuicSocket : public QuicSocket {
       (quic::Expected<void, LocalErrorCode>),
       peek,
       (StreamId,
-       const std::function<
-           void(StreamId, const folly::Range<PeekIterator>&)>&));
+       FunctionRef<void(StreamId, const folly::Range<PeekIterator>&)>));
 
   MOCK_METHOD(
       (quic::Expected<void, std::pair<LocalErrorCode, Optional<uint64_t>>>),
@@ -329,9 +325,7 @@ class MockQuicSocket : public QuicSocket {
   ConnectionSetupCallback* setupCb_{nullptr};
   ConnectionCallback* connCb_{nullptr};
 
-  std::function<bool(const Optional<std::string>&, const BufPtr&)>
-      earlyDataAppParamsValidator_;
-  std::function<BufPtr()> earlyDataAppParamsGetter_;
+  EarlyDataAppParamsHandler* earlyDataAppParamsHandler_{nullptr};
 
   MOCK_METHOD(
       void,
@@ -364,25 +358,9 @@ class MockQuicSocket : public QuicSocket {
       (),
       (const));
   MOCK_METHOD(
-      (quic::Expected<StreamGroupId, LocalErrorCode>),
-      createBidirectionalStreamGroup,
-      ());
-  MOCK_METHOD(
-      (quic::Expected<StreamGroupId, LocalErrorCode>),
-      createUnidirectionalStreamGroup,
-      ());
-  MOCK_METHOD(
-      (quic::Expected<StreamId, LocalErrorCode>),
-      createBidirectionalStreamInGroup,
-      (StreamGroupId));
-  MOCK_METHOD(
-      (quic::Expected<StreamId, LocalErrorCode>),
-      createUnidirectionalStreamInGroup,
-      (StreamGroupId));
-  MOCK_METHOD(
       (quic::Expected<void, LocalErrorCode>),
-      setStreamGroupRetransmissionPolicy,
-      (StreamGroupId, std::optional<QuicStreamGroupRetransmissionPolicy>),
+      setStreamRetransmissionDisabled,
+      (StreamId, bool),
       (noexcept));
   MOCK_METHOD(
       (const std::shared_ptr<const folly::AsyncTransportCertificate>),

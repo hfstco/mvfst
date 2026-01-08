@@ -8,10 +8,12 @@
 #pragma once
 
 #include <quic/QuicException.h>
+#include <quic/common/FunctionRef.h>
 #include <quic/state/AckEvent.h>
 #include <quic/state/OutstandingPacket.h>
 #include <quic/state/QuicStreamUtilities.h>
 
+#include <deque>
 #include <utility>
 
 namespace quic {
@@ -175,7 +177,7 @@ class SocketObserverInterface {
      * function.
      */
     void invokeForEachNewOutstandingPacketOrdered(
-        const std::function<void(const OutstandingPacketWrapper&)>& fn) const;
+        FunctionRef<void(const OutstandingPacketWrapper&)> fn) const;
 
     // Number of packets just written, including ACK eliciting packets.
     const uint64_t numPacketsWritten;

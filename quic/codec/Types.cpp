@@ -256,19 +256,19 @@ ShortHeader::ShortHeader(
     ConnectionId connId,
     PacketNum packetNum)
     : protectionType_(protectionType), connectionId_(std::move(connId)) {
-  CHECK(
+  MVCHECK(
       protectionType_ == ProtectionType::KeyPhaseZero ||
-      protectionType_ == ProtectionType::KeyPhaseOne)
-      << "bad short header protection type";
+          protectionType_ == ProtectionType::KeyPhaseOne,
+      "bad short header protection type");
   setPacketNumber(packetNum);
 }
 
 ShortHeader::ShortHeader(ProtectionType protectionType, ConnectionId connId)
     : protectionType_(protectionType), connectionId_(std::move(connId)) {
-  CHECK(
+  MVCHECK(
       protectionType_ == ProtectionType::KeyPhaseZero ||
-      protectionType_ == ProtectionType::KeyPhaseOne)
-      << "bad short header protection type";
+          protectionType_ == ProtectionType::KeyPhaseOne,
+      "bad short header protection type");
 }
 
 ProtectionType ShortHeader::getProtectionType() const {
@@ -297,11 +297,6 @@ bool StreamTypeField::hasOffset() const {
 
 uint8_t StreamTypeField::fieldValue() const {
   return field_;
-}
-
-StreamTypeField::Builder& StreamTypeField::Builder::switchToStreamGroups() {
-  field_ = static_cast<uint8_t>(FrameType::GROUP_STREAM);
-  return *this;
 }
 
 StreamTypeField::Builder& StreamTypeField::Builder::setFin() {
@@ -355,7 +350,7 @@ std::string_view toString(PacketNumberSpace pnSpace) {
     case PacketNumberSpace::AppData:
       return "AppDataSpace";
   }
-  CHECK(false) << "Unknown packet number space";
+  MVCHECK(false, "Unknown packet number space");
   folly::assume_unreachable();
 }
 
@@ -372,7 +367,7 @@ std::string_view toString(ProtectionType protectionType) {
     case ProtectionType::KeyPhaseOne:
       return "KeyPhaseOne";
   }
-  CHECK(false) << "Unknown protection type";
+  MVCHECK(false, "Unknown protection type");
   folly::assume_unreachable();
 }
 
@@ -444,15 +439,6 @@ std::string_view toString(FrameType frame) {
       return "ACK_FREQUENCY";
     case FrameType::IMMEDIATE_ACK:
       return "IMMEDIATE_ACK";
-    case FrameType::GROUP_STREAM:
-    case FrameType::GROUP_STREAM_FIN:
-    case FrameType::GROUP_STREAM_LEN:
-    case FrameType::GROUP_STREAM_LEN_FIN:
-    case FrameType::GROUP_STREAM_OFF:
-    case FrameType::GROUP_STREAM_OFF_FIN:
-    case FrameType::GROUP_STREAM_OFF_LEN:
-    case FrameType::GROUP_STREAM_OFF_LEN_FIN:
-      return "GROUP_STREAM";
     case FrameType::ACK_RECEIVE_TIMESTAMPS:
       return "ACK_RECEIVE_TIMESTAMPS";
     case quic::FrameType::ACK_EXTENDED:

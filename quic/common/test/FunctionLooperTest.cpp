@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#include <quic/common/FunctionLooper.h>
+#include <quic/api/QuicTransportBaseLite.h>
 #include <quic/common/events/FollyQuicEventBase.h>
 #include <quic/common/events/HighResQuicTimer.h>
 
@@ -17,146 +17,222 @@ using namespace testing;
 
 namespace quic::test {
 
-class FunctionLooperTest : public Test {};
+namespace {
 
-TEST(FunctionLooperTest, LooperNotRunning) {
-  folly::EventBase backingEvb;
-  auto evb = std::make_shared<FollyQuicEventBase>(&backingEvb);
-  bool called = false;
-  auto func = [&]() { called = true; };
-  FunctionLooper::Ptr looper(
-      new FunctionLooper(evb, std::move(func), LooperType::ReadLooper));
-  evb->loopOnce();
-  EXPECT_FALSE(called);
-  evb->loopOnce();
-  EXPECT_FALSE(called);
-  EXPECT_FALSE(looper->isRunning());
-}
+/**
+ * MockTransportForLooperTest is a minimal mock of QuicTransportBaseLite
+ * that allows testing TransportLooper in isolation.
+ */
+class MockTransportForLooperTest : public QuicTransportBaseLite {
+ public:
+  MockTransportForLooperTest(std::shared_ptr<QuicEventBase> evb)
+      : QuicTransportBaseLite(std::move(evb), nullptr, false) {}
 
-TEST(FunctionLooperTest, LooperStarted) {
-  folly::EventBase backingEvb;
-  auto evb = std::make_shared<FollyQuicEventBase>(&backingEvb);
-  bool called = false;
-  auto func = [&]() { called = true; };
-  FunctionLooper::Ptr looper(
-      new FunctionLooper(evb, std::move(func), LooperType::ReadLooper));
-  looper->run();
-  EXPECT_TRUE(looper->isRunning());
-  evb->loopOnce();
-  EXPECT_TRUE(called);
-  called = false;
-  evb->loopOnce();
-  EXPECT_TRUE(called);
-}
+  ~MockTransportForLooperTest() override {
+    // Must set closeState_ before base destructor runs
+    closeState_ = CloseState::CLOSED;
+  }
 
-TEST(FunctionLooperTest, LooperStopped) {
-  folly::EventBase backingEvb;
-  auto evb = std::make_shared<FollyQuicEventBase>(&backingEvb);
-  bool called = false;
-  auto func = [&]() { called = true; };
-  FunctionLooper::Ptr looper(
-      new FunctionLooper(evb, std::move(func), LooperType::ReadLooper));
-  looper->run();
-  evb->loopOnce();
-  EXPECT_TRUE(called);
-  called = false;
-  looper->stop();
-  EXPECT_FALSE(looper->isRunning());
-  evb->loopOnce();
-  EXPECT_FALSE(called);
-}
+  // Test state
+  bool called{false};
+  int count{0};
+  std::function<void()> onCallback;
+  bool firstPacingCall{true};
+  bool stopPacing{false};
+  std::chrono::microseconds pacingDelay{std::chrono::hours(1)};
 
-TEST(FunctionLooperTest, LooperRestarted) {
-  folly::EventBase backingEvb;
-  auto evb = std::make_shared<FollyQuicEventBase>(&backingEvb);
-  bool called = false;
-  auto func = [&]() { called = true; };
-  FunctionLooper::Ptr looper(
-      new FunctionLooper(evb, std::move(func), LooperType::ReadLooper));
-  looper->run();
-  evb->loopOnce();
-  EXPECT_TRUE(called);
-  called = false;
-  looper->stop();
-  evb->loopOnce();
-  EXPECT_FALSE(called);
-  looper->run();
-  EXPECT_TRUE(looper->isRunning());
-  evb->loopOnce();
-  EXPECT_TRUE(called);
-}
-
-TEST(FunctionLooperTest, DestroyLooperDuringFunc) {
-  folly::EventBase backingEvb;
-  auto evb = std::make_shared<FollyQuicEventBase>(&backingEvb);
-  bool called = false;
-  FunctionLooper::Ptr* looperPtr = nullptr;
-
-  auto func = [&]() {
+  void onLooperCallback(LooperType /* type */) override {
     called = true;
-    *looperPtr = nullptr;
-  };
-  FunctionLooper::Ptr looper(
-      new FunctionLooper(evb, std::move(func), LooperType::ReadLooper));
-  looperPtr = &looper;
+    ++count;
+    if (onCallback) {
+      onCallback();
+    }
+  }
+
+  std::chrono::microseconds getLooperPacingDelay() override {
+    if (firstPacingCall) {
+      firstPacingCall = false;
+      return pacingDelay;
+    }
+    if (stopPacing) {
+      return std::chrono::microseconds::zero();
+    }
+    return pacingDelay;
+  }
+
+  // Required pure virtual implementations
+  quic::Expected<void, QuicError> writeData() override {
+    return {};
+  }
+
+  quic::Expected<void, QuicError> onReadData(
+      const folly::SocketAddress& /* localAddress */,
+      ReceivedUdpPacket&& /* udpPacket */,
+      const folly::SocketAddress& /* peerAddress */) override {
+    return {};
+  }
+
+  bool hasWriteCipher() const override {
+    return true;
+  }
+
+  void closeTransport() override {}
+
+  void unbindConnection() override {}
+
+  std::shared_ptr<QuicTransportBaseLite> sharedGuard() override {
+    return nullptr;
+  }
+
+  Optional<std::vector<uint8_t>> getExportedKeyingMaterial(
+      const std::string& /* label */,
+      const Optional<folly::ByteRange>& /* context */,
+      uint16_t /* keyLength */) const override {
+    return std::nullopt;
+  }
+
+  Optional<std::vector<TransportParameter>> getPeerTransportParams()
+      const override {
+    return std::nullopt;
+  }
+
+  // Expose loopers for testing
+  TransportLooper* getWriteLooperForTest() {
+    return writeLooper_.get();
+  }
+
+  TransportLooper* getReadLooperForTest() {
+    return readLooper_.get();
+  }
+
+  // Create a test looper directly
+  TransportLooper::Ptr createTestLooper(LooperType type) {
+    return TransportLooper::Ptr(new TransportLooper(evb_, this, type));
+  }
+};
+
+} // namespace
+
+class TransportLooperTest : public Test {};
+
+TEST(TransportLooperTest, LooperNotRunning) {
+  folly::EventBase backingEvb;
+  auto evb = std::make_shared<FollyQuicEventBase>(&backingEvb);
+  MockTransportForLooperTest transport(evb);
+  auto looper = transport.createTestLooper(LooperType::ReadLooper);
+
+  evb->loopOnce();
+  EXPECT_FALSE(transport.called);
+  evb->loopOnce();
+  EXPECT_FALSE(transport.called);
+  EXPECT_FALSE(looper->isRunning());
+}
+
+TEST(TransportLooperTest, LooperStarted) {
+  folly::EventBase backingEvb;
+  auto evb = std::make_shared<FollyQuicEventBase>(&backingEvb);
+  MockTransportForLooperTest transport(evb);
+  auto looper = transport.createTestLooper(LooperType::ReadLooper);
+
+  looper->run();
+  EXPECT_TRUE(looper->isRunning());
+  evb->loopOnce();
+  EXPECT_TRUE(transport.called);
+  transport.called = false;
+  evb->loopOnce();
+  EXPECT_TRUE(transport.called);
+}
+
+TEST(TransportLooperTest, LooperStopped) {
+  folly::EventBase backingEvb;
+  auto evb = std::make_shared<FollyQuicEventBase>(&backingEvb);
+  MockTransportForLooperTest transport(evb);
+  auto looper = transport.createTestLooper(LooperType::ReadLooper);
 
   looper->run();
   evb->loopOnce();
-  EXPECT_TRUE(called);
+  EXPECT_TRUE(transport.called);
+  transport.called = false;
+  looper->stop();
+  EXPECT_FALSE(looper->isRunning());
+  evb->loopOnce();
+  EXPECT_FALSE(transport.called);
+}
+
+TEST(TransportLooperTest, LooperRestarted) {
+  folly::EventBase backingEvb;
+  auto evb = std::make_shared<FollyQuicEventBase>(&backingEvb);
+  MockTransportForLooperTest transport(evb);
+  auto looper = transport.createTestLooper(LooperType::ReadLooper);
+
+  looper->run();
+  evb->loopOnce();
+  EXPECT_TRUE(transport.called);
+  transport.called = false;
+  looper->stop();
+  evb->loopOnce();
+  EXPECT_FALSE(transport.called);
+  looper->run();
+  EXPECT_TRUE(looper->isRunning());
+  evb->loopOnce();
+  EXPECT_TRUE(transport.called);
+}
+
+TEST(TransportLooperTest, DestroyLooperDuringCallback) {
+  folly::EventBase backingEvb;
+  auto evb = std::make_shared<FollyQuicEventBase>(&backingEvb);
+  MockTransportForLooperTest transport(evb);
+  auto looper = transport.createTestLooper(LooperType::ReadLooper);
+  auto* looperPtr = &looper;
+
+  transport.onCallback = [looperPtr]() { *looperPtr = nullptr; };
+
+  looper->run();
+  evb->loopOnce();
+  EXPECT_TRUE(transport.called);
   EXPECT_EQ(looper, nullptr);
 }
 
-TEST(FunctionLooperTest, StopLooperDuringFunc) {
+TEST(TransportLooperTest, StopLooperDuringCallback) {
   folly::EventBase backingEvb;
   auto evb = std::make_shared<FollyQuicEventBase>(&backingEvb);
-  bool called = false;
-  FunctionLooper::Ptr* looperPtr = nullptr;
+  MockTransportForLooperTest transport(evb);
+  auto looper = transport.createTestLooper(LooperType::ReadLooper);
+  auto* looperPtr = looper.get();
 
-  auto func = [&]() {
-    called = true;
-    (*looperPtr)->stop();
-  };
-  FunctionLooper::Ptr looper(
-      new FunctionLooper(evb, std::move(func), LooperType::ReadLooper));
-  looperPtr = &looper;
+  transport.onCallback = [looperPtr]() { looperPtr->stop(); };
 
   looper->run();
   evb->loopOnce();
-  EXPECT_TRUE(called);
-  called = false;
+  EXPECT_TRUE(transport.called);
+  transport.called = false;
   evb->loopOnce();
-  EXPECT_FALSE(called);
+  EXPECT_FALSE(transport.called);
 }
 
-TEST(FunctionLooperTest, RunLooperDuringFunc) {
+TEST(TransportLooperTest, RunLooperDuringCallback) {
   folly::EventBase backingEvb;
   auto evb = std::make_shared<FollyQuicEventBase>(&backingEvb);
-  bool called = false;
-  FunctionLooper::Ptr* looperPtr = nullptr;
+  MockTransportForLooperTest transport(evb);
+  auto looper = transport.createTestLooper(LooperType::ReadLooper);
+  auto* looperPtr = looper.get();
 
-  auto func = [&]() {
-    called = true;
-    (*looperPtr)->run();
-  };
-  FunctionLooper::Ptr looper(
-      new FunctionLooper(evb, std::move(func), LooperType::ReadLooper));
-  looperPtr = &looper;
+  transport.onCallback = [looperPtr]() { looperPtr->run(); };
 
   looper->run();
   evb->loopOnce();
-  EXPECT_TRUE(called);
-  called = false;
+  EXPECT_TRUE(transport.called);
+  transport.called = false;
   evb->loopOnce();
-  EXPECT_TRUE(called);
+  EXPECT_TRUE(transport.called);
 }
 
-TEST(FunctionLooperTest, DetachStopsLooper) {
+TEST(TransportLooperTest, DetachStopsLooper) {
   folly::EventBase backingEvb;
   auto evb = std::make_shared<FollyQuicEventBase>(&backingEvb);
-  bool called = false;
-  auto func = [&]() { called = true; };
-  FunctionLooper::Ptr looper(
-      new FunctionLooper(evb, std::move(func), LooperType::ReadLooper));
+  MockTransportForLooperTest transport(evb);
+  auto looper = transport.createTestLooper(LooperType::ReadLooper);
+
   looper->run();
   EXPECT_TRUE(looper->isRunning());
   looper->detachEventBase();
@@ -165,97 +241,85 @@ TEST(FunctionLooperTest, DetachStopsLooper) {
   EXPECT_FALSE(looper->isRunning());
 }
 
-TEST(FunctionLooperTest, PacingOnce) {
+TEST(TransportLooperTest, PacingOnce) {
   folly::EventBase backingEvb;
   auto evb = std::make_shared<FollyQuicEventBase>(&backingEvb);
   QuicTimer::SharedPtr pacingTimer =
       std::make_shared<HighResQuicTimer>(evb->getBackingEventBase(), 1ms);
-  int count = 0;
-  auto func = [&]() { ++count; };
-  bool firstTime = true;
-  auto pacingFunc = [&]() -> auto {
-    if (firstTime) {
-      firstTime = false;
-      return 3600000ms;
-    }
-    return std::chrono::milliseconds::zero();
-  };
-  FunctionLooper::Ptr looper(
-      new FunctionLooper(evb, std::move(func), LooperType::ReadLooper));
+  MockTransportForLooperTest transport(evb);
+  auto looper = transport.createTestLooper(LooperType::ReadLooper);
+
   looper->setPacingTimer(std::move(pacingTimer));
-  looper->setPacingFunction(std::move(pacingFunc));
+  looper->enablePacingCallback();
   looper->run();
   evb->loopOnce();
-  EXPECT_EQ(1, count);
+  EXPECT_EQ(1, transport.count);
   EXPECT_TRUE(looper->isPacingScheduled());
   looper->timeoutExpired();
-  EXPECT_EQ(2, count);
+  EXPECT_EQ(2, transport.count);
   looper->stop();
 }
 
-TEST(FunctionLooperTest, KeepPacing) {
+TEST(TransportLooperTest, KeepPacing) {
   folly::EventBase backingEvb;
   auto evb = std::make_shared<FollyQuicEventBase>(&backingEvb);
   QuicTimer::SharedPtr pacingTimer =
       std::make_shared<HighResQuicTimer>(evb->getBackingEventBase(), 1ms);
-  int count = 0;
-  auto func = [&]() { ++count; };
-  bool stopPacing = false;
-  auto pacingFunc = [&]() -> auto {
-    if (stopPacing) {
-      return std::chrono::milliseconds::zero();
-    }
-    return 3600000ms;
-  };
-  FunctionLooper::Ptr looper(
-      new FunctionLooper(evb, std::move(func), LooperType::ReadLooper));
+  MockTransportForLooperTest transport(evb);
+  auto looper = transport.createTestLooper(LooperType::ReadLooper);
+
+  // Reset firstPacingCall so it always returns the pacing delay
+  transport.firstPacingCall = false;
+
   looper->setPacingTimer(pacingTimer);
-  looper->setPacingFunction(std::move(pacingFunc));
+  looper->enablePacingCallback();
   looper->run();
   evb->loopOnce();
-  EXPECT_EQ(1, count);
+  EXPECT_EQ(1, transport.count);
   EXPECT_TRUE(looper->isPacingScheduled());
 
   looper->cancelTimerCallback();
   EXPECT_FALSE(looper->isPacingScheduled());
   looper->timeoutExpired();
-  EXPECT_EQ(2, count);
+  EXPECT_EQ(2, transport.count);
   EXPECT_TRUE(looper->isPacingScheduled());
 
   looper->cancelTimerCallback();
   EXPECT_FALSE(looper->isPacingScheduled());
   looper->timeoutExpired();
-  EXPECT_EQ(3, count);
+  EXPECT_EQ(3, transport.count);
   EXPECT_TRUE(looper->isPacingScheduled());
 
-  stopPacing = true;
+  transport.stopPacing = true;
   looper->cancelTimerCallback();
   EXPECT_FALSE(looper->isPacingScheduled());
   looper->timeoutExpired();
-  EXPECT_EQ(4, count);
+  EXPECT_EQ(4, transport.count);
   EXPECT_FALSE(looper->isPacingScheduled());
 
   looper->stop();
 }
 
-TEST(FunctionLooperTest, TimerTickSize) {
+TEST(TransportLooperTest, TimerTickSize) {
   folly::EventBase backingEvb;
   auto evb = std::make_shared<FollyQuicEventBase>(&backingEvb);
   QuicTimer::SharedPtr pacingTimer =
       std::make_shared<HighResQuicTimer>(evb->getBackingEventBase(), 123ms);
-  FunctionLooper::Ptr looper(
-      new FunctionLooper(evb, [&]() {}, LooperType::ReadLooper));
+  MockTransportForLooperTest transport(evb);
+  auto looper = transport.createTestLooper(LooperType::ReadLooper);
+
   looper->setPacingTimer(std::move(pacingTimer));
   EXPECT_EQ(123ms, looper->getTimerTickInterval());
 }
 
-TEST(FunctionLooperTest, TimerTickSizeAfterNewEvb) {
+TEST(TransportLooperTest, TimerTickSizeAfterNewEvb) {
   folly::EventBase backingEvb;
   auto evb = std::make_shared<FollyQuicEventBase>(&backingEvb);
   QuicTimer::SharedPtr pacingTimer =
       std::make_shared<HighResQuicTimer>(evb->getBackingEventBase(), 123ms);
-  FunctionLooper::Ptr looper(
-      new FunctionLooper(evb, [&]() {}, LooperType::ReadLooper));
+  MockTransportForLooperTest transport(evb);
+  auto looper = transport.createTestLooper(LooperType::ReadLooper);
+
   looper->setPacingTimer(std::move(pacingTimer));
   EXPECT_EQ(123ms, looper->getTimerTickInterval());
   looper->detachEventBase();
@@ -265,17 +329,19 @@ TEST(FunctionLooperTest, TimerTickSizeAfterNewEvb) {
   EXPECT_EQ(123ms, looper->getTimerTickInterval());
 }
 
-TEST(FunctionLooperTest, NoLoopCallbackInPacingMode) {
+TEST(TransportLooperTest, NoLoopCallbackInPacingMode) {
   folly::EventBase backingEvb;
   auto evb = std::make_shared<FollyQuicEventBase>(&backingEvb);
   QuicTimer::SharedPtr pacingTimer =
       std::make_shared<HighResQuicTimer>(evb->getBackingEventBase(), 1ms);
-  auto runFunc = [&]() {};
-  auto pacingFunc = [&]() { return 3600000ms; };
-  FunctionLooper::Ptr looper(
-      new FunctionLooper(evb, std::move(runFunc), LooperType::ReadLooper));
+  MockTransportForLooperTest transport(evb);
+  auto looper = transport.createTestLooper(LooperType::ReadLooper);
+
+  // Reset firstPacingCall so it always returns the pacing delay
+  transport.firstPacingCall = false;
+
   looper->setPacingTimer(std::move(pacingTimer));
-  looper->setPacingFunction(std::move(pacingFunc));
+  looper->enablePacingCallback();
   // bootstrap the looper
   looper->run();
   // this loop will schedule pacer not looper:

@@ -18,6 +18,7 @@
 #include <quic/client/state/ClientStateMachine.h>
 #include <quic/common/StringUtils.h>
 #include <quic/congestion_control/CongestionControllerFactory.h>
+#include <quic/fizz/client/handshake/QuicTokenCache.h>
 #include <quic/flowcontrol/QuicFlowController.h>
 #include <quic/handshake/CryptoFactory.h>
 #include <quic/happyeyeballs/QuicHappyEyeballsFunctions.h>
@@ -65,7 +66,7 @@ QuicClientTransportLite::QuicClientTransportLite(
           evb,
           std::move(socket),
           useConnectionEndWithErrorCallback) {
-  DCHECK(handshakeFactory);
+  MVDCHECK(handshakeFactory);
   auto tempConn =
       std::make_unique<QuicClientConnectionState>(std::move(handshakeFactory));
   clientConn_ = tempConn.get();
@@ -85,7 +86,7 @@ QuicClientTransportLite::QuicClientTransportLite(
       srcConnId, conn_->nextSelfConnectionIdSequence++);
   auto randCidExpected =
       ConnectionId::createRandom(kMinInitialDestinationConnIdLength);
-  CHECK(randCidExpected.has_value());
+  MVCHECK(randCidExpected.has_value());
   clientConn_->initialDestinationConnectionId = randCidExpected.value();
   clientConn_->originalDestinationConnectionId =
       clientConn_->initialDestinationConnectionId;
@@ -239,7 +240,7 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacketData(
       MVVLOG(4) << "Received Stateless Reset " << *this;
       conn_->peerConnectionError = QuicError(
           QuicErrorCode(LocalErrorCode::CONNECTION_RESET),
-          toString(LocalErrorCode::CONNECTION_RESET).str());
+          toString(LocalErrorCode::CONNECTION_RESET));
       return quic::make_unexpected(
           QuicError(LocalErrorCode::NO_ERROR, "Stateless Reset Received"));
     }
@@ -487,7 +488,7 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacketData(
   bool pktHasRetransmittableData = false;
   bool pktHasCryptoData = false;
 
-  AckedPacketVisitor ackedPacketVisitor =
+  auto ackedPacketVisitor =
       [&](const OutstandingPacketWrapper& outstandingPacket) {
         auto outstandingProtectionType =
             outstandingPacket.packet.header.getProtectionType();
@@ -503,7 +504,7 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacketData(
         return maybeVerifyPendingKeyUpdate(
             *conn_, outstandingPacket, regularPacket);
       };
-  AckedFrameVisitor ackedFrameVisitor =
+  auto ackedFrameVisitor =
       [&](const OutstandingPacketWrapper& outstandingPacket,
           const QuicWriteFrame& packetFrame)
       -> quic::Expected<void, QuicError> {
@@ -512,7 +513,7 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacketData(
     switch (packetFrame.type()) {
       case QuicWriteFrame::Type::WriteAckFrame: {
         const WriteAckFrame& frame = *packetFrame.asWriteAckFrame();
-        DCHECK(!frame.ackBlocks.empty());
+        MVDCHECK(!frame.ackBlocks.empty());
         MVVLOG(4) << "Client received ack for largestAcked="
                   << frame.ackBlocks.front().end << " " << *this;
         commonAckVisitorForAckFrame(ackState, frame);
@@ -674,8 +675,8 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacketData(
         std::string tokenStr = newTokenFrame.token->toString();
         MVVLOG(10) << "client received new token token="
                    << quic::hexlify(tokenStr);
-        if (newTokenCallback_) {
-          newTokenCallback_(std::move(tokenStr));
+        if (tokenCache_ && hostname_) {
+          tokenCache_->putToken(*hostname_, std::move(tokenStr));
         }
         break;
       }
@@ -1106,7 +1107,7 @@ quic::Expected<void, QuicError> QuicClientTransportLite::writeData() {
     if (clientConn_->clientHandshakeLayer->getPhase() ==
             ClientHandshake::Phase::Established &&
         conn_->oneRttWriteCipher) {
-      CHECK(conn_->oneRttWriteHeaderCipher);
+      MVCHECK(conn_->oneRttWriteHeaderCipher);
       writeShortClose(
           *socket_,
           *conn_,
@@ -1116,7 +1117,7 @@ quic::Expected<void, QuicError> QuicClientTransportLite::writeData() {
           *conn_->oneRttWriteHeaderCipher);
     }
     if (conn_->handshakeWriteCipher) {
-      CHECK(conn_->handshakeWriteHeaderCipher);
+      MVCHECK(conn_->handshakeWriteHeaderCipher);
       writeLongClose(
           *socket_,
           *conn_,
@@ -1129,7 +1130,7 @@ quic::Expected<void, QuicError> QuicClientTransportLite::writeData() {
           version);
     }
     if (conn_->initialWriteCipher) {
-      CHECK(conn_->initialHeaderCipher);
+      MVCHECK(conn_->initialHeaderCipher);
       writeLongClose(
           *socket_,
           *conn_,
@@ -1179,7 +1180,7 @@ quic::Expected<void, QuicError> QuicClientTransportLite::writeData() {
     }
   }
   if (clientConn_->zeroRttWriteCipher && !conn_->oneRttWriteCipher) {
-    CHECK(clientConn_->zeroRttWriteHeaderCipher);
+    MVCHECK(clientConn_->zeroRttWriteHeaderCipher);
     auto result = writeZeroRttDataToSocket(
         *socket_,
         *conn_,
@@ -1198,7 +1199,7 @@ quic::Expected<void, QuicError> QuicClientTransportLite::writeData() {
     return {};
   }
   if (conn_->oneRttWriteCipher) {
-    CHECK(clientConn_->oneRttWriteHeaderCipher);
+    MVCHECK(clientConn_->oneRttWriteHeaderCipher);
     auto result = writeQuicDataExceptCryptoStreamToSocket(
         *socket_,
         *conn_,
@@ -1278,8 +1279,8 @@ QuicClientTransportLite::startCryptoHandshake() {
         TransportParameterId::client_direct_encap,
         conn_->transportSettings.clientDirectEncapConfig.value());
     // The encoding should succeed because *clientDirectEncapConfig is a uint8_t
-    CHECK(maybeEncodedDirectEncapParam)
-        << "Failed to encode direct encap param";
+    MVCHECK(
+        maybeEncodedDirectEncapParam, "Failed to encode direct encap param");
     customTransportParameters_.push_back(*maybeEncodedDirectEncapParam);
   }
 
@@ -1578,7 +1579,7 @@ quic::Expected<void, QuicError> QuicClientTransportLite::recvMsg(
           // the actual len is len - offset now
           // leave gro bytes
           tmp->trimEnd(len - offset - params.gro);
-          DCHECK_EQ(tmp->length(), params.gro);
+          MVDCHECK_EQ(tmp->length(), params.gro);
 
           offset += params.gro;
           remaining -= params.gro;
@@ -1588,7 +1589,7 @@ quic::Expected<void, QuicError> QuicClientTransportLite::recvMsg(
           // do not clone the last packet
           // start at offset, use all the remaining data
           readBuffer->trimStart(offset);
-          DCHECK_EQ(readBuffer->length(), remaining);
+          MVDCHECK_EQ(readBuffer->length(), remaining);
           remaining = 0;
           networkData.addPacket(
               ReceivedUdpPacket(std::move(readBuffer), timings, params.tos));
@@ -1601,201 +1602,6 @@ quic::Expected<void, QuicError> QuicClientTransportLite::recvMsg(
       networkData.addPacket(
           ReceivedUdpPacket(std::move(readBuffer), timings, params.tos));
     }
-    maybeQlogDatagram(bytesRead);
-  }
-  trackDatagramsReceived(
-      networkData.getPackets().size(), networkData.getTotalData());
-
-  return {};
-}
-
-quic::Expected<void, QuicError> QuicClientTransportLite::recvMmsg(
-    QuicAsyncUDPSocket& sock,
-    uint64_t readBufferSize,
-    uint16_t numPackets,
-    NetworkData& networkData,
-    Optional<folly::SocketAddress>& server,
-    size_t& totalData) {
-  auto& msgs = recvmmsgStorage_.msgs;
-  int flags = 0;
-#ifdef FOLLY_HAVE_MSG_ERRQUEUE
-  auto groResult = sock.getGRO();
-  if (!groResult.has_value()) {
-    return quic::make_unexpected(QuicError(
-        QuicErrorCode(TransportErrorCode::INTERNAL_ERROR),
-        fmt::format(
-            "Failed to get GRO status: {}", groResult.error().message)));
-  }
-  bool useGRO = groResult.value() > 0;
-
-  auto tsResult = sock.getTimestamping();
-  if (!tsResult.has_value()) {
-    return quic::make_unexpected(QuicError(
-        QuicErrorCode(TransportErrorCode::INTERNAL_ERROR),
-        fmt::format(
-            "Failed to get timestamping status: {}",
-            tsResult.error().message)));
-  }
-  bool useTs = tsResult.value() > 0;
-
-  auto tosResult = sock.getRecvTos();
-  if (!tosResult.has_value()) {
-    return quic::make_unexpected(QuicError(
-        QuicErrorCode(TransportErrorCode::INTERNAL_ERROR),
-        fmt::format(
-            "Failed to get TOS status: {}", tosResult.error().message)));
-  }
-  bool recvTos = tosResult.value();
-
-  bool checkCmsgs = useGRO || useTs || recvTos;
-  std::vector<std::array<
-      char,
-      QuicAsyncUDPSocket::ReadCallback::OnDataAvailableParams::kCmsgSpace>>
-      controlVec(checkCmsgs ? numPackets : 0);
-
-  // we need to consider MSG_TRUNC too
-  if (useGRO) {
-    flags |= MSG_TRUNC;
-  }
-#endif
-  for (uint16_t i = 0; i < numPackets; ++i) {
-    auto& addr = recvmmsgStorage_.impl_[i].addr;
-    auto& readBuffer = recvmmsgStorage_.impl_[i].readBuffer;
-    auto& iovec = recvmmsgStorage_.impl_[i].iovec;
-    struct msghdr* msg = &msgs[i].msg_hdr;
-
-    if (!readBuffer) {
-      readBuffer = BufHelpers::createCombined(readBufferSize);
-      iovec.iov_base = readBuffer->writableData();
-      iovec.iov_len = readBufferSize;
-      msg->msg_iov = &iovec;
-      msg->msg_iovlen = 1;
-    }
-    CHECK(readBuffer != nullptr);
-
-    auto* rawAddr = reinterpret_cast<sockaddr*>(&addr);
-    auto addrResult = sock.address();
-    if (!addrResult.has_value()) {
-      return quic::make_unexpected(QuicError(
-          QuicErrorCode(TransportErrorCode::INTERNAL_ERROR),
-          fmt::format(
-              "Failed to get socket address: {}", addrResult.error().message)));
-    }
-    rawAddr->sa_family = addrResult.value().getFamily();
-    msg->msg_name = rawAddr;
-    msg->msg_namelen = kAddrLen;
-#ifdef FOLLY_HAVE_MSG_ERRQUEUE
-    if (checkCmsgs) {
-      ::memset(controlVec[i].data(), 0, controlVec[i].size());
-      msg->msg_control = controlVec[i].data();
-      msg->msg_controllen = controlVec[i].size();
-    }
-#endif
-  }
-
-  int numMsgsRecvd = sock.recvmmsg(msgs.data(), numPackets, flags, nullptr);
-  if (numMsgsRecvd < 0) {
-    if (errno == EAGAIN || errno == EWOULDBLOCK) {
-      // Exit, socket will notify us again when socket is readable.
-      if (conn_->loopDetectorCallback) {
-        conn_->readDebugState.noReadReason = NoReadReason::RETRIABLE_ERROR;
-      }
-      return {};
-    }
-    // If we got a non-retriable error, we might have received
-    // a packet that we could process, however let's just quit early.
-    sock.pauseRead();
-    if (conn_->loopDetectorCallback) {
-      conn_->readDebugState.noReadReason = NoReadReason::NONRETRIABLE_ERROR;
-    }
-    return quic::make_unexpected(QuicError(
-        QuicErrorCode(TransportErrorCode::INTERNAL_ERROR),
-        fmt::format(
-            "recvmmsg() failed, errno={} {}", errno, quic::errnoStr(errno))));
-  }
-
-  CHECK_LE(numMsgsRecvd, numPackets);
-  for (uint16_t i = 0; i < static_cast<uint16_t>(numMsgsRecvd); ++i) {
-    auto& addr = recvmmsgStorage_.impl_[i].addr;
-    auto& readBuffer = recvmmsgStorage_.impl_[i].readBuffer;
-    auto& msg = msgs[i];
-
-    size_t bytesRead = msg.msg_len;
-    if (bytesRead == 0) {
-      // Empty datagram, this is probably garbage matching our tuple, we
-      // should ignore such datagrams.
-      continue;
-    }
-    QuicAsyncUDPSocket::ReadCallback::OnDataAvailableParams params;
-#ifdef FOLLY_HAVE_MSG_ERRQUEUE
-    if (checkCmsgs) {
-      QuicAsyncUDPSocket::fromMsg(params, msg.msg_hdr);
-
-      // truncated
-      if (bytesRead > readBufferSize) {
-        bytesRead = readBufferSize;
-        if (params.gro > 0) {
-          bytesRead = bytesRead - bytesRead % params.gro;
-        }
-      }
-    }
-#endif
-    totalData += bytesRead;
-
-    if (!server) {
-      server.emplace(folly::SocketAddress());
-      auto* rawAddr = reinterpret_cast<sockaddr*>(&addr);
-      server->setFromSockaddr(rawAddr, kAddrLen);
-    }
-
-    ReceivedUdpPacket::Timings timings;
-    if (params.ts.has_value()) {
-      timings.maybeSoftwareTs =
-          QuicAsyncUDPSocket::convertToSocketTimestampExt(*params.ts);
-    }
-
-    MVVLOG(10) << "Got data from socket peer=" << *server
-               << " len=" << bytesRead;
-    readBuffer->append(bytesRead);
-    if (params.gro > 0) {
-      size_t len = bytesRead;
-      size_t remaining = len;
-      size_t offset = 0;
-      size_t totalNumPackets = networkData.getPackets().size() +
-          ((len + params.gro - 1) / params.gro);
-      networkData.reserve(totalNumPackets);
-      while (remaining) {
-        if (static_cast<int>(remaining) > params.gro) {
-          auto tmp = readBuffer->cloneOne();
-          // start at offset
-          tmp->trimStart(offset);
-          // the actual len is len - offset now
-          // leave gro bytes
-          tmp->trimEnd(len - offset - params.gro);
-          DCHECK_EQ(tmp->length(), params.gro);
-
-          offset += params.gro;
-          remaining -= params.gro;
-          networkData.addPacket(
-              ReceivedUdpPacket(std::move(tmp), timings, params.tos));
-        } else {
-          // do not clone the last packet
-          // start at offset, use all the remaining data
-          readBuffer->trimStart(offset);
-          DCHECK_EQ(readBuffer->length(), remaining);
-          remaining = 0;
-          networkData.addPacket(
-              ReceivedUdpPacket(std::move(readBuffer), timings, params.tos));
-          // This is the last packet. Break here to silence the linter's warning
-          // about a use-after-move in the next iteration of the loop
-          break;
-        }
-      }
-    } else {
-      networkData.addPacket(
-          ReceivedUdpPacket(std::move(readBuffer), timings, params.tos));
-    }
-
     maybeQlogDatagram(bytesRead);
   }
   trackDatagramsReceived(
@@ -1822,8 +1628,8 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processPackets(
     }
     return {};
   }
-  DCHECK(localAddress.has_value());
-  DCHECK(peerAddress.has_value());
+  MVDCHECK(localAddress.has_value());
+  MVDCHECK(peerAddress.has_value());
   // TODO: we can get better receive time accuracy than this, with
   // SO_TIMESTAMP or SIOCGSTAMP.
   auto packetReceiveTime = Clock::now();
@@ -1894,7 +1700,7 @@ QuicClientTransportLite::readWithRecvmsgSinglePacketLoop(
 void QuicClientTransportLite::onNotifyDataAvailable(
     QuicAsyncUDPSocket& sock) noexcept {
   auto self = this->shared_from_this();
-  CHECK(conn_) << "trying to receive packets without a connection";
+  MVCHECK(conn_, "trying to receive packets without a connection");
   auto readBufferSize = std::max(
                             conn_->transportSettings.maxRecvPacketSize,
                             uint64_t(kDefaultUDPReadBufferSize)) *
@@ -1950,7 +1756,7 @@ void QuicClientTransportLite::start(
     ConnectionCallback* connCb) {
   startHappyEyeballsIfEnabled();
 
-  CHECK(conn_->peerAddress.isInitialized());
+  MVCHECK(conn_->peerAddress.isInitialized());
 
   QLOG(*conn_, addTransportStateUpdate, kStart);
 
@@ -1980,7 +1786,7 @@ void QuicClientTransportLite::start(
     return;
   }
 
-  CHECK(socket_->address().has_value());
+  MVCHECK(socket_->address().has_value());
   auto addPathRes = clientConn_->pathManager->addValidatedPath(
       *socket_->address(), conn_->peerAddress);
   if (addPathRes.hasError()) {
@@ -1998,7 +1804,7 @@ void QuicClientTransportLite::start(
 
 void QuicClientTransportLite::addNewPeerAddress(
     folly::SocketAddress peerAddress) {
-  CHECK(peerAddress.isInitialized());
+  MVCHECK(peerAddress.isInitialized());
 
   if (peerAddress.getIPAddress().isZero()) {
     // Using the wildcard address as the peer address is a special case which is
@@ -2024,7 +1830,7 @@ void QuicClientTransportLite::addNewPeerAddress(
 
 void QuicClientTransportLite::setLocalAddress(
     folly::SocketAddress localAddress) {
-  CHECK(localAddress.isInitialized());
+  MVCHECK(localAddress.isInitialized());
   conn_->localAddress = std::move(localAddress);
 }
 
@@ -2243,7 +2049,7 @@ quic::Expected<void, QuicError> QuicClientTransportLite::migrateConnection(
     // The oldPathId is no longer the current path. So this cannot fail.
     auto addSocketResult =
         conn_->pathManager->addSocketToPath(oldPathId, std::move(socket_));
-    CHECK(!addSocketResult.hasError()) << addSocketResult.error();
+    MVCHECK(!addSocketResult.hasError(), addSocketResult.error());
 
     socket_ = std::move(newSocket);
   }
@@ -2280,7 +2086,7 @@ quic::Expected<void, QuicError> QuicClientTransportLite::migrateConnection(
 
 void QuicClientTransportLite::setTransportStatsCallback(
     std::shared_ptr<QuicTransportStatsCallback> statsCallback) noexcept {
-  CHECK(conn_);
+  MVCHECK(conn_);
   statsCallback_ = std::move(statsCallback);
   if (statsCallback_) {
     conn_->statsCallback = statsCallback_.get();
@@ -2382,13 +2188,6 @@ void QuicClientTransportLite::setCongestionControl(CongestionControlType type) {
         << "A congestion controller factory is not set. Using a default per-transport instance.";
   }
   QuicTransportBaseLite::setCongestionControl(type);
-}
-
-void QuicClientTransportLite::RecvmmsgStorage::resize(size_t numPackets) {
-  if (msgs.size() != numPackets) {
-    msgs.resize(numPackets);
-    impl_.resize(numPackets);
-  }
 }
 
 uint64_t QuicClientTransportLite::getNumAckFramesSent() const {

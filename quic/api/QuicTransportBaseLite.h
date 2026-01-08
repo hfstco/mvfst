@@ -9,9 +9,21 @@
 
 #include <quic/api/QuicSocketLite.h>
 #include <quic/api/QuicTransportFunctions.h>
-#include <quic/common/FunctionLooper.h>
+#include <quic/common/FunctionRef.h>
+#include <quic/common/events/QuicEventBase.h>
+#include <quic/common/events/QuicTimer.h>
+
+#include <folly/io/async/DelayedDestruction.h>
 
 namespace quic {
+
+enum class LooperType : uint8_t {
+  ReadLooper = 1,
+  PeekLooper = 2,
+  WriteLooper = 3
+};
+
+std::ostream& operator<<(std::ostream& out, const LooperType& rhs);
 
 enum class CloseState { OPEN, GRACEFUL_CLOSING, CLOSED };
 
@@ -410,6 +422,104 @@ class QuicTransportBaseLite : virtual public QuicSocketLite,
     QuicTransportBaseLite* transport_;
   };
 
+  /**
+   * TransportLooper manages event loop callbacks for the transport.
+   */
+  class TransportLooper : public QuicEventBaseLoopCallback,
+                          public QuicTimerCallback,
+                          public folly::DelayedDestruction {
+   public:
+    using Ptr =
+        std::unique_ptr<TransportLooper, folly::DelayedDestruction::Destructor>;
+
+    explicit TransportLooper(
+        std::shared_ptr<QuicEventBase> evb,
+        QuicTransportBaseLite* transport,
+        LooperType type);
+
+    void setPacingTimer(QuicTimer::SharedPtr pacingTimer) noexcept;
+
+    void runLoopCallback() noexcept override;
+
+    /**
+     * Starts running the loop callback in each loop iteration.
+     * If this is already scheduled to run, run() will continue to run it.
+     */
+    void run(bool thisIteration = false) noexcept;
+
+    /**
+     * Enables pacing callback - will call transport's getLooperPacingDelay().
+     */
+    void enablePacingCallback() noexcept;
+
+    /**
+     * Stops running the loop in each loop iteration.
+     */
+    void stop() noexcept;
+
+    /**
+     * Whether the looper is running or not. This is not thread-safe and should
+     * only be called on the looper's evb.
+     */
+    [[nodiscard]] bool isRunning() const;
+
+    /**
+     * Whether the pacing timer is scheduled or not. This is not thread-safe and
+     * should only be called on the looper's evb.
+     */
+    [[nodiscard]] bool isPacingScheduled();
+
+    /**
+     * Whether the loop callback is scheduled or not. This is not thread-safe
+     * and should only be called on the looper's evb.
+     */
+    [[nodiscard]] bool isLoopCallbackScheduled();
+
+    /**
+     * Attaches a new event base to the looper. Must be invoked on the
+     * evb that the looper is to be attached to.
+     */
+    void attachEventBase(std::shared_ptr<QuicEventBase> evb);
+
+    /**
+     * Detaches the current event base from the looper. Must be called on
+     * the current event base thread.
+     */
+    void detachEventBase();
+
+    void timeoutExpired() noexcept override;
+
+    void callbackCanceled() noexcept override;
+
+    [[nodiscard]] OptionalMicros getTimerTickInterval() noexcept;
+
+    /*
+     * Controls whether to fire a loop early when the pacing timer has been
+     * missed or is scheduled to fire "soon" (within 1ms).
+     */
+    void setFireLoopEarly(bool val) {
+      fireLoopEarly_ = val;
+    }
+
+   private:
+    ~TransportLooper() override = default;
+    void commonLoopBody() noexcept;
+    bool schedulePacingTimeout() noexcept;
+
+    std::shared_ptr<QuicEventBase> evb_;
+    QuicTransportBaseLite* transport_;
+    QuicTimer::SharedPtr pacingTimer_;
+    TimePoint nextPacingTime_;
+    const LooperType type_;
+
+    struct {
+      bool running_ : 1;
+      bool inLoopBody_ : 1;
+      bool fireLoopEarly_ : 1;
+      bool hasPacingCallback_ : 1;
+    };
+  };
+
   void scheduleLossTimeout(std::chrono::milliseconds timeout);
 
   void cancelLossTimeout();
@@ -511,6 +621,22 @@ class QuicTransportBaseLite : virtual public QuicSocketLite,
       bool drainConnection = true,
       bool sendCloseImmediately = true);
 
+  /**
+   * Handles an exception by logging, setting exceptionCloseWhat_, and closing
+   * the connection. Returns the appropriate LocalErrorCode for the caller.
+   *
+   * @param ex The caught exception (must be std::exception or derived)
+   * @param contextMsg Message to include in QuicError (e.g., "writeChain()
+   *                   error")
+   * @param streamId Optional stream ID for logging context
+   * @return LocalErrorCode to return to caller (for Expected-returning
+   *         functions)
+   */
+  LocalErrorCode handleExceptionAndClose(
+      const std::exception& ex,
+      folly::StringPiece contextMsg,
+      Optional<StreamId> streamId = std::nullopt);
+
   void processCallbacksAfterNetworkData();
 
   quic::Expected<void, LocalErrorCode> resetStreamInternal(
@@ -522,12 +648,11 @@ class QuicTransportBaseLite : virtual public QuicSocketLite,
   void cancelByteEventCallbacksForStreamInternal(
       const ByteEvent::Type type,
       const StreamId id,
-      const std::function<bool(uint64_t)>& offsetFilter);
+      FunctionRef<bool(uint64_t)> offsetFilter);
 
   void onSocketWritable() noexcept override;
 
   void handleNewStreamCallbacks(std::vector<StreamId>& newPeerStreams);
-  void handleNewGroupedStreamCallbacks(std::vector<StreamId>& newPeerStreams);
   void handleKnobCallbacks();
   void handleAckEventCallbacks();
   void handleCancelByteEventCallbacks();
@@ -555,8 +680,7 @@ class QuicTransportBaseLite : virtual public QuicSocketLite,
   void closeUdpSocket();
 
   quic::Expected<StreamId, LocalErrorCode> createStreamInternal(
-      bool bidirectional,
-      const OptionalIntegral<StreamGroupId>& streamGroupId = std::nullopt);
+      bool bidirectional);
 
   void runOnEvbAsync(
       std::function<void(std::shared_ptr<QuicTransportBaseLite>)> func);
@@ -588,6 +712,11 @@ class QuicTransportBaseLite : virtual public QuicSocketLite,
   virtual bool hasPeekCallback(StreamId id);
   virtual void invokeDatagramCallbackIfSet();
 
+  // Virtual callback methods for TransportLooper
+  // Called by TransportLooper to dispatch to the appropriate handler
+  virtual void onLooperCallback(LooperType type);
+  virtual std::chrono::microseconds getLooperPacingDelay();
+
   bool isTimeoutScheduled(QuicTimerCallback* callback) const;
 
   void invokeReadDataAndCallbacks(bool updateLoopersAndCheckForClosedStream);
@@ -608,15 +737,14 @@ class QuicTransportBaseLite : virtual public QuicSocketLite,
    *
    * Removes number of locations to update when a byte event is added.
    */
-  void invokeForEachByteEventType(
-      const std::function<void(const ByteEvent::Type)>& fn) {
+  void invokeForEachByteEventType(FunctionRef<void(const ByteEvent::Type)> fn) {
     for (const auto& type : ByteEvent::kByteEventTypes) {
       fn(type);
     }
   }
 
   void invokeForEachByteEventTypeConst(
-      const std::function<void(const ByteEvent::Type)>& fn) const {
+      FunctionRef<void(const ByteEvent::Type)> fn) const {
     for (const auto& type : ByteEvent::kByteEventTypes) {
       fn(type);
     }
@@ -716,7 +844,7 @@ class QuicTransportBaseLite : virtual public QuicSocketLite,
     ByteEventCallback* callback;
   };
 
-  using ByteEventMap = UnorderedMap<StreamId, std::deque<ByteEventDetail>>;
+  using ByteEventMap = UnorderedMap<StreamId, CircularDeque<ByteEventDetail>>;
   ByteEventMap& getByteEventMap(const ByteEvent::Type type);
   [[nodiscard]] const ByteEventMap& getByteEventMapConst(
       const ByteEvent::Type type) const;
@@ -732,8 +860,8 @@ class QuicTransportBaseLite : virtual public QuicSocketLite,
   PathValidationTimeout pathValidationTimeout_;
   DrainTimeout drainTimeout_;
 
-  FunctionLooper::Ptr writeLooper_;
-  FunctionLooper::Ptr readLooper_;
+  TransportLooper::Ptr writeLooper_;
+  TransportLooper::Ptr readLooper_;
 
   Optional<std::string> exceptionCloseWhat_;
 
@@ -802,7 +930,6 @@ class QuicTransportBaseLite : virtual public QuicSocketLite,
    * Helper functions to handle new streams.
    */
   void handleNewStreams(std::vector<StreamId>& newPeerStreams);
-  void handleNewGroupedStreams(std::vector<StreamId>& newPeerStreams);
 
   /**
    * Helper to log new stream event to observer.

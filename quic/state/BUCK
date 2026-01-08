@@ -16,6 +16,17 @@ mvfst_cpp_library(
 )
 
 mvfst_cpp_library(
+    name = "early_data_app_params_handler",
+    headers = [
+        "EarlyDataAppParamsHandler.h",
+    ],
+    exported_deps = [
+        "//quic/common:buf_util",
+        "//quic/common:optional",
+    ],
+)
+
+mvfst_cpp_library(
     name = "loss_state",
     headers = [
         "LossState.h",
@@ -104,10 +115,10 @@ mvfst_cpp_library(
         ":ack_event",
         ":ack_states",
         ":cloned_packet_identifier",
+        ":early_data_app_params_handler",
         ":loss_state",
         ":outstanding_packet",
         ":quic_connection_stats",
-        ":retransmission_policy",
         ":stats_callback",
         ":transport_settings",
         "//folly:network_address",
@@ -120,6 +131,7 @@ mvfst_cpp_library(
         "//quic/common:buf_accessor",
         "//quic/common:circular_deque",
         "//quic/common:expected",
+        "//quic/common:function_ref",
         "//quic/common:interval_set",
         "//quic/common:mvfst_logging",
         "//quic/common:optional",
@@ -161,6 +173,7 @@ mvfst_cpp_library(
         "//quic:constants",
         "//quic/codec:types",
         "//quic/common:expected",
+        "//quic/common:function_ref",
         "//quic/common:interval_set",
         "//quic/common:optional",
         "//quic/congestion_control:congestion_controller",
@@ -184,6 +197,7 @@ mvfst_cpp_library(
     exported_deps = [
         ":quic_state_machine",
         "//quic/common:expected",
+        "//quic/common:function_ref",
     ],
 )
 
@@ -267,6 +281,7 @@ mvfst_cpp_library(
     deps = [
         ":state_functions",
         "//quic:constants",
+        "//quic/common:mvfst_logging",
         "//quic/state/stream:stream",
     ],
     exported_deps = [
@@ -314,6 +329,7 @@ mvfst_cpp_library(
     ],
     deps = [
         "//folly:map_util",
+        "//quic/common:mvfst_logging",
     ],
     exported_deps = [
         ":outstanding_packet",
@@ -332,20 +348,11 @@ mvfst_cpp_library(
         "QuicAckFrequencyFunctions.h",
     ],
     deps = [
+        "//quic/common:mvfst_logging",
         "//quic/common:time_util",
     ],
     exported_deps = [
         "//quic/state:quic_state_machine",
-    ],
-)
-
-mvfst_cpp_library(
-    name = "retransmission_policy",
-    headers = [
-        "QuicStreamGroupRetransmissionPolicy.h",
-    ],
-    exported_deps = [
-        "//quic:constants",
     ],
 )
 

@@ -343,14 +343,9 @@ struct TransportSettings {
   bool enableKeepalive{false};
   // Whether or not to enable WritableBytes limit (server only)
   bool enableWritableBytesLimit{false};
-  // Whether or not to remove data from the loss buffer on spurious loss.
-  bool removeFromLossBufferOnSpurious{false};
   // If set to true, the users won't get new stream notification until an
   // actual stream frame with the new stream id arrives.
   bool notifyOnNewStreamsExplicitly{false};
-  // Both peers must support stream groups; negotiated during handshake.
-  // 0 means stream groups are disabled.
-  uint64_t advertisedMaxStreamGroups{0};
   bool experimentalPacer{false};
   // experimental flag to close ingress SM when invoking stopSending
   bool dropIngressOnStopSending{false};
@@ -380,12 +375,6 @@ struct TransportSettings {
 
   // The default priority to instantiate streams with.
   PriorityQueue::Priority defaultPriority;
-
-  // How many times we will a schedule a stream to packets before moving onto
-  // the next one in the queue. Only relevant for incremental priority.
-  uint64_t priorityQueueWritesPerStream{1};
-  // Whether to include ACKs whenever we have data to write and packets to ACK.
-  bool opportunisticAcking{true};
 
   // Local configuration for ACK receive timestamps.
   //
@@ -454,18 +443,11 @@ struct TransportSettings {
   // If flow control updates should be sent based on time passed since last
   // update.
   bool disableFlowControlTimeBasedUpdates{false};
-  // Whether to process callbacks per received packet.
-  bool processCallbacksPerPacket{false};
   // Whether to trigger packet processing per socket read rather than batch
   // receiving and then processing.
   bool networkDataPerSocketRead{false};
   bool cloneAllPacketsWithCryptoFrame{false};
   bool cloneCryptoPacketsAtMostOnce{false};
-  // Use a reordering threshold heuristic of inflight / 2.
-  bool useInflightReorderingThreshold{false};
-  // Raise read callbacks for all unidirectional streams first on data
-  // reception.
-  bool unidirectionalStreamsReadCallbacksFirst{false};
   bool immediatelyRetransmitInitialPackets{false};
   // If > 0 this represents the coalescing of appends to the read buffer
   // which will be applied. i.e. when used the underlying IOBufs in the read

@@ -8,16 +8,16 @@
 #pragma once
 
 #include <folly/MaybeManagedPtr.h>
+#include <folly/Portability.h>
 #include <folly/io/IOBuf.h>
 #include <quic/QuicConstants.h>
 #include <quic/api/QuicSocketLite.h>
+#include <quic/common/FunctionRef.h>
 #include <quic/common/Optional.h>
 #include <quic/common/events/QuicEventBase.h>
 #include <quic/observer/SocketObserverContainer.h>
 #include <quic/priority/PriorityQueue.h>
-#include <quic/state/QuicStreamGroupRetransmissionPolicy.h>
-
-#include <folly/Portability.h>
+#include <quic/state/EarlyDataAppParamsHandler.h>
 #include <chrono>
 
 namespace quic {
@@ -25,53 +25,19 @@ namespace quic {
 class QuicSocket : virtual public QuicSocketLite {
  public:
   /**
-   * Sets the functions that mvfst will invoke to validate early data params
-   * and encode early data params to NewSessionTicket.
-   * It's up to the application's responsibility to make sure captured objects
-   * (if any) are alive when the functions are called.
+   * Sets the handler for early data (0-RTT) application parameters.
    *
-   * validator:
-   *   On server side:
-   *     Called during handshake while negotiating early data.
-   *     @param alpn
-   *       The negotiated ALPN. Optional because it may be absent from
-   *       ClientHello.
-   *     @param appParams
-   *       The encoded and encrypted application parameters from PSK.
-   *     @return
-   *       Whether application accepts parameters from resumption state for
-   *       0-RTT.
-   *   On client side:
-   *     Called when transport is applying psk from cache.
-   *     @param alpn
-   *       The ALPN client is going to use for this connection. Optional
-   *       because client may not set ALPN.
-   *     @param appParams
-   *       The encoded (not encrypted) application parameter from local cache.
-   *     @return
-   *       Whether application will attempt early data based on the cached
-   *       application parameters. This is useful when client updates to use a
-   *       new binary but still reads PSK from an old cache. Client may choose
-   *       to not attempt 0-RTT at all given client thinks server will likely
-   *       reject it.
+   * The handler is used to:
+   * - Validate cached/resumption app params during early data setup
+   * - Provide current app params for caching in session tickets
    *
-   * getter:
-   *   On server side:
-   *     Called when transport is writing NewSessionTicket.
-   *     @return
-   *       The encoded application parameters that will be included in
-   *       NewSessionTicket.
-   *   On client side:
-   *     Called when client receives NewSessionTicket and is going to write to
-   *     cache.
-   *     @return
-   *       Encoded application parameters that will be written to cache.
+   * See EarlyDataAppParamsHandler for detailed method documentation.
+   *
+   * @param handler Non-owning pointer. Application must ensure handler
+   *                outlives the connection. Pass nullptr to clear.
    */
-  virtual void setEarlyDataAppParamsFunctions(
-      std::function<
-          bool(const Optional<std::string>& alpn, const BufPtr& appParams)>
-          validator,
-      std::function<BufPtr()> getter) = 0;
+  virtual void setEarlyDataAppParamsHandler(
+      EarlyDataAppParamsHandler* handler) = 0;
 
   ~QuicSocket() override = default;
 
@@ -264,7 +230,7 @@ class QuicSocket : virtual public QuicSocketLite {
    */
   virtual quic::Expected<void, LocalErrorCode> peek(
       StreamId id,
-      const std::function<void(StreamId id, const folly::Range<PeekIterator>&)>&
+      FunctionRef<void(StreamId id, const folly::Range<PeekIterator>&)>
           peekCallback) = 0;
 
   /**
@@ -290,30 +256,6 @@ class QuicSocket : virtual public QuicSocketLite {
   virtual quic::Expected<void, LocalErrorCode> consume(
       StreamId id,
       size_t amount) = 0;
-
-  /**
-   *  Create a bidirectional stream group.
-   */
-  virtual quic::Expected<StreamGroupId, LocalErrorCode>
-  createBidirectionalStreamGroup() = 0;
-
-  /**
-   *  Create a unidirectional stream group.
-   */
-  virtual quic::Expected<StreamGroupId, LocalErrorCode>
-  createUnidirectionalStreamGroup() = 0;
-
-  /**
-   *  Same as createBidirectionalStream(), but creates a stream in a group.
-   */
-  virtual quic::Expected<StreamId, LocalErrorCode>
-  createBidirectionalStreamInGroup(StreamGroupId groupId) = 0;
-
-  /**
-   *  Same as createBidirectionalStream(), but creates a stream in a group.
-   */
-  virtual quic::Expected<StreamId, LocalErrorCode>
-  createUnidirectionalStreamInGroup(StreamGroupId groupId) = 0;
 
   /**
    * Returns whether a stream ID represents a client-initiated stream.
@@ -465,12 +407,14 @@ class QuicSocket : virtual public QuicSocketLite {
       size_t atMost = 0) = 0;
 
   /**
-   *  Sets a retransmission policy on a stream group.
+   * Sets whether retransmissions are disabled for a specific stream.
+   *
+   * @param id The stream ID
+   * @param disabled If true, retransmissions are disabled for this stream
    */
-  virtual quic::Expected<void, LocalErrorCode>
-  setStreamGroupRetransmissionPolicy(
-      StreamGroupId groupId,
-      std::optional<QuicStreamGroupRetransmissionPolicy> policy) noexcept = 0;
+  virtual quic::Expected<void, LocalErrorCode> setStreamRetransmissionDisabled(
+      StreamId id,
+      bool disabled) noexcept = 0;
 
   using Observer = SocketObserverContainer::Observer;
   using ManagedObserver = SocketObserverContainer::ManagedObserver;

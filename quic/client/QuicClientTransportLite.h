@@ -22,6 +22,7 @@
 namespace quic {
 
 class ClientHandshakeFactory;
+class QuicTokenCache;
 
 class QuicClientTransportLite
     : virtual public QuicTransportBaseLite,
@@ -207,12 +208,12 @@ class QuicClientTransportLite
       std::shared_ptr<QuicTransportStatsCallback> statsCallback) noexcept;
 
   /**
-   * Set a callback function to be invoked and passed
-   * the new token upon receiving a NEW_TOKEN (0x07) frame.
+   * Set a token cache to store NEW_TOKEN frames received from the server.
+   * The cache's putToken() will be called with the hostname and token.
+   * The cache must outlive the transport.
    */
-  void setNewTokenCallback(
-      std::function<void(std::string)> newTokenCallback) noexcept {
-    newTokenCallback_ = std::move(newTokenCallback);
+  void setTokenCache(QuicTokenCache* tokenCache) noexcept {
+    tokenCache_ = tokenCache;
   }
 
   /**
@@ -276,14 +277,6 @@ class QuicClientTransportLite
       QuicAsyncUDPSocket& sock,
       uint64_t readBufferSize,
       int numPackets,
-      NetworkData& networkData,
-      Optional<folly::SocketAddress>& server,
-      size_t& totalData);
-
-  [[nodiscard]] quic::Expected<void, QuicError> recvMmsg(
-      QuicAsyncUDPSocket& sock,
-      uint64_t readBufferSize,
-      uint16_t numPackets,
       NetworkData& networkData,
       Optional<folly::SocketAddress>& server,
       size_t& totalData);
@@ -374,24 +367,6 @@ class QuicClientTransportLite
   // supports GRO. otherwise kDefaultNumGROBuffers
   uint32_t numGROBuffers_{kDefaultNumGROBuffers};
 
-  // TODO(bschlinker): Deprecate in favor of Wrapper::recvmmsg
-  struct RecvmmsgStorage {
-    struct impl_ {
-      struct sockaddr_storage addr;
-      struct iovec iovec;
-      // Buffers we pass to recvmmsg.
-      BufPtr readBuffer;
-    };
-
-    // Storage for the recvmmsg system call.
-    std::vector<struct mmsghdr> msgs;
-    std::vector<struct impl_> impl_;
-    void resize(size_t numPackets);
-  };
-
-  // TODO(bschlinker): Deprecate in favor of Wrapper::recvmmsg
-  RecvmmsgStorage recvmmsgStorage_;
-
   void runOnEvbAsync(
       std::function<void(std::shared_ptr<QuicClientTransportLite>)> func);
 
@@ -414,8 +389,8 @@ class QuicClientTransportLite
   std::shared_ptr<QuicTransportStatsCallback> statsCallback_;
   // We will only send transport knobs once, this flag keeps track of it
   bool transportKnobsSent_{false};
-  // Callback function to invoke when the client receives a new token
-  std::function<void(std::string)> newTokenCallback_;
+  // Token cache for storing NEW_TOKEN frames from the server
+  QuicTokenCache* tokenCache_{nullptr};
 
   // Output buf/accessor to be used for continuous memory writes.
   std::unique_ptr<BufAccessor> bufAccessor_;

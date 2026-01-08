@@ -6,6 +6,7 @@
  */
 
 #include <folly/portability/GTest.h>
+#include <quic/common/MvfstLogging.h>
 
 #include <quic/api/QuicPacketScheduler.h>
 #include <quic/api/QuicTransportFunctions.h>
@@ -126,7 +127,7 @@ RegularQuicPacketBuilder createPacketBuilder(QuicClientConnectionState& conn) {
       conn.udpSendPacketLen,
       std::move(shortHeader),
       conn.ackStates.appDataAckState.largestAckedByPeer.value_or(0));
-  CHECK(!builder.encodePacketHeader().hasError());
+  MVCHECK(!builder.encodePacketHeader().hasError());
   return builder;
 }
 
@@ -146,10 +147,10 @@ WriteStreamFrame writeDataToStream(
     const std::string& data) {
   auto stream = conn.streamManager->findStream(streamId);
   auto length = data.size();
-  CHECK(stream);
+  MVCHECK(stream);
   auto result =
       writeDataToQuicStream(*stream, folly::IOBuf::copyBuffer(data), false);
-  CHECK(!result.hasError());
+  MVCHECK(!result.hasError());
   return {streamId, 0, length, false};
 }
 
@@ -161,7 +162,7 @@ WriteStreamFrame writeDataToStream(
   auto stream = conn.streamManager->findStream(streamId);
   auto length = buf->computeChainDataLength();
   auto result = writeDataToQuicStream(*stream, std::move(buf), false);
-  CHECK(!result.hasError());
+  MVCHECK(!result.hasError());
   return {streamId, 0, length, false};
 }
 
@@ -172,13 +173,6 @@ std::unique_ptr<MockQuicPacketBuilder> setupMockPacketBuilder() {
       .WillRepeatedly(Invoke([builder = builder.get()](auto f) {
         builder->frames_.push_back(f);
       }));
-  return builder;
-}
-
-std::unique_ptr<MockQuicPacketBuilder> setupMockPacketBuilder(
-    std::vector<size_t> expectedRemaining) {
-  auto builder = std::make_unique<NiceMock<MockQuicPacketBuilder>>();
-  builder->setExpectedSpaceRemaining(std::move(expectedRemaining));
   return builder;
 }
 
@@ -198,23 +192,6 @@ void verifyStreamFrames(
         builder.frames_.begin() + expectedFrames.size());
   }
 }
-
-void verifyStreamFrames(
-    MockQuicPacketBuilder& builder,
-    const std::vector<StreamId>& expectedIds) {
-  ASSERT_EQ(builder.frames_.size(), expectedIds.size());
-  for (size_t i = 0; i < expectedIds.size(); ++i) {
-    ASSERT_TRUE(builder.frames_[i].asWriteStreamFrame());
-    EXPECT_EQ(
-        builder.frames_[i].asWriteStreamFrame()->streamId, expectedIds[i]);
-  }
-  if (expectedIds.size() == builder.frames_.size()) {
-    builder.frames_.clear();
-  } else {
-    builder.frames_.erase(
-        builder.frames_.begin(), builder.frames_.begin() + expectedIds.size());
-  }
-}
 } // namespace
 
 namespace quic::test {
@@ -232,10 +209,10 @@ class QuicPacketSchedulerTestBase {
         FizzClientQuicHandshakeContext::Builder().build());
     auto result =
         conn->streamManager->refreshTransportSettings(transportSettings);
-    CHECK(!result.hasError()) << "Failed to refresh transport settings";
+    MVCHECK(!result.hasError(), "Failed to refresh transport settings");
     result = conn->streamManager->setMaxLocalBidirectionalStreams(maxStreams);
-    CHECK(!result.hasError())
-        << "Failed to set max local bidirectional streams";
+    MVCHECK(
+        !result.hasError(), "Failed to set max local bidirectional streams");
     conn->flowControlState.peerAdvertisedMaxOffset = maxOffset;
     conn->flowControlState.peerAdvertisedInitialMaxStreamOffsetBidiRemote =
         initialMaxOffset;
@@ -706,7 +683,7 @@ TEST_P(QuicPacketSchedulerTest, WriteOnlyOutstandingPacketsTest) {
   // written packet should not have any frame in the builder
   auto& writtenPacket = *result->packet;
   auto shortHeader = writtenPacket.packet.header.asShort();
-  CHECK(shortHeader);
+  MVCHECK(shortHeader);
   EXPECT_EQ(ProtectionType::KeyPhaseOne, shortHeader->getProtectionType());
   EXPECT_EQ(
       conn.ackStates.appDataAckState.nextPacketNum,
@@ -716,7 +693,7 @@ TEST_P(QuicPacketSchedulerTest, WriteOnlyOutstandingPacketsTest) {
   EXPECT_GE(writtenPacket.packet.frames.size(), 1);
   auto& writtenFrame = writtenPacket.packet.frames.at(0);
   auto maxDataFrame = writtenFrame.asMaxDataFrame();
-  CHECK(maxDataFrame);
+  MVCHECK(maxDataFrame);
   for (auto& frame : writtenPacket.packet.frames) {
     bool present = false;
     /* the next four frames should not be written */
@@ -1288,7 +1265,7 @@ TEST_P(QuicPacketSchedulerTest, CloningSchedulerWithInplaceBuilderFullPacket) {
   EXPECT_EQ(conn.udpSendPacketLen, bufferLength);
   auto updateResult = updateConnection(
       conn,
-      *CHECK_NOTNULL(conn.pathManager->getPath(conn.currentPathId)),
+      *MVCHECK_NOTNULL(conn.pathManager->getPath(conn.currentPathId)),
       std::nullopt,
       result->packet->packet,
       Clock::now(),
@@ -1369,7 +1346,7 @@ TEST_P(QuicPacketSchedulerTest, CloneLargerThanOriginalPacket) {
   EXPECT_EQ(encodedSize, conn.udpSendPacketLen);
   auto updateResult = updateConnection(
       conn,
-      *CHECK_NOTNULL(conn.pathManager->getPath(conn.currentPathId)),
+      *MVCHECK_NOTNULL(conn.pathManager->getPath(conn.currentPathId)),
       std::nullopt,
       packetResult->packet->packet,
       Clock::now(),
@@ -1531,39 +1508,6 @@ TEST_P(QuicPacketSchedulerTest, StreamFrameSchedulerRoundRobin) {
   auto result2 = scheduler.writeStreams(*builder2);
   ASSERT_FALSE(result2.hasError());
   verifyStreamFrames(*builder2, {f2, f3, f1});
-}
-
-TEST_P(QuicPacketSchedulerTest, StreamFrameSchedulerRoundRobinNextsPer) {
-  auto connPtr = createConn(10, 100000, 100000, GetParam());
-  auto& conn = *connPtr;
-  conn.streamManager->setWriteQueueMaxNextsPerStream(2);
-  StreamFrameScheduler scheduler(conn);
-
-  auto stream1 = createStream(conn);
-  auto stream2 = createStream(conn);
-  auto stream3 = createStream(conn);
-
-  auto largeBuf = createLargeBuffer(conn.udpSendPacketLen * 2);
-  auto f1 = writeDataToStream(conn, stream1, std::move(largeBuf));
-  auto f2 = writeDataToStream(conn, stream2, "some data");
-  auto f3 = writeDataToStream(conn, stream3, "some data");
-
-  // Should write frames for stream1, stream1, stream2, stream3, followed >
-  // stream1 again.
-  auto builder2 =
-      setupMockPacketBuilder({1500, 0, 1400, 0, 1300, 1100, 1000, 0});
-  auto result2 = scheduler.writeStreams(*builder2);
-  ASSERT_FALSE(result2.hasError());
-  builder2->advanceRemaining();
-  ASSERT_EQ(nextScheduledStreamID(conn), stream1);
-  ASSERT_EQ(builder2->frames_.size(), 1);
-  ASSERT_FALSE(scheduler.writeStreams(*builder2).hasError());
-  ASSERT_EQ(builder2->frames_.size(), 2);
-  ASSERT_EQ(nextScheduledStreamID(conn), stream2);
-  builder2->advanceRemaining();
-  ASSERT_FALSE(scheduler.writeStreams(*builder2).hasError());
-  ASSERT_FALSE(scheduler.writeStreams(*builder2).hasError());
-  verifyStreamFrames(*builder2, {stream1, stream1, stream2, stream3, stream1});
 }
 
 TEST_P(QuicPacketSchedulerTest, StreamFrameSchedulerRoundRobinStreamPerPacket) {
@@ -1878,7 +1822,7 @@ TEST_P(QuicPacketSchedulerTest, WriteLossWithoutFlowControl) {
   ASSERT_FALSE(
       updateConnection(
           conn,
-          *CHECK_NOTNULL(conn.pathManager->getPath(conn.currentPathId)),
+          *MVCHECK_NOTNULL(conn.pathManager->getPath(conn.currentPathId)),
           std::nullopt,
           packet1,
           Clock::now(),
@@ -1914,7 +1858,7 @@ TEST_P(QuicPacketSchedulerTest, WriteLossWithoutFlowControl) {
   ASSERT_FALSE(
       updateConnection(
           conn,
-          *CHECK_NOTNULL(conn.pathManager->getPath(conn.currentPathId)),
+          *MVCHECK_NOTNULL(conn.pathManager->getPath(conn.currentPathId)),
           std::nullopt,
           packet2,
           Clock::now(),
@@ -1964,7 +1908,7 @@ TEST_P(QuicPacketSchedulerTest, WriteLossWithoutFlowControlSequential) {
   ASSERT_FALSE(
       updateConnection(
           conn,
-          *CHECK_NOTNULL(conn.pathManager->getPath(conn.currentPathId)),
+          *MVCHECK_NOTNULL(conn.pathManager->getPath(conn.currentPathId)),
           std::nullopt,
           packet1,
           Clock::now(),
@@ -2000,7 +1944,7 @@ TEST_P(QuicPacketSchedulerTest, WriteLossWithoutFlowControlSequential) {
   ASSERT_FALSE(
       updateConnection(
           conn,
-          *CHECK_NOTNULL(conn.pathManager->getPath(conn.currentPathId)),
+          *MVCHECK_NOTNULL(conn.pathManager->getPath(conn.currentPathId)),
           std::nullopt,
           packet2,
           Clock::now(),
@@ -2056,7 +2000,7 @@ TEST_P(QuicPacketSchedulerTest, MultipleStreamsRunOutOfFlowControl) {
   auto packet1 = std::move(builder1).buildPacket().packet;
   ASSERT_TRUE(updateConnection(
       conn,
-      *CHECK_NOTNULL(conn.pathManager->getPath(conn.currentPathId)),
+      *MVCHECK_NOTNULL(conn.pathManager->getPath(conn.currentPathId)),
       std::nullopt,
       packet1,
       Clock::now(),
@@ -2097,7 +2041,7 @@ TEST_P(QuicPacketSchedulerTest, MultipleStreamsRunOutOfFlowControl) {
   auto packet2 = std::move(builder2).buildPacket().packet;
   ASSERT_TRUE(updateConnection(
       conn,
-      *CHECK_NOTNULL(conn.pathManager->getPath(conn.currentPathId)),
+      *MVCHECK_NOTNULL(conn.pathManager->getPath(conn.currentPathId)),
       std::nullopt,
       packet2,
       Clock::now(),
@@ -2152,7 +2096,7 @@ TEST_P(QuicPacketSchedulerTest, RunOutFlowControlDuringStreamWrite) {
   ASSERT_FALSE(
       updateConnection(
           conn,
-          *CHECK_NOTNULL(conn.pathManager->getPath(conn.currentPathId)),
+          *MVCHECK_NOTNULL(conn.pathManager->getPath(conn.currentPathId)),
           std::nullopt,
           packet1,
           Clock::now(),
@@ -2622,7 +2566,7 @@ TEST_P(QuicPacketSchedulerTest, RstStreamSchedulerReliableReset) {
   ASSERT_FALSE(
       updateConnection(
           conn,
-          *CHECK_NOTNULL(conn.pathManager->getPath(conn.currentPathId)),
+          *MVCHECK_NOTNULL(conn.pathManager->getPath(conn.currentPathId)),
           std::nullopt,
           packetResult1.value().packet->packet,
           Clock::now(),
@@ -2653,7 +2597,7 @@ TEST_P(QuicPacketSchedulerTest, RstStreamSchedulerReliableReset) {
   ASSERT_FALSE(
       updateConnection(
           conn,
-          *CHECK_NOTNULL(conn.pathManager->getPath(conn.currentPathId)),
+          *MVCHECK_NOTNULL(conn.pathManager->getPath(conn.currentPathId)),
           std::nullopt,
           packetResult2.value().packet->packet,
           Clock::now(),

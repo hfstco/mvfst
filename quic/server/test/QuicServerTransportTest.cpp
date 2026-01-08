@@ -3517,9 +3517,12 @@ class QuicServerTransportHandshakeTest
 
   void expectWriteNewSessionTicket() override {
     std::string appParams("APP params");
-    server->setEarlyDataAppParamsFunctions(
-        [](const Optional<std::string>&, const BufPtr&) { return false; },
-        [=]() -> BufPtr { return folly::IOBuf::copyBuffer(appParams); });
+    earlyDataHandler_.validateFn = [](const Optional<std::string>&,
+                                      const BufPtr&) { return false; };
+    earlyDataHandler_.getFn = [=]() -> BufPtr {
+      return folly::IOBuf::copyBuffer(appParams);
+    };
+    server->setEarlyDataAppParamsHandler(&earlyDataHandler_);
     EXPECT_CALL(*getFakeHandshakeLayer(), writeNewSessionTicket(_))
         .WillOnce(Invoke(
             [=, this](
@@ -3876,25 +3879,6 @@ TEST_F(QuicServerTransportTest, TestAutotuneStreamFlowControlKnobHandler) {
             TransportKnobParamId::AUTOTUNE_RECV_STREAM_FLOW_CONTROL),
         .val = uint64_t(0)}});
   EXPECT_FALSE(transportSettings.autotuneReceiveStreamFlowControl);
-}
-
-TEST_F(QuicServerTransportTest, TestInflightReorderingThreshold) {
-  auto& transportSettings = server->getNonConstConn().transportSettings;
-
-  // autotuneReceiveStreamFlowControl is disabled by default
-  ASSERT_FALSE(transportSettings.useInflightReorderingThreshold);
-
-  server->handleKnobParams(
-      {{.id = static_cast<uint64_t>(
-            TransportKnobParamId::INFLIGHT_REORDERING_THRESHOLD),
-        .val = uint64_t(1)}});
-  EXPECT_TRUE(transportSettings.useInflightReorderingThreshold);
-
-  server->handleKnobParams(
-      {{.id = static_cast<uint64_t>(
-            TransportKnobParamId::INFLIGHT_REORDERING_THRESHOLD),
-        .val = uint64_t(0)}});
-  EXPECT_FALSE(transportSettings.useInflightReorderingThreshold);
 }
 
 TEST_F(QuicServerTransportTest, TestPacerExperimentalKnobHandler) {

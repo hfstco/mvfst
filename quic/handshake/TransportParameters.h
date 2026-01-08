@@ -12,6 +12,7 @@
 #include <quic/codec/QuicInteger.h>
 #include <quic/codec/Types.h>
 #include <quic/common/Expected.h>
+#include <quic/common/MvfstLogging.h>
 
 namespace quic {
 
@@ -42,7 +43,6 @@ enum class TransportParameterId : uint64_t {
   max_receive_timestamps_per_ack = 0xff0a002,
   receive_timestamps_exponent = 0xff0a003,
   extended_ack_features = 0xff0a004,
-  stream_groups_enabled = 0x0000ff99,
   knob_frames_supported = 0x00005178,
   cwnd_hint_bytes = 0x00007492,
   client_direct_encap = 0x000042fc,
@@ -101,10 +101,10 @@ struct TransportParameter {
     // write parameter; need to improve QuicInteger encoding methods
     BufWriter writer(res->writableData(), res->capacity());
     auto appenderOp = [&](auto val) { writer.writeBE(val); };
-    CHECK(encodeQuicInteger(u64_tp(parameter), appenderOp));
+    MVCHECK(encodeQuicInteger(u64_tp(parameter), appenderOp));
 
     // write size of value
-    CHECK(encodeQuicInteger(value->computeChainDataLength(), appenderOp));
+    MVCHECK(encodeQuicInteger(value->computeChainDataLength(), appenderOp));
 
     // write value if present
     if (value) {

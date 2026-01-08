@@ -35,7 +35,6 @@ quic::Expected<Optional<uint64_t>, QuicError> writeStreamFrameHeader(
     uint64_t flowControlLen,
     bool fin,
     Optional<bool> skipLenHint,
-    OptionalIntegral<StreamGroupId> streamGroupId,
     bool appendFrame) {
   if (builder.remainingSpaceInPkt() == 0) {
     return std::nullopt;
@@ -46,29 +45,14 @@ quic::Expected<Optional<uint64_t>, QuicError> writeStreamFrameHeader(
         "No data or fin supplied when writing stream."));
   }
   StreamTypeField::Builder streamTypeBuilder;
-  if (streamGroupId) {
-    streamTypeBuilder.switchToStreamGroups();
-  }
   QuicInteger idInt(id);
-  Optional<QuicInteger> groupIdInt;
-  if (streamGroupId) {
-    groupIdInt = QuicInteger(*streamGroupId);
-  }
 
-  // First account for the things that are non-optional: frame type, stream id
-  // and (optional) group id.
+  // First account for the things that are non-optional: frame type, stream id.
   auto idIntSize = idInt.getSize();
   if (idIntSize.hasError()) {
     return quic::make_unexpected(idIntSize.error());
   }
   uint64_t headerSize = sizeof(uint8_t) + idIntSize.value();
-  if (groupIdInt) {
-    auto groupIdIntSize = groupIdInt->getSize();
-    if (groupIdIntSize.hasError()) {
-      return quic::make_unexpected(groupIdIntSize.error());
-    }
-    headerSize += groupIdIntSize.value();
-  }
   if (builder.remainingSpaceInPkt() < headerSize) {
     MVVLOG(4) << "No space in packet for stream header. stream=" << id
               << " remaining=" << builder.remainingSpaceInPkt();
@@ -117,7 +101,7 @@ quic::Expected<Optional<uint64_t>, QuicError> writeStreamFrameHeader(
     } else {
       // This should never really happen as dataLen is bounded by the remaining
       // space in the packet which should be << kEightByteLimit.
-      MVLOG_FATAL << "Stream frame length too large.";
+      MVCHECK(false, "Stream frame length too large.");
     }
   }
   if (dataLenLen > 0) {
@@ -154,9 +138,6 @@ quic::Expected<Optional<uint64_t>, QuicError> writeStreamFrameHeader(
   auto streamType = streamTypeBuilder.build();
   builder.writeBE(streamType.fieldValue());
   builder.write(idInt);
-  if (groupIdInt) {
-    builder.write(*groupIdInt);
-  }
   if (offset != 0) {
     builder.write(offsetInt);
   }
@@ -164,8 +145,8 @@ quic::Expected<Optional<uint64_t>, QuicError> writeStreamFrameHeader(
     builder.write(QuicInteger(dataLen));
   }
   if (appendFrame) {
-    builder.appendFrame(WriteStreamFrame(
-        id, offset, dataLen, streamType.hasFin(), streamGroupId));
+    builder.appendFrame(
+        WriteStreamFrame(id, offset, dataLen, streamType.hasFin()));
   } else {
     builder.markNonEmpty();
   }
@@ -217,8 +198,9 @@ quic::Expected<Optional<WriteCryptoFrame>, QuicError> writeCryptoFrame(
     return quic::make_unexpected(lengthVarIntSizeRes.error());
   }
 
-  CHECK(lengthVarIntSizeRes.value() <= lengthBytes)
-      << "Length bytes representation exceeds allocated space";
+  MVCHECK(
+      lengthVarIntSizeRes.value() <= lengthBytes,
+      "Length bytes representation exceeds allocated space");
   builder.write(intFrameType);
   builder.write(offsetInteger);
   builder.write(lengthVarInt);
@@ -249,7 +231,7 @@ quic::Expected<Optional<WriteCryptoFrame>, QuicError> writeCryptoFrame(
        ++blockItr) {
     const auto& currBlock = *blockItr;
     // These must be true because of the properties of the interval set.
-    CHECK_GE(currentSeqNum, currBlock.end + 2);
+    MVCHECK_GE(currentSeqNum, currBlock.end + 2);
     PacketNum gap = currentSeqNum - currBlock.end - 2;
     PacketNum currBlockLen = currBlock.end - currBlock.start;
 
@@ -437,7 +419,7 @@ fillFrameWithPacketReceiveTimestamps(
           nextTimestampRangeUsedSpace + deltasCountSizeResult.value();
       ackFrame.recvdPacketsTimestampRanges.push_back(nextTimestampRange);
       prevPktNum = timestampIntervalsIt->start;
-      DCHECK(cumUsedSpace <= spaceLeft);
+      MVDCHECK(cumUsedSpace <= spaceLeft);
     }
     if (outOfSpace) {
       break;
@@ -448,7 +430,7 @@ fillFrameWithPacketReceiveTimestamps(
   if (computedSizeResult.hasError()) {
     return quic::make_unexpected(computedSizeResult.error());
   }
-  DCHECK(cumUsedSpace == computedSizeResult.value());
+  MVDCHECK(cumUsedSpace == computedSizeResult.value());
   return ackFrame.recvdPacketsTimestampRanges.size();
 }
 
@@ -541,7 +523,7 @@ maybeWriteAckBaseFields(
   for (auto it = ackFrame.ackBlocks.cbegin() + 1;
        it != ackFrame.ackBlocks.cend();
        ++it) {
-    CHECK_GE(currentSeqNum, it->end + 2);
+    MVCHECK_GE(currentSeqNum, it->end + 2);
     PacketNum gap = currentSeqNum - it->end - 2;
     PacketNum currBlockLen = it->end - it->start;
     QuicInteger gapInt(gap);
@@ -997,7 +979,7 @@ quic::Expected<size_t, QuicError> writeSimpleFrame(
     case QuicSimpleFrame::Type::HandshakeDoneFrame: {
       const HandshakeDoneFrame& handshakeDoneFrame =
           *frame.asHandshakeDoneFrame();
-      CHECK(builder.getPacketHeader().asShort());
+      MVCHECK(builder.getPacketHeader().asShort());
       QuicInteger intFrameType(static_cast<uint8_t>(FrameType::HANDSHAKE_DONE));
 
       auto intFrameTypeSize = intFrameType.getSize();
@@ -1457,7 +1439,7 @@ quic::Expected<size_t, QuicError> writeFrame(
       return size_t(0);
     }
     default: {
-      MVLOG_FATAL << "Unknown / unsupported frame type received";
+      MVCHECK(false, "Unknown / unsupported frame type received");
     }
   }
 }

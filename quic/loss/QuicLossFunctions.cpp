@@ -208,7 +208,7 @@ quic::Expected<void, QuicError> markPacketLoss(
         if (bufferItr == cryptoStream->retransmissionBuffer.end()) {
           break;
         }
-        DCHECK_EQ(bufferItr->second->offset, frame.offset);
+        MVDCHECK_EQ(bufferItr->second->offset, frame.offset);
         cryptoStream->insertIntoLossBuffer(std::move(bufferItr->second));
         cryptoStream->retransmissionBuffer.erase(bufferItr);
         break;
@@ -311,12 +311,6 @@ quic::Expected<bool, QuicError> processOutstandingsForLoss(
     const auto reorderDistance = largestAckedForComparison - currentPacketNum;
     auto reorderingThreshold = conn.lossState.reorderingThreshold;
 
-    if (conn.transportSettings.useInflightReorderingThreshold) {
-      reorderingThreshold = std::max(
-          conn.lossState.reorderingThreshold,
-          std::min<uint32_t>(
-              conn.outstandings.numOutstanding() / 2, kMaxReorderingThreshold));
-    }
     const auto& skippedPacketNum = getAckState(conn, pnSpace).skippedPacketNum;
     if (skippedPacketNum && skippedPacketNum.value() >= currentPacketNum &&
         skippedPacketNum.value() <= largestAckedForComparison) {
@@ -333,7 +327,7 @@ quic::Expected<bool, QuicError> processOutstandingsForLoss(
     }
 
     if (pkt.maybeClonedPacketIdentifier) {
-      CHECK(conn.outstandings.clonedPacketCount[pnSpace]);
+      MVCHECK(conn.outstandings.clonedPacketCount[pnSpace]);
       --conn.outstandings.clonedPacketCount[pnSpace];
     }
 
@@ -355,7 +349,7 @@ quic::Expected<bool, QuicError> processOutstandingsForLoss(
           *pkt.maybeClonedPacketIdentifier);
     }
     if (!processed) {
-      CHECK(conn.outstandings.packetCount[currentPacketNumberSpace]);
+      MVCHECK(conn.outstandings.packetCount[currentPacketNumberSpace]);
       --conn.outstandings.packetCount[currentPacketNumberSpace];
     }
 
@@ -477,7 +471,7 @@ detectLossPackets(
   }
 
   if (lossEvent.largestLostPacketNum.has_value()) {
-    DCHECK(lossEvent.largestLostSentTime && lossEvent.smallestLostSentTime);
+    MVDCHECK(lossEvent.largestLostSentTime && lossEvent.smallestLostSentTime);
     QLOG(
         conn,
         addPacketsLost,

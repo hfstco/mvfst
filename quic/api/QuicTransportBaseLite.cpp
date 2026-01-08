@@ -19,6 +19,9 @@
 #include <quic/state/QuicPacingFunctions.h>
 #include <quic/state/QuicStreamFunctions.h>
 #include <quic/state/stream/StreamSendHandlers.h>
+
+#include <folly/ScopeGuard.h>
+
 #include <sstream>
 
 namespace {
@@ -50,6 +53,183 @@ inline std::ostream& operator<<(
   return os;
 }
 
+std::ostream& operator<<(std::ostream& out, const LooperType& rhs) {
+  switch (rhs) {
+    case LooperType::ReadLooper:
+      out << "ReadLooper";
+      break;
+    case LooperType::PeekLooper:
+      out << "PeekLooper";
+      break;
+    case LooperType::WriteLooper:
+      out << "WriteLooper";
+      break;
+    default:
+      out << "unknown";
+      break;
+  }
+  return out;
+}
+
+using namespace std::chrono_literals;
+
+// TransportLooper implementation
+
+QuicTransportBaseLite::TransportLooper::TransportLooper(
+    std::shared_ptr<QuicEventBase> evb,
+    QuicTransportBaseLite* transport,
+    LooperType type)
+    : evb_(std::move(evb)),
+      transport_(transport),
+      type_(type),
+      running_(false),
+      inLoopBody_(false),
+      fireLoopEarly_(false),
+      hasPacingCallback_(false) {
+  DCHECK(transport_);
+}
+
+void QuicTransportBaseLite::TransportLooper::setPacingTimer(
+    QuicTimer::SharedPtr pacingTimer) noexcept {
+  pacingTimer_ = std::move(pacingTimer);
+}
+
+void QuicTransportBaseLite::TransportLooper::enablePacingCallback() noexcept {
+  hasPacingCallback_ = true;
+}
+
+void QuicTransportBaseLite::TransportLooper::commonLoopBody() noexcept {
+  inLoopBody_ = true;
+  SCOPE_EXIT {
+    inLoopBody_ = false;
+  };
+  auto hasBeenRunning = running_;
+  transport_->onLooperCallback(type_);
+  // callback could cause us to stop ourselves.
+  // Someone could have also called run() in the callback.
+  MVVLOG(10) << __func__ << ": " << type_
+             << " hasBeenRunning=" << hasBeenRunning
+             << " running_=" << running_;
+  if (!running_) {
+    return;
+  }
+  if (!schedulePacingTimeout()) {
+    evb_->runInLoop(this);
+  }
+}
+
+bool QuicTransportBaseLite::TransportLooper::schedulePacingTimeout() noexcept {
+  if (hasPacingCallback_ && (pacingTimer_ || evb_) &&
+      !isTimerCallbackScheduled()) {
+    auto timeUntilWrite = transport_->getLooperPacingDelay();
+    if (timeUntilWrite != 0us) {
+      nextPacingTime_ = Clock::now() + timeUntilWrite;
+      if (pacingTimer_) {
+        pacingTimer_->scheduleTimeout(this, timeUntilWrite);
+        return true;
+      }
+      if (evb_) {
+        evb_->scheduleTimeoutHighRes(this, timeUntilWrite);
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+void QuicTransportBaseLite::TransportLooper::runLoopCallback() noexcept {
+  folly::DelayedDestruction::DestructorGuard dg(this);
+  commonLoopBody();
+}
+
+void QuicTransportBaseLite::TransportLooper::run(bool thisIteration) noexcept {
+  MVVLOG(10) << __func__ << ": " << type_;
+  running_ = true;
+  // Caller can call run() in the callback. But if we are in pacing mode, we
+  // should prevent such loop.
+  if (pacingTimer_ && inLoopBody_) {
+    MVVLOG(4) << __func__ << ": " << type_
+              << " in loop body and using pacing - not rescheduling";
+    return;
+  }
+  if (isLoopCallbackScheduled() ||
+      (!fireLoopEarly_ && hasPacingCallback_ && isTimerCallbackScheduled())) {
+    MVVLOG(10) << __func__ << ": " << type_ << " already scheduled";
+    return;
+  }
+  // If we are pacing, we're about to write again, if it's close, just write
+  // now.
+  if (hasPacingCallback_ && isTimerCallbackScheduled()) {
+    auto n = Clock::now();
+    auto timeUntilWrite = nextPacingTime_ < n
+        ? 0us
+        : std::chrono::duration_cast<std::chrono::milliseconds>(
+              nextPacingTime_ - n);
+    if (timeUntilWrite <= 1ms) {
+      cancelTimerCallback();
+      // The next loop is good enough
+      thisIteration = false;
+    } else {
+      return;
+    }
+  }
+  evb_->runInLoop(this, thisIteration);
+}
+
+void QuicTransportBaseLite::TransportLooper::stop() noexcept {
+  MVVLOG(10) << __func__ << ": " << type_;
+  running_ = false;
+  if (evb_) {
+    cancelLoopCallback();
+  }
+  cancelTimerCallback();
+}
+
+bool QuicTransportBaseLite::TransportLooper::isRunning() const {
+  return running_;
+}
+
+bool QuicTransportBaseLite::TransportLooper::isPacingScheduled() {
+  return hasPacingCallback_ && isTimerCallbackScheduled();
+}
+
+bool QuicTransportBaseLite::TransportLooper::isLoopCallbackScheduled() {
+  return QuicEventBaseLoopCallback::isLoopCallbackScheduled();
+}
+
+void QuicTransportBaseLite::TransportLooper::attachEventBase(
+    std::shared_ptr<QuicEventBase> evb) {
+  MVVLOG(10) << __func__ << ": " << type_;
+  DCHECK(!evb_);
+  DCHECK(evb && evb->isInEventBaseThread());
+  evb_ = std::move(evb);
+}
+
+void QuicTransportBaseLite::TransportLooper::detachEventBase() {
+  MVVLOG(10) << __func__ << ": " << type_;
+  DCHECK(evb_ && evb_->isInEventBaseThread());
+  stop();
+  cancelTimerCallback();
+  evb_ = nullptr;
+}
+
+void QuicTransportBaseLite::TransportLooper::timeoutExpired() noexcept {
+  folly::DelayedDestruction::DestructorGuard dg(this);
+  commonLoopBody();
+}
+
+void QuicTransportBaseLite::TransportLooper::callbackCanceled() noexcept {
+  return;
+}
+
+OptionalMicros
+QuicTransportBaseLite::TransportLooper::getTimerTickInterval() noexcept {
+  if (pacingTimer_) {
+    return pacingTimer_->getTickInterval();
+  }
+  return std::nullopt;
+}
+
 QuicTransportBaseLite::QuicTransportBaseLite(
     std::shared_ptr<QuicEventBase> evb,
     std::unique_ptr<QuicAsyncUDPSocket> socket,
@@ -64,14 +244,8 @@ QuicTransportBaseLite::QuicTransportBaseLite(
       ackTimeout_(this),
       pathValidationTimeout_(this),
       drainTimeout_(this),
-      writeLooper_(new FunctionLooper(
-          evb_,
-          [this]() { pacedWriteDataToSocket(); },
-          LooperType::WriteLooper)),
-      readLooper_(new FunctionLooper(
-          evb_,
-          [this]() { invokeReadDataAndCallbacks(true); },
-          LooperType::ReadLooper)) {}
+      writeLooper_(new TransportLooper(evb_, this, LooperType::WriteLooper)),
+      readLooper_(new TransportLooper(evb_, this, LooperType::ReadLooper)) {}
 
 QuicTransportBaseLite::~QuicTransportBaseLite() {
   resetConnectionCallbacks();
@@ -79,8 +253,29 @@ QuicTransportBaseLite::~QuicTransportBaseLite() {
 
   // closeImpl and closeUdpSocket should have been triggered by destructor of
   // derived class to ensure that observers are properly notified
-  DCHECK_NE(CloseState::OPEN, closeState_);
-  DCHECK(!socket_.get()); // should be no socket
+  MVDCHECK_NE(CloseState::OPEN, closeState_);
+  MVDCHECK(!socket_.get()); // should be no socket
+}
+
+void QuicTransportBaseLite::onLooperCallback(LooperType type) {
+  switch (type) {
+    case LooperType::WriteLooper:
+      pacedWriteDataToSocket();
+      break;
+    case LooperType::ReadLooper:
+      invokeReadDataAndCallbacks(true);
+      break;
+    case LooperType::PeekLooper:
+      invokePeekDataAndCallbacks();
+      break;
+  }
+}
+
+std::chrono::microseconds QuicTransportBaseLite::getLooperPacingDelay() {
+  if (isConnectionPaced(*conn_)) {
+    return conn_->pacer->getTimeUntilNextWrite();
+  }
+  return std::chrono::microseconds::zero();
 }
 
 void QuicTransportBaseLite::onNetworkData(
@@ -144,8 +339,6 @@ void QuicTransportBaseLite::onNetworkData(
         closeImpl(QuicError(
             QuicErrorCode(TransportErrorCode::NO_ERROR), "Peer closed"));
         return;
-      } else if (conn_->transportSettings.processCallbacksPerPacket) {
-        invokeReadDataAndCallbacks(false);
       }
     }
 
@@ -195,27 +388,9 @@ void QuicTransportBaseLite::onNetworkData(
         closeImpl(result.error());
       }
     }
-  } catch (const QuicTransportException& ex) {
-    MVVLOG(4) << __func__ << " " << ex.what() << " " << *this;
-    exceptionCloseWhat_ = ex.what();
-    return closeImpl(
-        QuicError(QuicErrorCode(ex.errorCode()), std::string(ex.what())));
-  } catch (const QuicInternalException& ex) {
-    MVVLOG(4) << __func__ << " " << ex.what() << " " << *this;
-    exceptionCloseWhat_ = ex.what();
-    return closeImpl(
-        QuicError(QuicErrorCode(ex.errorCode()), std::string(ex.what())));
-  } catch (const QuicApplicationException& ex) {
-    MVVLOG(4) << __func__ << " " << ex.what() << " " << *this;
-    exceptionCloseWhat_ = ex.what();
-    return closeImpl(
-        QuicError(QuicErrorCode(ex.errorCode()), std::string(ex.what())));
   } catch (const std::exception& ex) {
-    MVVLOG(4) << __func__ << " " << ex.what() << " " << *this;
-    exceptionCloseWhat_ = ex.what();
-    return closeImpl(QuicError(
-        QuicErrorCode(TransportErrorCode::INTERNAL_ERROR),
-        std::string("error onNetworkData()")));
+    handleExceptionAndClose(ex, "error onNetworkData()");
+    return;
   }
 }
 
@@ -232,7 +407,7 @@ void QuicTransportBaseLite::close(Optional<QuicError> errorCode) {
 }
 
 void QuicTransportBaseLite::closeNow(Optional<QuicError> errorCode) {
-  DCHECK(getEventBase() && getEventBase()->isInEventBaseThread());
+  MVDCHECK(getEventBase() && getEventBase()->isInEventBaseThread());
   [[maybe_unused]] auto self = sharedGuard();
   MVVLOG(4) << __func__ << " " << *this;
   errorCode = maybeSetGenericAppError(std::move(errorCode));
@@ -367,28 +542,9 @@ QuicSocketLite::WriteResult QuicTransportBaseLite::writeChain(
       conn_->pacer->reset();
     }
     updateWriteLooper(true);
-  } catch (const QuicTransportException& ex) {
-    MVVLOG(4) << __func__ << " streamId=" << id << " " << ex.what() << " "
-              << *this;
-    exceptionCloseWhat_ = ex.what();
-    closeImpl(QuicError(
-        QuicErrorCode(ex.errorCode()), std::string("writeChain() error")));
-    return quic::make_unexpected(LocalErrorCode::TRANSPORT_ERROR);
-  } catch (const QuicInternalException& ex) {
-    MVVLOG(4) << __func__ << " streamId=" << id << " " << ex.what() << " "
-              << *this;
-    exceptionCloseWhat_ = ex.what();
-    closeImpl(QuicError(
-        QuicErrorCode(ex.errorCode()), std::string("writeChain() error")));
-    return quic::make_unexpected(ex.errorCode());
   } catch (const std::exception& ex) {
-    MVVLOG(4) << __func__ << " streamId=" << id << " " << ex.what() << " "
-              << *this;
-    exceptionCloseWhat_ = ex.what();
-    closeImpl(QuicError(
-        QuicErrorCode(TransportErrorCode::INTERNAL_ERROR),
-        std::string("writeChain() error")));
-    return quic::make_unexpected(LocalErrorCode::INTERNAL_ERROR);
+    return quic::make_unexpected(
+        handleExceptionAndClose(ex, "writeChain() error", id));
   }
   return {};
 }
@@ -755,25 +911,8 @@ QuicTransportBaseLite::read(StreamId id, size_t maxLen) {
     }
     return quic::Expected<std::pair<BufPtr, bool>, LocalErrorCode>(
         std::move(result));
-  } catch (const QuicTransportException& ex) {
-    MVVLOG(4) << "read() error " << ex.what() << " " << *this;
-    exceptionCloseWhat_ = ex.what();
-    closeImpl(
-        QuicError(QuicErrorCode(ex.errorCode()), std::string("read() error")));
-    return quic::make_unexpected(LocalErrorCode::TRANSPORT_ERROR);
-  } catch (const QuicInternalException& ex) {
-    MVVLOG(4) << __func__ << " " << ex.what() << " " << *this;
-    exceptionCloseWhat_ = ex.what();
-    closeImpl(
-        QuicError(QuicErrorCode(ex.errorCode()), std::string("read() error")));
-    return quic::make_unexpected(ex.errorCode());
   } catch (const std::exception& ex) {
-    MVVLOG(4) << "read()  error " << ex.what() << " " << *this;
-    exceptionCloseWhat_ = ex.what();
-    closeImpl(QuicError(
-        QuicErrorCode(TransportErrorCode::INTERNAL_ERROR),
-        std::string("read() error")));
-    return quic::make_unexpected(LocalErrorCode::INTERNAL_ERROR);
+    return quic::make_unexpected(handleExceptionAndClose(ex, "read() error"));
   }
 }
 
@@ -783,9 +922,9 @@ void QuicTransportBaseLite::setQLogger(std::shared_ptr<QLogger> qLogger) {
   // of times it gets reset, and only stop qlog collection when the number of
   // resets equals the number of times the logger was set
   if (!conn_->qLogger) {
-    CHECK_EQ(qlogRefcnt_, 0);
+    MVCHECK_EQ(qlogRefcnt_, 0);
   } else {
-    CHECK_GT(qlogRefcnt_, 0);
+    MVCHECK_GT(qlogRefcnt_, 0);
   }
 
   if (qLogger) {
@@ -851,7 +990,7 @@ quic::Expected<void, LocalErrorCode> QuicTransportBaseLite::setMaxPacingRate(
 
 void QuicTransportBaseLite::setThrottlingSignalProvider(
     std::shared_ptr<ThrottlingSignalProvider> throttlingSignalProvider) {
-  DCHECK(conn_);
+  MVDCHECK(conn_);
   conn_->throttlingSignalProvider = throttlingSignalProvider;
 }
 
@@ -898,7 +1037,6 @@ QuicTransportBaseLite::ByteEventMap& QuicTransportBaseLite::getByteEventMap(
     case ByteEvent::Type::TX:
       return txCallbacks_;
   }
-  MVLOG_FATAL << "Unhandled case in getByteEventMap";
   folly::assume_unreachable();
 }
 
@@ -910,7 +1048,6 @@ QuicTransportBaseLite::getByteEventMapConst(const ByteEvent::Type type) const {
     case ByteEvent::Type::TX:
       return txCallbacks_;
   }
-  MVLOG_FATAL << "Unhandled case in getByteEventMapConst";
   folly::assume_unreachable();
 }
 
@@ -1044,13 +1181,7 @@ void QuicTransportBaseLite::updateReadLooper() {
       conn_->streamManager->readableStreams().begin(),
       conn_->streamManager->readableStreams().end(),
       matcherFn);
-  auto unidirIter = std::find_if(
-      conn_->streamManager->readableUnidirectionalStreams().begin(),
-      conn_->streamManager->readableUnidirectionalStreams().end(),
-      matcherFn);
   if (iter != conn_->streamManager->readableStreams().end() ||
-      unidirIter !=
-          conn_->streamManager->readableUnidirectionalStreams().end() ||
       !conn_->datagramState.readBuffer.empty()) {
     MVVLOG(10) << "Scheduling read looper " << *this;
     readLooper_->run();
@@ -1184,24 +1315,8 @@ void QuicTransportBaseLite::writeSocketDataAndCatch() {
       return;
     }
     processCallbacksAfterWriteData();
-  } catch (const QuicTransportException& ex) {
-    MVVLOG(4) << __func__ << ex.what() << " " << *this;
-    exceptionCloseWhat_ = ex.what();
-    closeImpl(QuicError(
-        QuicErrorCode(ex.errorCode()),
-        std::string("writeSocketDataAndCatch()  error")));
-  } catch (const QuicInternalException& ex) {
-    MVVLOG(4) << __func__ << ex.what() << " " << *this;
-    exceptionCloseWhat_ = ex.what();
-    closeImpl(QuicError(
-        QuicErrorCode(ex.errorCode()),
-        std::string("writeSocketDataAndCatch()  error")));
   } catch (const std::exception& ex) {
-    MVVLOG(4) << __func__ << " error=" << ex.what() << " " << *this;
-    exceptionCloseWhat_ = ex.what();
-    closeImpl(QuicError(
-        QuicErrorCode(TransportErrorCode::INTERNAL_ERROR),
-        std::string("writeSocketDataAndCatch()  error")));
+    handleExceptionAndClose(ex, "writeSocketDataAndCatch() error");
   }
 }
 
@@ -1299,12 +1414,12 @@ quic::Expected<void, QuicError> QuicTransportBaseLite::writeSocketData() {
           conn_->lossState.totalAckElicitingPacketsSent;
       const auto afterNumOutstandingPackets =
           conn_->outstandings.numOutstanding();
-      CHECK_LE(beforeTotalPacketsSent, afterTotalPacketsSent);
-      CHECK_LE(
+      MVCHECK_LE(beforeTotalPacketsSent, afterTotalPacketsSent);
+      MVCHECK_LE(
           beforeTotalAckElicitingPacketsSent,
           afterTotalAckElicitingPacketsSent);
-      CHECK_LE(beforeNumOutstandingPackets, afterNumOutstandingPackets);
-      CHECK_EQ(
+      MVCHECK_LE(beforeNumOutstandingPackets, afterNumOutstandingPackets);
+      MVCHECK_EQ(
           afterNumOutstandingPackets - beforeNumOutstandingPackets,
           afterTotalAckElicitingPacketsSent -
               beforeTotalAckElicitingPacketsSent);
@@ -1452,7 +1567,7 @@ void QuicTransportBaseLite::closeImpl(
   updatePacingOnClose(*conn_);
   auto cancelCode = QuicError(
       QuicErrorCode(LocalErrorCode::NO_ERROR),
-      toString(LocalErrorCode::NO_ERROR).str());
+      toString(LocalErrorCode::NO_ERROR));
   if (conn_->peerConnectionError) {
     cancelCode = *conn_->peerConnectionError;
   } else if (errorCode) {
@@ -1573,7 +1688,7 @@ void QuicTransportBaseLite::closeImpl(
       drainConnection && !isReset && !isAbandon && !isInvalidMigration;
   if (drainConnection) {
     // We ever drain once, and the object ever gets created once.
-    DCHECK(!isTimeoutScheduled(&drainTimeout_));
+    MVDCHECK(!isTimeoutScheduled(&drainTimeout_));
     scheduleTimeout(
         &drainTimeout_,
         folly::chrono::ceil<std::chrono::milliseconds>(
@@ -1581,6 +1696,43 @@ void QuicTransportBaseLite::closeImpl(
   } else {
     drainTimeoutExpired();
   }
+}
+
+LocalErrorCode QuicTransportBaseLite::handleExceptionAndClose(
+    const std::exception& ex,
+    folly::StringPiece contextMsg,
+    Optional<StreamId> streamId) {
+  // Log with optional stream context
+  if (streamId.has_value()) {
+    MVVLOG(4) << contextMsg << " streamId=" << *streamId << " " << ex.what()
+              << " " << *this;
+  } else {
+    MVVLOG(4) << contextMsg << " " << ex.what() << " " << *this;
+  }
+
+  exceptionCloseWhat_ = ex.what();
+
+  // Determine error code and return value based on exception type
+  if (auto* transportEx = dynamic_cast<const QuicTransportException*>(&ex)) {
+    closeImpl(QuicError(
+        QuicErrorCode(transportEx->errorCode()), std::string(contextMsg)));
+    return LocalErrorCode::TRANSPORT_ERROR;
+  }
+  if (auto* internalEx = dynamic_cast<const QuicInternalException*>(&ex)) {
+    closeImpl(QuicError(
+        QuicErrorCode(internalEx->errorCode()), std::string(contextMsg)));
+    return internalEx->errorCode();
+  }
+  if (auto* appEx = dynamic_cast<const QuicApplicationException*>(&ex)) {
+    closeImpl(
+        QuicError(QuicErrorCode(appEx->errorCode()), std::string(contextMsg)));
+    return LocalErrorCode::TRANSPORT_ERROR;
+  }
+  // Fallback for unknown std::exception
+  closeImpl(QuicError(
+      QuicErrorCode(TransportErrorCode::INTERNAL_ERROR),
+      std::string(contextMsg)));
+  return LocalErrorCode::INTERNAL_ERROR;
 }
 
 void QuicTransportBaseLite::processCallbacksAfterNetworkData() {
@@ -1595,11 +1747,6 @@ void QuicTransportBaseLite::processCallbacksAfterNetworkData() {
   std::vector<StreamId> tempStorage;
 
   handleNewStreamCallbacks(tempStorage);
-  if (closeState_ != CloseState::OPEN) {
-    return;
-  }
-
-  handleNewGroupedStreamCallbacks(tempStorage);
   if (closeState_ != CloseState::OPEN) {
     return;
   }
@@ -1715,28 +1862,9 @@ quic::Expected<void, LocalErrorCode> QuicTransportBaseLite::resetStreamInternal(
 
     pendingWriteCallbacks_.erase(id);
     QUIC_STATS(conn_->statsCallback, onQuicStreamReset, errorCode);
-  } catch (const QuicTransportException& ex) {
-    MVVLOG(4) << __func__ << " streamId=" << id << " " << ex.what() << " "
-              << *this;
-    exceptionCloseWhat_ = ex.what();
-    closeImpl(QuicError(
-        QuicErrorCode(ex.errorCode()), std::string("resetStream() error")));
-    return quic::make_unexpected(LocalErrorCode::TRANSPORT_ERROR);
-  } catch (const QuicInternalException& ex) {
-    MVVLOG(4) << __func__ << " streamId=" << id << " " << ex.what() << " "
-              << *this;
-    exceptionCloseWhat_ = ex.what();
-    closeImpl(QuicError(
-        QuicErrorCode(ex.errorCode()), std::string("resetStream() error")));
-    return quic::make_unexpected(ex.errorCode());
   } catch (const std::exception& ex) {
-    MVVLOG(4) << __func__ << " streamId=" << id << " " << ex.what() << " "
-              << *this;
-    exceptionCloseWhat_ = ex.what();
-    closeImpl(QuicError(
-        QuicErrorCode(TransportErrorCode::INTERNAL_ERROR),
-        std::string("resetStream() error")));
-    return quic::make_unexpected(LocalErrorCode::INTERNAL_ERROR);
+    return quic::make_unexpected(
+        handleExceptionAndClose(ex, "resetStream() error", id));
   }
   return {};
 }
@@ -1744,7 +1872,7 @@ quic::Expected<void, LocalErrorCode> QuicTransportBaseLite::resetStreamInternal(
 void QuicTransportBaseLite::cancelByteEventCallbacksForStreamInternal(
     const ByteEvent::Type type,
     const StreamId id,
-    const std::function<bool(uint64_t)>& offsetFilter) {
+    FunctionRef<bool(uint64_t)> offsetFilter) {
   if (isReceivingStream(conn_->nodeType, id)) {
     return;
   }
@@ -1898,26 +2026,11 @@ void QuicTransportBaseLite::handleNewStreamCallbacks(
   handleNewStreams(streamStorage);
 }
 
-void QuicTransportBaseLite::handleNewGroupedStreamCallbacks(
-    std::vector<StreamId>& streamStorage) {
-  auto newStreamGroups = conn_->streamManager->consumeNewPeerStreamGroups();
-  for (auto newStreamGroupId : newStreamGroups) {
-    if (isBidirectionalStream(newStreamGroupId)) {
-      connCallback_->onNewBidirectionalStreamGroup(newStreamGroupId);
-    } else {
-      connCallback_->onNewUnidirectionalStreamGroup(newStreamGroupId);
-    }
-  }
-
-  streamStorage = conn_->streamManager->consumeNewGroupedPeerStreams();
-  handleNewGroupedStreams(streamStorage);
-}
-
 void QuicTransportBaseLite::handleDeliveryCallbacks() {
   auto deliverableStreamId = conn_->streamManager->popDeliverable();
   while (deliverableStreamId.has_value()) {
     auto streamId = *deliverableStreamId;
-    auto stream = CHECK_NOTNULL(
+    auto stream = MVCHECK_NOTNULL(
         conn_->streamManager->getStream(streamId).value_or(nullptr));
     auto maxOffsetToDeliver = getLargestDeliverableOffset(*stream);
 
@@ -1965,7 +2078,7 @@ void QuicTransportBaseLite::handleStreamFlowControlUpdatedCallbacks(
   streamStorage = conn_->streamManager->consumeFlowControlUpdated();
   const auto& flowControlUpdated = streamStorage;
   for (auto streamId : flowControlUpdated) {
-    auto stream = CHECK_NOTNULL(
+    auto stream = MVCHECK_NOTNULL(
         conn_->streamManager->getStream(streamId).value_or(nullptr));
     if (!stream->writable()) {
       pendingWriteCallbacks_.erase(streamId);
@@ -1976,7 +2089,7 @@ void QuicTransportBaseLite::handleStreamFlowControlUpdatedCallbacks(
       return;
     }
     // In case the callback modified the stream map, get it again.
-    stream = CHECK_NOTNULL(
+    stream = MVCHECK_NOTNULL(
         conn_->streamManager->getStream(streamId).value_or(nullptr));
     auto maxStreamWritable = maxWritableOnStream(*stream);
     if (maxStreamWritable != 0 && !pendingWriteCallbacks_.empty()) {
@@ -2025,7 +2138,7 @@ void QuicTransportBaseLite::handleConnWritable() {
       auto streamId = writeCallbackIt->first;
       auto wcb = writeCallbackIt->second;
       ++writeCallbackIt;
-      auto stream = CHECK_NOTNULL(
+      auto stream = MVCHECK_NOTNULL(
           conn_->streamManager->getStream(streamId).value_or(nullptr));
       if (!stream->writable()) {
         pendingWriteCallbacks_.erase(streamId);
@@ -2057,7 +2170,7 @@ QuicTransportBaseLite::handleInitialWriteDataCommon(
     const ConnectionId& dstConnId,
     uint64_t packetLimit,
     const std::string& token) {
-  CHECK(conn_->initialWriteCipher);
+  MVCHECK(conn_->initialWriteCipher);
   auto version = conn_->version.value_or(*(conn_->originalVersion));
   auto& initialCryptoStream =
       *getCryptoStream(*conn_->cryptoState, EncryptionLevel::Initial);
@@ -2069,7 +2182,7 @@ QuicTransportBaseLite::handleInitialWriteDataCommon(
        numProbePackets) ||
       initialScheduler.hasData() || toWriteInitialAcks(*conn_) ||
       hasBufferedDataToWrite(*conn_)) {
-    CHECK(conn_->initialHeaderCipher);
+    MVCHECK(conn_->initialHeaderCipher);
     return writeCryptoAndAckDataToSocket(
         *socket_,
         *conn_,
@@ -2091,7 +2204,7 @@ QuicTransportBaseLite::handleHandshakeWriteDataCommon(
     const ConnectionId& dstConnId,
     uint64_t packetLimit) {
   auto version = conn_->version.value_or(*(conn_->originalVersion));
-  CHECK(conn_->handshakeWriteCipher);
+  MVCHECK(conn_->handshakeWriteCipher);
   auto& handshakeCryptoStream =
       *getCryptoStream(*conn_->cryptoState, EncryptionLevel::Handshake);
   CryptoStreamScheduler handshakeScheduler(*conn_, handshakeCryptoStream);
@@ -2101,7 +2214,7 @@ QuicTransportBaseLite::handleHandshakeWriteDataCommon(
        handshakeCryptoStream.retransmissionBuffer.size() && numProbePackets) ||
       handshakeScheduler.hasData() || toWriteHandshakeAcks(*conn_) ||
       hasBufferedDataToWrite(*conn_)) {
-    CHECK(conn_->handshakeWriteHeaderCipher);
+    MVCHECK(conn_->handshakeWriteHeaderCipher);
     return writeCryptoAndAckDataToSocket(
         *socket_,
         *conn_,
@@ -2137,19 +2250,15 @@ void QuicTransportBaseLite::closeUdpSocket() {
 }
 
 quic::Expected<StreamId, LocalErrorCode>
-QuicTransportBaseLite::createStreamInternal(
-    bool bidirectional,
-    const OptionalIntegral<StreamGroupId>& streamGroupId) {
+QuicTransportBaseLite::createStreamInternal(bool bidirectional) {
   if (closeState_ != CloseState::OPEN) {
     return quic::make_unexpected(LocalErrorCode::CONNECTION_CLOSED);
   }
   quic::Expected<QuicStreamState*, LocalErrorCode> streamResult;
   if (bidirectional) {
-    streamResult =
-        conn_->streamManager->createNextBidirectionalStream(streamGroupId);
+    streamResult = conn_->streamManager->createNextBidirectionalStream();
   } else {
-    streamResult =
-        conn_->streamManager->createNextUnidirectionalStream(streamGroupId);
+    streamResult = conn_->streamManager->createNextUnidirectionalStream();
   }
   if (!streamResult.has_value()) {
     return quic::make_unexpected(streamResult.error());
@@ -2190,7 +2299,7 @@ void QuicTransportBaseLite::excessWriteTimeoutExpired() noexcept {
 }
 
 void QuicTransportBaseLite::lossTimeoutExpired() noexcept {
-  CHECK_NE(closeState_, CloseState::CLOSED);
+  MVCHECK_NE(closeState_, CloseState::CLOSED);
   // onLossDetectionAlarm will set packetToSend in pending events
   [[maybe_unused]] auto self = sharedGuard();
   try {
@@ -2202,24 +2311,8 @@ void QuicTransportBaseLite::lossTimeoutExpired() noexcept {
     }
 
     pacedWriteDataToSocket();
-  } catch (const QuicTransportException& ex) {
-    MVVLOG(4) << __func__ << " " << ex.what() << " " << *this;
-    exceptionCloseWhat_ = ex.what();
-    closeImpl(QuicError(
-        QuicErrorCode(ex.errorCode()),
-        std::string("lossTimeoutExpired() error")));
-  } catch (const QuicInternalException& ex) {
-    MVVLOG(4) << __func__ << " " << ex.what() << " " << *this;
-    exceptionCloseWhat_ = ex.what();
-    closeImpl(QuicError(
-        QuicErrorCode(ex.errorCode()),
-        std::string("lossTimeoutExpired() error")));
   } catch (const std::exception& ex) {
-    MVVLOG(4) << __func__ << "  " << ex.what() << " " << *this;
-    exceptionCloseWhat_ = ex.what();
-    closeImpl(QuicError(
-        QuicErrorCode(TransportErrorCode::INTERNAL_ERROR),
-        std::string("lossTimeoutExpired() error")));
+    handleExceptionAndClose(ex, "lossTimeoutExpired() error");
   }
 }
 
@@ -2228,7 +2321,7 @@ void QuicTransportBaseLite::idleTimeoutExpired(bool drain) noexcept {
   [[maybe_unused]] auto self = sharedGuard();
   // idle timeout is expired, just close the connection and drain or
   // send connection close immediately depending on 'drain'
-  DCHECK_NE(closeState_, CloseState::CLOSED);
+  MVDCHECK_NE(closeState_, CloseState::CLOSED);
   auto localError =
       drain ? LocalErrorCode::IDLE_TIMEOUT : LocalErrorCode::SHUTTING_DOWN;
   auto sendCloseImmediately =
@@ -2256,7 +2349,7 @@ void QuicTransportBaseLite::keepaliveTimeoutExpired() noexcept {
 }
 
 void QuicTransportBaseLite::ackTimeoutExpired() noexcept {
-  CHECK_NE(closeState_, CloseState::CLOSED);
+  MVCHECK_NE(closeState_, CloseState::CLOSED);
   MVVLOG(10) << __func__ << " " << *this;
   [[maybe_unused]] auto self = sharedGuard();
   updateAckStateOnAckTimeout(*conn_);
@@ -2356,13 +2449,7 @@ void QuicTransportBaseLite::cancelAllAppCallbacks(
       continue;
     }
     if (it->second.readCb) {
-      auto stream = CHECK_NOTNULL(
-          conn_->streamManager->getStream(streamId).value_or(nullptr));
-      if (!stream->groupId) {
-        it->second.readCb->readError(streamId, err);
-      } else {
-        it->second.readCb->readErrorWithGroup(streamId, *stream->groupId, err);
-      }
+      it->second.readCb->readError(streamId, err);
     }
     readCallbacks_.erase(it);
   }
@@ -2521,18 +2608,8 @@ void QuicTransportBaseLite::invokeReadDataAndCallbacks(
   std::vector<StreamId> readableStreamsCopy;
 
   const auto& readableStreams = self->conn_->streamManager->readableStreams();
-  const auto& readableUnidirectionalStreams =
-      self->conn_->streamManager->readableUnidirectionalStreams();
 
-  readableStreamsCopy.reserve(
-      readableStreams.size() + readableUnidirectionalStreams.size());
-
-  if (self->conn_->transportSettings.unidirectionalStreamsReadCallbacksFirst) {
-    std::copy(
-        readableUnidirectionalStreams.begin(),
-        readableUnidirectionalStreams.end(),
-        std::back_inserter(readableStreamsCopy));
-  }
+  readableStreamsCopy.reserve(readableStreams.size());
 
   std::copy(
       readableStreams.begin(),
@@ -2550,42 +2627,26 @@ void QuicTransportBaseLite::invokeReadDataAndCallbacks(
       continue;
     }
     auto readCb = callback->second.readCb;
-    auto stream = CHECK_NOTNULL(
+    auto stream = MVCHECK_NOTNULL(
         conn_->streamManager->getStream(streamId).value_or(nullptr));
     if (readCb && stream->streamReadError &&
         (!stream->reliableSizeFromPeer ||
          *stream->reliableSizeFromPeer <= stream->currentReadOffset)) {
       // If we got a reliable reset from the peer, we don't fire the readError
       // callback and remove it until we've read all of the reliable data.
-      if (self->conn_->transportSettings
-              .unidirectionalStreamsReadCallbacksFirst &&
-          isUnidirectionalStream(streamId)) {
-        self->conn_->streamManager->readableUnidirectionalStreams().erase(
-            streamId);
-      } else {
-        self->conn_->streamManager->readableStreams().erase(streamId);
-      }
+      self->conn_->streamManager->readableStreams().erase(streamId);
       readCallbacks_.erase(callback);
       // if there is an error on the stream - it's not readable anymore, so
       // we cannot peek into it as well.
       self->conn_->streamManager->peekableStreams().erase(streamId);
       MVVLOG(10) << "invoking read error callbacks on stream=" << streamId
                  << " " << *this;
-      if (!stream->groupId) {
-        readCb->readError(streamId, QuicError(*stream->streamReadError));
-      } else {
-        readCb->readErrorWithGroup(
-            streamId, *stream->groupId, QuicError(*stream->streamReadError));
-      }
+      readCb->readError(streamId, QuicError(*stream->streamReadError));
     } else if (
         readCb && callback->second.resumed && stream->hasReadableData()) {
       MVVLOG(10) << "invoking read callbacks on stream=" << streamId << " "
                  << *this;
-      if (!stream->groupId) {
-        readCb->readAvailable(streamId);
-      } else {
-        readCb->readAvailableWithGroup(streamId, *stream->groupId);
-      }
+      readCb->readAvailable(streamId);
     }
   }
 
@@ -2643,7 +2704,7 @@ Optional<folly::SocketCmsgMap>
 QuicTransportBaseLite::getAdditionalCmsgsForAsyncUDPSocket() {
   if (conn_->socketCmsgsState.additionalCmsgs) {
     // This callback should be happening for the target write
-    DCHECK(conn_->writeCount == conn_->socketCmsgsState.targetWriteCount);
+    MVDCHECK(conn_->writeCount == conn_->socketCmsgsState.targetWriteCount);
     return conn_->socketCmsgsState.additionalCmsgs;
   }
   return std::nullopt;
@@ -2759,11 +2820,11 @@ void QuicTransportBaseLite::processCallbacksAfterWriteData() {
   auto txStreamId = conn_->streamManager->popTx();
   while (txStreamId.has_value()) {
     auto streamId = *txStreamId;
-    auto stream = CHECK_NOTNULL(
+    auto stream = MVCHECK_NOTNULL(
         conn_->streamManager->getStream(streamId).value_or(nullptr));
     auto largestOffsetTxed = getLargestWriteOffsetTxed(*stream);
     // if it's in the set of streams with TX, we should have a valid offset
-    CHECK(largestOffsetTxed.has_value());
+    MVCHECK(largestOffsetTxed.has_value());
 
     // lambda to help get the next callback to call for this stream
     auto getNextTxCallbackForStreamAndCleanup =
@@ -2860,7 +2921,7 @@ void QuicTransportBaseLite::setTransportSettings(
   } else {
     // TODO: We should let chain based GSO to use bufAccessor in the future as
     // well.
-    CHECK(
+    MVCHECK(
         conn_->bufAccessor ||
         transportSettings.dataPathType != DataPathType::ContinuousMemory);
     conn_->transportSettings = std::move(transportSettings);
@@ -2892,12 +2953,7 @@ void QuicTransportBaseLite::setTransportSettings(
   validateCongestionAndPacing(
       conn_->transportSettings.defaultCongestionController);
   if (conn_->transportSettings.pacingEnabled) {
-    writeLooper_->setPacingFunction([this]() -> auto {
-      if (isConnectionPaced(*conn_)) {
-        return conn_->pacer->getTimeUntilNextWrite();
-      }
-      return 0us;
-    });
+    writeLooper_->enablePacingCallback();
     bool usingBbr =
         (conn_->transportSettings.defaultCongestionController ==
              CongestionControlType::BBR ||
@@ -2936,10 +2992,10 @@ void QuicTransportBaseLite::setTransportSettings(
 }
 
 void QuicTransportBaseLite::setCongestionControl(CongestionControlType type) {
-  DCHECK(conn_);
+  MVDCHECK(conn_);
   if (!conn_->congestionController ||
       type != conn_->congestionController->type()) {
-    CHECK(conn_->congestionControllerFactory);
+    MVCHECK(conn_->congestionControllerFactory);
     validateCongestionAndPacing(type);
     conn_->congestionController =
         conn_->congestionControllerFactory->makeCongestionController(
@@ -2958,15 +3014,15 @@ void QuicTransportBaseLite::setSupportedVersions(
 
 void QuicTransportBaseLite::setCongestionControllerFactory(
     std::shared_ptr<CongestionControllerFactory> ccFactory) {
-  CHECK(ccFactory);
-  CHECK(conn_);
+  MVCHECK(ccFactory);
+  MVCHECK(conn_);
   conn_->congestionControllerFactory = ccFactory;
   conn_->congestionController.reset();
 }
 
 void QuicTransportBaseLite::addPacketProcessor(
     std::shared_ptr<PacketProcessor> packetProcessor) {
-  DCHECK(conn_);
+  MVDCHECK(conn_);
   conn_->packetProcessors.push_back(std::move(packetProcessor));
 }
 
@@ -3116,7 +3172,7 @@ quic::Expected<void, QuicError> QuicTransportBaseLite::validateECNState() {
 
   if (conn_->ecnState == ECNState::FailedValidation) {
     conn_->socketTos.fields.ecn = 0;
-    CHECK(socket_ && socket_->isBound());
+    MVCHECK(socket_ && socket_->isBound());
     auto result = socket_->setTosOrTrafficClass(conn_->socketTos.value);
     if (!result.has_value()) {
       return result;
@@ -3276,35 +3332,11 @@ void QuicTransportBaseLite::handleNewStreams(
     std::vector<StreamId>& streamStorage) {
   const auto& newPeerStreamIds = streamStorage;
   for (const auto& streamId : newPeerStreamIds) {
-    CHECK_NOTNULL(connCallback_.get());
+    MVCHECK_NOTNULL(connCallback_.get());
     if (isBidirectionalStream(streamId)) {
       connCallback_->onNewBidirectionalStream(streamId);
     } else {
       connCallback_->onNewUnidirectionalStream(streamId);
-    }
-
-    logStreamOpenEvent(streamId);
-    if (closeState_ != CloseState::OPEN) {
-      return;
-    }
-  }
-  streamStorage.clear();
-}
-
-void QuicTransportBaseLite::handleNewGroupedStreams(
-    std::vector<StreamId>& streamStorage) {
-  const auto& newPeerStreamIds = streamStorage;
-  for (const auto& streamId : newPeerStreamIds) {
-    CHECK_NOTNULL(connCallback_.get());
-    auto stream = CHECK_NOTNULL(
-        conn_->streamManager->getStream(streamId).value_or(nullptr));
-    CHECK(stream->groupId);
-    if (isBidirectionalStream(streamId)) {
-      connCallback_->onNewBidirectionalStreamInGroup(
-          streamId, *stream->groupId);
-    } else {
-      connCallback_->onNewUnidirectionalStreamInGroup(
-          streamId, *stream->groupId);
     }
 
     logStreamOpenEvent(streamId);
@@ -3381,7 +3413,7 @@ void QuicTransportBaseLite::updateCongestionControlSettings(
 }
 
 void QuicTransportBaseLite::describe(std::ostream& os) const {
-  CHECK(conn_);
+  MVCHECK(conn_);
   os << *conn_;
 }
 

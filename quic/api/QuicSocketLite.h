@@ -13,6 +13,7 @@
 #include <quic/api/QuicCallbacks.h>
 #include <quic/api/TransportInfo.h>
 #include <quic/codec/Types.h>
+#include <quic/common/MvfstLogging.h>
 #include <quic/common/udpsocket/QuicAsyncUDPSocket.h>
 #include <quic/handshake/HandshakeLayer.h>
 #include <quic/handshake/TransportParameters.h>
@@ -94,36 +95,10 @@ class QuicSocketLite {
     virtual void onNewBidirectionalStream(StreamId id) noexcept = 0;
 
     /**
-     * Invoked when the peer creates a new bidirectional stream group.
-     */
-    virtual void onNewBidirectionalStreamGroup(StreamGroupId) noexcept {}
-
-    /**
-     * Invoked when the peer creates a new bidirectional stream in a specific
-     * group.
-     */
-    virtual void onNewBidirectionalStreamInGroup(
-        StreamId,
-        StreamGroupId) noexcept {}
-
-    /**
      * Invoked when the peer creates a new unidirectional stream.  The most
      * common flow would be to set the ReadCallback from here
      */
     virtual void onNewUnidirectionalStream(StreamId id) noexcept = 0;
-
-    /**
-     * Invoked when the peer creates a new unidirectional stream group.
-     */
-    virtual void onNewUnidirectionalStreamGroup(StreamGroupId) noexcept {}
-
-    /**
-     * Invoked when the peer creates a new unidirectional stream in a specific
-     * group.
-     */
-    virtual void onNewUnidirectionalStreamInGroup(
-        StreamId,
-        StreamGroupId) noexcept {}
 
     /**
      * Invoked when a given stream has been closed and its state is about to
@@ -371,13 +346,13 @@ class QuicSocketLite {
     }
 
     void onByteEvent(ByteEvent byteEvent) final {
-      CHECK_EQ((int)ByteEvent::Type::ACK, (int)byteEvent.type); // sanity
+      MVCHECK_EQ((int)ByteEvent::Type::ACK, (int)byteEvent.type); // sanity
       onDeliveryAck(byteEvent.id, byteEvent.offset, byteEvent.srtt);
     }
 
     // Temporary shim during transition to ByteEvent
     void onByteEventCanceled(ByteEventCancellation cancellation) final {
-      CHECK_EQ((int)ByteEvent::Type::ACK, (int)cancellation.type); // sanity
+      MVCHECK_EQ((int)ByteEvent::Type::ACK, (int)cancellation.type); // sanity
       onCanceled(cancellation.id, cancellation.offset);
     }
   };

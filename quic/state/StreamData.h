@@ -157,7 +157,7 @@ struct QuicStreamLike {
       }
     }();
     if (lenAdjustment && len == 0) {
-      MVLOG_FATAL << "ACK for empty stream frame with no fin.";
+      MVCHECK(false, "ACK for empty stream frame with no fin.");
     }
     return ackedIntervals.tryInsert(offset, offset + len - lenAdjustment);
   }
@@ -343,11 +343,6 @@ struct QuicStreamState : public QuicStreamLike {
 
   QuicStreamState(StreamId id, QuicConnectionStateBase& conn);
 
-  QuicStreamState(
-      StreamId idIn,
-      const OptionalIntegral<StreamGroupId>& groupIdIn,
-      QuicConnectionStateBase& connIn);
-
   QuicStreamState(QuicStreamState&&) = default;
 
   /**
@@ -355,10 +350,7 @@ struct QuicStreamState : public QuicStreamLike {
    * QuicConnectionStateBase.
    */
   QuicStreamState(QuicConnectionStateBase& connIn, QuicStreamState&& other)
-      : QuicStreamLike(std::move(other)),
-        conn(connIn),
-        id(other.id),
-        groupId(other.groupId) {
+      : QuicStreamLike(std::move(other)), conn(connIn), id(other.id) {
     // QuicStreamState fields
     finalWriteOffset = other.finalWriteOffset;
     flowControlState = other.flowControlState;
@@ -372,6 +364,8 @@ struct QuicStreamState : public QuicStreamLike {
     holbCount = other.holbCount;
     priority = other.priority;
     streamLossCount = other.streamLossCount;
+    inLossSet_ = other.inLossSet_;
+    retransmissionDisabled_ = other.retransmissionDisabled_;
   }
 
   // Connection that this stream is associated with.
@@ -379,9 +373,6 @@ struct QuicStreamState : public QuicStreamLike {
 
   // Stream id of the connection.
   StreamId id;
-
-  // ID of the group the stream belongs to.
-  OptionalIntegral<StreamGroupId> groupId;
 
   // Write side eof offset. This represents only the final FIN offset.
   Optional<uint64_t> finalWriteOffset;
@@ -433,6 +424,14 @@ struct QuicStreamState : public QuicStreamLike {
 
   uint64_t streamLossCount{0};
 
+  // Tracks if this stream is currently counted in the connection-level
+  // numStreamsWithLoss counter. Used to avoid double-counting.
+  bool inLossSet_{false};
+
+  // If true, retransmissions are disabled for this stream (data lost will not
+  // be retransmitted).
+  bool retransmissionDisabled_{false};
+
   // Returns true if both send and receive state machines are in a terminal
   // state
   [[nodiscard]] bool inTerminalStates() const {
@@ -459,7 +458,7 @@ struct QuicStreamState : public QuicStreamLike {
   // needs to have data in the pendingWrites chain, or it has EOF to send.
   [[nodiscard]] bool hasWritableData(bool connFlowControlOpen = true) const {
     if (!pendingWrites.empty()) {
-      CHECK_GE(flowControlState.peerAdvertisedMaxOffset, currentWriteOffset);
+      MVCHECK_GE(flowControlState.peerAdvertisedMaxOffset, currentWriteOffset);
       return connFlowControlOpen &&
           flowControlState.peerAdvertisedMaxOffset - currentWriteOffset > 0;
     }

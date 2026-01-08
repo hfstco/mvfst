@@ -15,6 +15,8 @@
 #include <quic/common/BufAccessor.h>
 #include <quic/common/CircularDeque.h>
 #include <quic/common/Expected.h>
+#include <quic/common/FunctionRef.h>
+#include <quic/common/MvfstLogging.h>
 #include <quic/congestion_control/CongestionController.h>
 #include <quic/congestion_control/PacketProcessor.h>
 #include <quic/congestion_control/ThrottlingSignalProvider.h>
@@ -25,11 +27,11 @@
 #include <quic/state/AckEvent.h>
 #include <quic/state/AckStates.h>
 #include <quic/state/ClonedPacketIdentifier.h>
+#include <quic/state/EarlyDataAppParamsHandler.h>
 #include <quic/state/LossState.h>
 #include <quic/state/OutstandingPacket.h>
 #include <quic/state/QuicConnectionStats.h>
 #include <quic/state/QuicPathManager.h>
-#include <quic/state/QuicStreamGroupRetransmissionPolicy.h>
 #include <quic/state/QuicStreamManager.h>
 #include <quic/state/QuicTransportStatsCallback.h>
 #include <quic/state/StreamData.h>
@@ -72,7 +74,8 @@ struct OutstandingsInfo {
 
   // Number of packets outstanding and not declared lost.
   uint64_t numOutstanding() {
-    CHECK_GE(packets.size(), declaredLostCount + scheduledForDestructionCount);
+    MVCHECK_GE(
+        packets.size(), declaredLostCount + scheduledForDestructionCount);
     return packets.size() - declaredLostCount - scheduledForDestructionCount;
   }
 
@@ -99,7 +102,7 @@ class AppLimitedTracker {
    * Mark the connection as application limited.
    */
   void setAppLimited() {
-    DCHECK(!isAppLimited_);
+    MVDCHECK(!isAppLimited_);
     isAppLimited_ = true;
     appLimitedStartTime_ = Clock::now();
   }
@@ -108,7 +111,7 @@ class AppLimitedTracker {
    * Mark the connection as not being application limited.
    */
   void setNotAppLimited() {
-    DCHECK(isAppLimited_);
+    MVDCHECK(isAppLimited_);
     isAppLimited_ = false;
     totalAppLimitedTime_ +=
         std::chrono::duration_cast<std::chrono::microseconds>(
@@ -612,11 +615,10 @@ struct QuicConnectionStateBase : public folly::DelayedDestruction {
   std::shared_ptr<LoopDetectorCallback> loopDetectorCallback;
 
   /**
-   * Eerie data app params functions.
+   * Early data app params handler.
+   * Non-owning pointer - application must ensure handler outlives connection.
    */
-  std::function<bool(const Optional<std::string>&, const BufPtr&)>
-      earlyDataAppParamsValidator;
-  std::function<BufPtr()> earlyDataAppParamsGetter;
+  EarlyDataAppParamsHandler* earlyDataAppParamsHandler{nullptr};
 
   // Get the next available peer connection id and mark it as used.
   // If the caller decides not to use the returned connection id, it must retire
@@ -698,9 +700,6 @@ struct QuicConnectionStateBase : public folly::DelayedDestruction {
 
   DatagramState datagramState;
 
-  // Peer max stream groups advertised.
-  OptionalIntegral<uint64_t> peerAdvertisedMaxStreamGroups;
-
   // Sequence number to use for the next ACK_FREQUENCY frame
   uint64_t nextAckFrequencyFrameSequenceNumber{0};
 
@@ -719,10 +718,6 @@ struct QuicConnectionStateBase : public folly::DelayedDestruction {
   // so cache them once we've receive the relevant transport parameters.
   bool negotiatedAckReceiveTimestampSupport{false};
   ExtendedAckFeatureMaskType negotiatedExtendedAckFeatures{0};
-
-  // Retransmission policies map.
-  UnorderedMap<StreamGroupId, QuicStreamGroupRetransmissionPolicy>
-      retransmissionPolicies;
 
   struct SocketCmsgsState {
     Optional<folly::SocketCmsgMap> additionalCmsgs;
@@ -796,7 +791,7 @@ struct AckStateVersion {
   bool operator!=(const AckStateVersion& other) const;
 };
 
-using LossVisitor = std::function<quic::Expected<void, QuicError>(
+using LossVisitor = FunctionRef<quic::Expected<void, QuicError>(
     QuicConnectionStateBase& conn,
     PathIdType pathId,
     RegularQuicWritePacket& packet,

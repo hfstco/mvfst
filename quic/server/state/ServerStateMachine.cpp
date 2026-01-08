@@ -260,16 +260,6 @@ quic::Expected<void, QuicError> processClientInitialParams(
   }
   auto maxDatagramFrameSize = maxDatagramFrameSizeResult.value();
 
-  auto peerAdvertisedMaxStreamGroupsResult = getIntegerParameter(
-      static_cast<TransportParameterId>(
-          TransportParameterId::stream_groups_enabled),
-      clientParams.parameters);
-  if (peerAdvertisedMaxStreamGroupsResult.hasError()) {
-    return quic::make_unexpected(peerAdvertisedMaxStreamGroupsResult.error());
-  }
-  auto peerAdvertisedMaxStreamGroups =
-      peerAdvertisedMaxStreamGroupsResult.value();
-
   auto isAckReceiveTimestampsEnabledResult = getIntegerParameter(
       TransportParameterId::ack_receive_timestamps_enabled,
       clientParams.parameters);
@@ -466,9 +456,6 @@ quic::Expected<void, QuicError> processClientInitialParams(
   conn.peerActiveConnectionIdLimit =
       activeConnectionIdLimit.value_or(kDefaultActiveConnectionIdLimit);
 
-  if (peerAdvertisedMaxStreamGroups) {
-    conn.peerAdvertisedMaxStreamGroups = *peerAdvertisedMaxStreamGroups;
-  }
   if (isAckReceiveTimestampsEnabled.has_value() &&
       isAckReceiveTimestampsEnabled.value() == 1) {
     if (maxReceiveTimestampsPerAck.has_value() &&
@@ -604,13 +591,13 @@ quic::Expected<void, QuicError> updateHandshakeState(
       std::move(handshakeReadHeaderCipherResult.value());
 
   if (handshakeReadCipher) {
-    CHECK(handshakeReadHeaderCipher);
+    MVCHECK(handshakeReadHeaderCipher);
     conn.readCodec->setHandshakeReadCipher(std::move(handshakeReadCipher));
     conn.readCodec->setHandshakeHeaderCipher(
         std::move(handshakeReadHeaderCipher));
   }
   if (handshakeLayer->isHandshakeDone()) {
-    CHECK(conn.oneRttWriteCipher);
+    MVCHECK(conn.oneRttWriteCipher);
     if (!conn.sentHandshakeDone) {
       sendSimpleFrame(conn, HandshakeDoneFrame());
       conn.sentHandshakeDone = true;
@@ -626,7 +613,7 @@ quic::Expected<void, QuicError> updateHandshakeState(
       // Encrypt two tuple -> (clientIp, curTimeInMs)
       TokenGenerator generator(conn.transportSettings.retryTokenSecret.value());
       auto encryptedToken = generator.encryptToken(token);
-      CHECK(encryptedToken.has_value());
+      MVCHECK(encryptedToken.has_value());
 
       sendSimpleFrame(conn, NewTokenFrame(std::move(encryptedToken.value())));
       QUIC_STATS(conn.statsCallback, onNewTokenIssued);
@@ -640,7 +627,7 @@ quic::Expected<void, QuicError> updateHandshakeState(
 bool validateAndUpdateSourceToken(
     QuicServerConnectionState& conn,
     std::vector<folly::IPAddress> sourceAddresses) {
-  DCHECK(conn.peerAddress.isInitialized());
+  MVDCHECK(conn.peerAddress.isInitialized());
   bool foundMatch = false;
   for (int ii = sourceAddresses.size() - 1; ii >= 0; --ii) {
     // TODO T33014230 subnet matching
@@ -717,16 +704,15 @@ void maybeUpdateTransportFromAppToken(
     if (maybeCwndHintBytes) {
       QUIC_STATS(conn.statsCallback, onCwndHintBytesSample, *maybeCwndHintBytes);
 
-      // Only use the cwndHint if the source address is included in the token
-      DCHECK(conn.peerAddress.isInitialized());
-      auto addressMatches =
-          std::find(
-              appToken->sourceAddresses.begin(),
-              appToken->sourceAddresses.end(),
-              conn.peerAddress.getIPAddress()) != appToken->sourceAddresses.end();
-      if (addressMatches) {
-        conn.maybeCwndHintBytes = maybeCwndHintBytes;
-      }
+    // Only use the cwndHint if the source address is included in the token
+    MVDCHECK(conn.peerAddress.isInitialized());
+    auto addressMatches =
+        std::find(
+            appToken->sourceAddresses.begin(),
+            appToken->sourceAddresses.end(),
+            conn.peerAddress.getIPAddress()) != appToken->sourceAddresses.end();
+    if (addressMatches) {
+      conn.maybeCwndHintBytes = maybeCwndHintBytes;
     }
   }
   auto maybeSavedCongestionWindowResult = getIntegerParameter(TransportParameterId::saved_congestion_window, params);
@@ -924,7 +910,7 @@ static void handleCipherUnavailable(
 quic::Expected<void, QuicError> onServerReadDataFromOpen(
     QuicServerConnectionState& conn,
     ServerEvents::ReadData& readData) {
-  CHECK_EQ(conn.state, ServerState::Open);
+  MVCHECK_EQ(conn.state, ServerState::Open);
 
   if (readData.udpPacket.buf.empty()) {
     return {};
@@ -937,7 +923,7 @@ quic::Expected<void, QuicError> onServerReadDataFromOpen(
         readData.udpPacket.buf.front()->length());
     uint8_t initialByte = 0;
     // Non-empty => at least one byte
-    CHECK(cursor.tryReadBE(initialByte));
+    MVCHECK(cursor.tryReadBE(initialByte));
     auto parsedLongHeader = parseLongHeaderInvariant(initialByte, cursor);
     if (!parsedLongHeader) {
       MVVLOG(4) << "Could not parse initial packet header";
@@ -989,12 +975,12 @@ quic::Expected<void, QuicError> onServerReadDataFromOpen(
           "Initial destination connectionid too small"));
     }
 
-    CHECK(conn.connIdAlgo) << "ConnectionIdAlgo is not set.";
-    CHECK(!conn.serverConnectionId.has_value());
-    CHECK(conn.serverConnIdParams);
+    MVCHECK(conn.connIdAlgo, "ConnectionIdAlgo is not set.");
+    MVCHECK(!conn.serverConnectionId.has_value());
+    MVCHECK(conn.serverConnIdParams);
 
     auto newServerConnIdData = conn.createAndAddNewSelfConnId();
-    CHECK(newServerConnIdData.has_value());
+    MVCHECK(newServerConnIdData.has_value());
     conn.serverConnectionId = newServerConnIdData->connId;
 
     auto customTransportParams = getSupportedExtTransportParams(conn);
@@ -1235,7 +1221,7 @@ quic::Expected<void, QuicError> onServerReadDataFromOpen(
       }
     }
 
-    CHECK(conn.clientConnectionId);
+    MVCHECK(conn.clientConnectionId);
     QLOG(conn, addPacket, regularPacket, packetSize);
 
     if (!conn.version) {
@@ -1286,20 +1272,20 @@ quic::Expected<void, QuicError> onServerReadDataFromOpen(
     if (distanceFromExpectedPacketNum > 0) {
       QUIC_STATS(conn.statsCallback, onOutOfOrderPacketReceived);
     }
-    DCHECK(hasReceivedUdpPackets(conn));
+    MVDCHECK(hasReceivedUdpPackets(conn));
 
     bool pktHasRetransmittableData = false;
     bool pktHasCryptoData = false;
     bool isNonProbingPacket = false;
     bool handshakeConfirmedThisLoop = false;
 
-    AckedPacketVisitor ackedPacketVisitor =
+    auto ackedPacketVisitor =
         [&](const OutstandingPacketWrapper& outstandingPacket) {
           return maybeVerifyPendingKeyUpdate(
               conn, outstandingPacket, regularPacket);
         };
-    AckedFrameVisitor ackedFrameVisitor = [&](const OutstandingPacketWrapper&,
-                                              const QuicWriteFrame& packetFrame)
+    auto ackedFrameVisitor = [&](const OutstandingPacketWrapper&,
+                                 const QuicWriteFrame& packetFrame)
         -> quic::Expected<void, QuicError> {
       switch (packetFrame.type()) {
         case QuicWriteFrame::Type::WriteStreamFrame: {
@@ -1340,7 +1326,7 @@ quic::Expected<void, QuicError> onServerReadDataFromOpen(
         }
         case QuicWriteFrame::Type::WriteAckFrame: {
           const WriteAckFrame& frame = *packetFrame.asWriteAckFrame();
-          DCHECK(!frame.ackBlocks.empty());
+          MVDCHECK(!frame.ackBlocks.empty());
           MVVLOG(4) << "Server received ack for largestAcked="
                     << frame.ackBlocks.front().end << " " << conn;
           commonAckVisitorForAckFrame(ackState, frame);
@@ -1496,8 +1482,7 @@ quic::Expected<void, QuicError> onServerReadDataFromOpen(
                      << " fin=" << frame.fin << " " << conn;
           pktHasRetransmittableData = true;
           isNonProbingPacket = true;
-          auto streamResult = conn.streamManager->getStream(
-              frame.streamId, frame.streamGroupId);
+          auto streamResult = conn.streamManager->getStream(frame.streamId);
           if (streamResult.hasError()) {
             return quic::make_unexpected(streamResult.error());
           }
@@ -1792,7 +1777,7 @@ quic::Expected<void, QuicError> onServerReadDataFromOpen(
 quic::Expected<void, QuicError> onServerReadDataFromClosed(
     QuicServerConnectionState& conn,
     ServerEvents::ReadData& readData) {
-  CHECK_EQ(conn.state, ServerState::Closed);
+  MVCHECK_EQ(conn.state, ServerState::Closed);
   BufQueue& udpData = readData.udpPacket.buf;
   auto packetSize = udpData.empty() ? 0 : udpData.chainLength();
   if (!conn.readCodec) {
@@ -1960,10 +1945,10 @@ void onServerCloseOpenState(QuicServerConnectionState& conn) {
 Optional<ConnectionIdData>
 QuicServerConnectionState::createAndAddNewSelfConnId() {
   // Should be set right after server transport construction.
-  CHECK(connIdAlgo);
-  CHECK(serverConnIdParams);
+  MVCHECK(connIdAlgo);
+  MVCHECK(serverConnIdParams);
 
-  CHECK(transportSettings.statelessResetTokenSecret);
+  MVCHECK(transportSettings.statelessResetTokenSecret);
 
   StatelessResetGenerator generator(
       transportSettings.statelessResetTokenSecret.value(),
