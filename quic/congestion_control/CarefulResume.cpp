@@ -27,7 +27,7 @@ namespace quic {
           && !savedCongestionWindow_ && !savedRTT_) {
           savedCongestionWindow_ = conn_.maybeSavedCongestionWindow.value();
           savedRTT_ = conn_.maybeSavedRtt.value();
-          VLOG(10) << "Careful Resume parameters set. savedCongestionWindow=" << savedCongestionWindow_
+          VLOG(1) << "Careful Resume parameters set. savedCongestionWindow=" << savedCongestionWindow_
           << " savedRTT=" << savedRTT_;
         }
 
@@ -90,7 +90,7 @@ namespace quic {
 
     startOfEpoch_ = Clock::now();
 
-    LOG(INFO) << "Entering Reconnaissance savedCongestionWindow_=" << savedCongestionWindow_ <<
+    VLOG(1) << "Entering Reconnaissance savedCongestionWindow_=" << savedCongestionWindow_ <<
       "; savedRTT_=" << savedRTT_;
     if (conn_.qLogger) {
       conn_.qLogger->addCarefulResumePhaseUpdated(stateToString(lastState_),
@@ -111,7 +111,7 @@ namespace quic {
 
     cwndBytes = savedCongestionWindow_ / 2;
 
-    LOG(INFO) << "Entering Unvalidated cwnd=" << cwndBytes <<
+    VLOG(1) << "Entering Unvalidated cwnd=" << cwndBytes <<
       "; pipeSize_=" << pipeSize_ <<
       "; firstUnvalidatedPacket_=" << firstUnvalidatedPacket_ <<
         "; lastUnvalidatedPacket_=" << lastUnvalidatedPacket_;
@@ -140,7 +140,7 @@ namespace quic {
       cwndBytes = pipeSize_;
     }
 
-    LOG(INFO) << "Entering Validating cwnd=" << cwndBytes <<
+    VLOG(1) << "Entering Validating cwnd=" << cwndBytes <<
       "; pipeSize_=" << pipeSize_ <<
       "; firstUnvalidatedPacket_=" << firstUnvalidatedPacket_ <<
         "; lastUnvalidatedPacket_=" << lastUnvalidatedPacket_;
@@ -163,7 +163,7 @@ namespace quic {
 
     cwndBytes = (pipeSize_ / 2 >= minCwnd) ? pipeSize_ / 2 : minCwnd;
 
-    LOG(INFO) << "Entering Safe Retreat cwnd=" << cwndBytes <<
+    VLOG(1) << "Entering Safe Retreat cwnd=" << cwndBytes <<
       "; pipeSize_=" << pipeSize_ <<
       "; firstUnvalidatedPacket_=" << firstUnvalidatedPacket_ <<
         "; lastUnvalidatedPacket_=" << lastUnvalidatedPacket_;
@@ -181,7 +181,7 @@ namespace quic {
 
     startOfEpoch_ = Clock::now();
 
-    LOG(INFO) << "Entering Normal cwnd=" << cwndBytes <<
+    VLOG(1) << "Entering Normal cwnd=" << cwndBytes <<
       "; pipeSize_=" << pipeSize_ <<
       "; firstUnvalidatedPacket_=" << firstUnvalidatedPacket_ <<
         "; lastUnvalidatedPacket_=" << lastUnvalidatedPacket_;

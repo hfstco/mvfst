@@ -612,7 +612,7 @@ QuicServerTransport::maybeWriteNewSessionTicket() {
     if (conn_->congestionController) {
       savedCongestionWindow = conn_->congestionController->getBDP();
       savedRtt = conn_->lossState.mrtt.count();
-      VLOG(7) << "Writing a new Careful Reume parameters to ticket with savedCongestionWindow=" << savedCongestionWindow.value()
+      VLOG(1) << "Writing a new Careful Resume parameters to ticket with savedCongestionWindow=" << savedCongestionWindow.value()
       << " and savedRtt=" << savedRtt.value();
       newSessionTicketWrittenSavedCongestionWindow_ = savedCongestionWindow;
       newSessionTicketWrittenSavedRtt_ = savedRtt;

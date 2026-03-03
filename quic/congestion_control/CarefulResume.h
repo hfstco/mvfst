@@ -98,7 +98,7 @@ struct CarefulResume {
     if (getenv("PREVIOUS_RTT") && getenv("PREVIOUS_CWND_BYTES")) {
       savedCongestionWindow_ = strtoull(getenv("PREVIOUS_CWND_BYTES"), NULL, 10);
       savedRTT_ = strtoull(getenv("PREVIOUS_RTT"), NULL, 10);
-      VLOG(10) << "Overwrite Careful Resume parameters. savedCongestionWindow=" << savedCongestionWindow_
+      VLOG(1) << "Overwrite Careful Resume parameters. savedCongestionWindow=" << savedCongestionWindow_
                << " savedRTT=" << savedRTT_;
     }
   };
