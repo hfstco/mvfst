@@ -34,9 +34,6 @@ mvfst_cpp_library(
         "fbcode//quic/state:stats_callback",
         "//quic/common:mvfst_logging",
     ],
-    exported_external_deps = [
-        "glog",
-    ],
 )
 
 mvfst_cpp_binary(
@@ -50,8 +47,5 @@ mvfst_cpp_binary(
         "//folly/init:init",
         "//folly/portability:gflags",
         "//quic/common:mvfst_logging",
-    ],
-    external_deps = [
-        "glog",
     ],
 )

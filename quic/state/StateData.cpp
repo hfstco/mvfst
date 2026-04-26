@@ -7,7 +7,6 @@
 
 #include <quic/codec/QuicInteger.h>
 #include <quic/common/Expected.h>
-#include <quic/common/MvfstLogging.h>
 #include <quic/state/OutstandingPacket.h>
 #include <quic/state/QuicStreamUtilities.h>
 #include <quic/state/StateData.h>
@@ -97,7 +96,7 @@ PacingRate::Builder&& PacingRate::Builder::setBurstSize(
 }
 
 PacingRate PacingRate::Builder::build() && {
-  return PacingRate(interval_, burstSize_);
+  return {interval_, burstSize_};
 }
 
 Expected<ConnectionId, QuicError>
@@ -145,7 +144,7 @@ void QuicConnectionStateBase::retirePeerConnectionId(ConnectionId peerCid) {
     return;
   }
 
-  pendingEvents.frames.push_back(
+  pendingEvents.frames.emplace_back(
       RetireConnectionIdFrame(cidData->sequenceNumber));
 
   peerConnectionIds.erase(cidData);

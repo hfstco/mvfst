@@ -41,6 +41,7 @@ createTicketTransportParameters(
     uint64_t initialMaxStreamsUni,
     ExtendedAckFeatureMaskType extendedAckSupport,
     Optional<uint64_t> cwndHintBytes = std::nullopt,
+    Optional<uint64_t> rttHintMs = std::nullopt,
     Optional<uint64_t> savedCongestionWindow = std::nullopt,
     Optional<uint64_t> savedRtt = std::nullopt);
 

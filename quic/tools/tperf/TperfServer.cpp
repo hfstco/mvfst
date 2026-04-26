@@ -11,6 +11,7 @@
 #include <quic/common/test/TestUtils.h>
 #include <quic/congestion_control/StaticCwndCongestionController.h>
 #include <quic/logging/FileQLogger.h>
+#include <quic/logging/oops_logger/GlogOopsLogger.h>
 #include <quic/tools/tperf/PacingObserver.h>
 #include <quic/tools/tperf/TperfServer.h>
 
@@ -440,6 +441,8 @@ class TPerfServerTransportFactory : public quic::QuicServerTransportFactory {
       std::shared_ptr<FileQLogger> qlogger = nullptr;
       setPacingObserver(qlogger, transport.get(), pacingObserver_);
     }
+    transport->setOopsLogger(std::make_shared<proto_oops::GlogOopsLogger>());
+
     serverHandler->setQuicSocket(transport);
     handlers_.push_back(std::move(serverHandler));
     return transport;
@@ -483,7 +486,6 @@ TPerfServer::TPerfServer(
     bool gso,
     uint32_t maxCwndInMss,
     bool pacing,
-    bool experimentalPacer,
     uint32_t numStreams,
     uint64_t maxBytesPerStream,
     uint32_t maxReceivePacketSize,
@@ -521,7 +523,8 @@ TPerfServer::TPerfServer(
       numServerWorkers_(numServerWorkers),
       burstDeadlineMs_(burstDeadlineMs),
       maxPacingRate_(maxPacingRate) {
-  fizz::CryptoUtils::init();
+  fizz::Error err;
+  FIZZ_THROW_ON_ERROR(fizz::CryptoUtils::init(err), err);
   eventBase_.setName("tperf_server");
   quic::TransportSettings settings;
   if (useInplaceWrite && gso) {
@@ -537,7 +540,6 @@ TPerfServer::TPerfServer(
     settings.pacingTickInterval = 200us;
     settings.writeLimitRttFraction = 0;
   }
-  settings.experimentalPacer = experimentalPacer;
 
   if (gso) {
     settings.batchingMode = QuicBatchingMode::BATCHING_MODE_GSO;
@@ -557,7 +559,6 @@ TPerfServer::TPerfServer(
     settings.enableEcnOnEgress = true;
     settings.useL4sEcn = true;
     settings.minBurstPackets = 1;
-    settings.experimentalPacer = true;
     settings.ccaConfig.onlyGrowCwndWhenLimited = true;
     settings.ccaConfig.leaveHeadroomForCwndLimited = true;
   }

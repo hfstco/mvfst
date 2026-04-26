@@ -114,7 +114,7 @@ class MockClientHandshakeBase : public ClientHandshake {
       getReadRecordLayerEncryptionLevel,
       (),
       (override));
-  MOCK_METHOD(void, processSocketData, (folly::IOBufQueue & queue));
+  MOCK_METHOD(void, processSocketData, (quic::IOBufQueue & queue));
   MOCK_METHOD(bool, matchEarlyParameters, ());
   MOCK_METHOD(
       (quic::Expected<std::unique_ptr<Aead>, QuicError>),
@@ -135,7 +135,7 @@ class MockClientHandshakeBase : public ClientHandshake {
       (),
       (const, override));
   MOCK_METHOD(
-      const std::shared_ptr<const folly::AsyncTransportCertificate>,
+      const std::shared_ptr<const fizz::Cert>,
       getPeerCertificate,
       (),
       (const, override));
@@ -155,7 +155,7 @@ class MockClientHandshake : public MockClientHandshakeBase {
     return Optional<CachedServerTransportParameters>(std::nullopt);
   }
 
-  void processSocketData(folly::IOBufQueue& /* queue */) override {}
+  void processSocketData(quic::IOBufQueue& /* queue */) override {}
 
   bool matchEarlyParameters() override {
     return false;

@@ -17,6 +17,10 @@
 #include <chrono>
 
 namespace quic {
+
+#define QUIC_DEFAULT_AEAD_HEADER <quic/fizz/handshake/FizzBridge.h>
+#define QUIC_DEFAULT_AEAD ::quic::FizzAead
+
 template <class... Args>
 struct UnorderedMap : folly::F14FastMap<Args...> {};
 
@@ -40,7 +44,7 @@ template <
     typename Value,
     size_t N,
     class Container = InlineMapVec<std::pair<Key, Value>, N>,
-    typename = std::enable_if_t<std::is_integral<Key>::value>>
+    typename = std::enable_if_t<std::is_integral_v<Key>>>
 using InlineMap = folly::heap_vector_map<
     Key,
     Value,
@@ -56,7 +60,7 @@ template <
     typename Value,
     size_t N,
     class Container = InlineSetVec<Value, N>,
-    typename = std::enable_if_t<std::is_integral<Value>::value>>
+    typename = std::enable_if_t<std::is_integral_v<Value>>>
 using InlineSet = folly::heap_vector_set<
     Value,
     std::less<Value>,

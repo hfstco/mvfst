@@ -165,6 +165,13 @@ struct ServerDirectEncapConfig {
   uint8_t supportedZones;
 };
 
+struct EgressPolicerConfig {
+  bool enabled{false};
+  uint64_t rateBytesPerSec{0};
+  uint32_t burstMs{100};
+  uint32_t delayMs{1000};
+};
+
 struct TransportSettings {
   // The initial flow control window for the whole connection advertised to the
   // peer.
@@ -226,7 +233,7 @@ struct TransportSettings {
       ZeroRttSourceTokenMatchingPolicy::REJECT_IF_NO_EXACT_MATCH};
   // Scale pacing rate for CC, non-empty indicates override via transport knobs
   std::pair<uint8_t, uint8_t> startupRttFactor{1, 2};
-  std::pair<uint8_t, uint8_t> defaultRttFactor{4, 5};
+  std::pair<uint8_t, uint8_t> defaultRttFactor{1, 1};
   //
   bool attemptEarlyData{false};
   // Maximum number of packets the connection will write in
@@ -343,14 +350,11 @@ struct TransportSettings {
   bool enableKeepalive{false};
   // Whether or not to enable WritableBytes limit (server only)
   bool enableWritableBytesLimit{false};
-  // If set to true, the users won't get new stream notification until an
-  // actual stream frame with the new stream id arrives.
-  bool notifyOnNewStreamsExplicitly{false};
-  bool experimentalPacer{false};
   // experimental flag to close ingress SM when invoking stopSending
   bool dropIngressOnStopSending{false};
   bool advertisedReliableResetStreamSupport{false};
   bool advertisedKnobFrameSupport{false};
+  Optional<uint16_t> quicExperimentId;
 
   // Extended ACK support to advertise to the peer. This is what we expect to
   // receive from the peer inside ACK_EXTENDED frames.
@@ -434,10 +438,6 @@ struct TransportSettings {
   uint64_t cwndModerateJumpstart{48000};
   uint64_t cwndStrongJumpstart{72000};
   bool useSockWritableEvents{false};
-  // use backpressure single packet batch writer. Only works for
-  // QuicBatchingMode::BATCHING_MODE_NONE and DataPathType::ChainedMemory
-  // and requires useSockWritableEvents to be enabled.
-  bool enableWriterBackpressure{false};
   // Ack timeout = SRTT * ackTimerFactor
   double ackTimerFactor{kAckTimerFactor};
   // If flow control updates should be sent based on time passed since last
@@ -449,10 +449,6 @@ struct TransportSettings {
   bool cloneAllPacketsWithCryptoFrame{false};
   bool cloneCryptoPacketsAtMostOnce{false};
   bool immediatelyRetransmitInitialPackets{false};
-  // If > 0 this represents the coalescing of appends to the read buffer
-  // which will be applied. i.e. when used the underlying IOBufs in the read
-  // buffer will mostly be in chunks of this size.
-  uint32_t readCoalescingSize{0};
 
   // Ceiling of packets to receive from signaled socket per evb loop on the
   // server side.
@@ -461,8 +457,6 @@ struct TransportSettings {
   // Support "paused" requests which buffer on the server without streaming back
   // to the client.
   bool disablePausedPriority{false};
-
-  bool sendAckOnlyInitial{false};
 
   // Randomly skip one in N sequence numbers when sending packets.
   uint16_t skipOneInNPacketSequenceNumber{kSkipOneInNPacketSequenceNumber};
@@ -499,6 +493,21 @@ struct TransportSettings {
   std::chrono::milliseconds keepAliveTimeout{0};
 
   bool enableScone{false};
+  std::chrono::seconds sconePacketInterval{20};
+
+  EgressPolicerConfig egressPolicerConfig;
+
+  // Enable path degradation / blackhole detection callbacks.
+  // When enabled, the transport fires onPathDegrading() and
+  // onBlackholeDetected() on ConnectionCallback at ptoCount thresholds.
+  bool enablePathDegradationDetection{false};
+
+  // Number of consecutive PTOs before firing onPathDegrading.
+  uint16_t numPtosForPathDegrading{kDefaultNumPtosForPathDegrading};
+
+  // Number of consecutive PTOs before firing onBlackholeDetected.
+  // Must be > numPtosForPathDegrading and < maxNumPTOs.
+  uint16_t numPtosForBlackhole{kDefaultNumPtosForBlackhole};
 };
 
 } // namespace quic

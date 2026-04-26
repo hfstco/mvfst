@@ -242,25 +242,60 @@ void updateErrnoCount(
   }
 }
 
-// Helper function to write SCONE packet if needed.
+// Check if a SCONE packet should be sent based on negotiation state and
+// the configured send interval.
+bool shouldSendSconePacket(
+    const QuicConnectionStateBase& connection,
+    PacketNumberSpace pnSpace,
+    TimePoint sendTime) {
+  if (!connection.scone || !connection.scone->negotiated ||
+      pnSpace != PacketNumberSpace::AppData ||
+      connection.nodeType != QuicNodeType::Server ||
+      !connection.serverConnectionId) {
+    return false;
+  }
+  if (!connection.scone->lastSconeSentTime.has_value()) {
+    return true;
+  }
+  return sendTime - *connection.scone->lastSconeSentTime >=
+      connection.transportSettings.sconePacketInterval;
+}
+
+// Returns the number of bytes to reserve for the SCONE flow indicator.
+// The indicator (0xc8 0x13) is appended to every client datagram before the
+// first server response, telling on-path network elements the flow supports
+// SCONE (draft-ietf-scone-protocol Section 6.1).
+uint64_t sconeFlowIndicatorSize(
+    const QuicConnectionStateBase& connection,
+    const PacketHeader& header) {
+  if (!connection.transportSettings.enableScone) {
+    return 0;
+  }
+  if (!header.asLong()) {
+    return 0;
+  }
+  if (hasReceivedUdpPackets(connection)) {
+    return 0;
+  }
+  return kSconeFlowIndicatorSize;
+}
+
+// Helper function to write SCONE packet if needed (continuous memory path).
 // Returns the size of the SCONE packet written, or 0 if no packet was written.
 uint64_t writeSconePacketIfNeeded(
     QuicConnectionStateBase& connection,
     const PacketHeader& header,
-    PacketNumberSpace pnSpace) {
-  bool needScone = connection.scone && connection.scone->negotiated &&
-      !connection.scone->sentThisLoop &&
-      pnSpace == PacketNumberSpace::AppData &&
-      connection.nodeType == QuicNodeType::Server;
-
-  if (!needScone) {
+    PacketNumberSpace pnSpace,
+    TimePoint sendTime) {
+  if (!shouldSendSconePacket(connection, pnSpace, sendTime)) {
     return 0;
   }
 
-  // SCONE packets are only sent with AppData (short headers)
+  // DCID = client's CID (matches the coalesced short header's DCID)
+  // SCID = server's own CID
   auto sconeDstCid = header.asShort()->getConnectionId();
-  auto sconeSrcCid = ConnectionId::createZeroLength();
-  uint8_t sconeRateSignal = kSconeNoAdvice;
+  auto sconeSrcCid = *connection.serverConnectionId;
+  uint8_t sconeRateSignal = connection.scone->configuredRateSignal;
   auto sconePacket =
       buildSconePacket(sconeRateSignal, sconeDstCid, sconeSrcCid);
   uint64_t sconeSize = sconePacket.computeChainDataLength();
@@ -272,7 +307,7 @@ uint64_t writeSconePacketIfNeeded(
 
   memcpy(connection.bufAccessor->writableTail(), sconePacket.data(), sconeSize);
   connection.bufAccessor->append(sconeSize);
-  connection.scone->sentThisLoop = true;
+  connection.scone->lastSconeSentTime = sendTime;
 
   VLOG(4) << "SCONE: Wrote " << sconeSize << " bytes to continuous buffer";
   if (connection.qLogger) {
@@ -281,6 +316,27 @@ uint64_t writeSconePacketIfNeeded(
   }
 
   return sconeSize;
+}
+
+bool shouldPolicerDropPacket(
+    QuicConnectionStateBase& connection,
+    size_t encodedSize) {
+  if (connection.nodeType != QuicNodeType::Server) {
+    return false;
+  }
+  if (!connection.egressPolicer) {
+    return false;
+  }
+  if (connection.egressPolicerActivationTime.has_value() &&
+      Clock::now() < *connection.egressPolicerActivationTime) {
+    return false;
+  }
+  auto wireBytes = static_cast<double>(encodedSize);
+  if (!connection.egressPolicer->consume(wireBytes)) {
+    QUIC_STATS(connection.statsCallback, onPacketDroppedByEgressPolicer);
+    return true;
+  }
+  return false;
 }
 
 [[nodiscard]] quic::Expected<DataPathResult, QuicError>
@@ -294,15 +350,18 @@ continuousMemoryBuildScheduleEncrypt(
     uint64_t writableBytes,
     IOBufQuicBatch& ioBufBatch,
     const Aead& aead,
-    const PacketNumberCipher& headerCipher) {
+    const PacketNumberCipher& headerCipher,
+    TimePoint sendTime) {
   // SCONE: If needed, build the SCONE packet and write it to the buffer first.
   uint64_t sconePacketSize =
-      writeSconePacketIfNeeded(connection, header, pnSpace);
+      writeSconePacketIfNeeded(connection, header, pnSpace, sendTime);
+
+  // SCONE flow indicator: reserve space for the 2-byte indicator appended
+  // after the encrypted packet (must check header before it's moved)
+  uint64_t flowIndSize = sconeFlowIndicatorSize(connection, header);
 
   // Defensive check: ensure we have enough space for the regular packet
-  if (connection.udpSendPacketLen < sconePacketSize) {
-    // This should never happen as writeSconePacketIfNeeded validates space,
-    // but adding defensive check for clarity
+  if (connection.udpSendPacketLen < sconePacketSize + flowIndSize) {
     return quic::make_unexpected(QuicError(
         QuicErrorCode(TransportErrorCode::INTERNAL_ERROR),
         "Insufficient space after SCONE packet"));
@@ -318,7 +377,7 @@ continuousMemoryBuildScheduleEncrypt(
   // It's the scheduler's job to invoke encode header
   InplaceQuicPacketBuilder pktBuilder(
       *connection.bufAccessor,
-      connection.udpSendPacketLen - sconePacketSize,
+      connection.udpSendPacketLen - sconePacketSize - flowIndSize,
       std::move(header),
       getAckState(connection, pnSpace).largestAckedByPeer.value_or(0));
   pktBuilder.accountForCipherOverhead(cipherOverhead);
@@ -405,9 +464,24 @@ continuousMemoryBuildScheduleEncrypt(
         true, std::move(result.value()), encodedSize, encodedBodySize);
   }
   connection.bufAccessor->release(std::move(packetBuf));
+
+  // Append SCONE flow indicator as the last 2 bytes of the datagram
+  if (flowIndSize > 0) {
+    connection.bufAccessor->writableTail()[0] = kSconeFlowIndicatorByte1;
+    connection.bufAccessor->writableTail()[1] = kSconeFlowIndicatorByte2;
+    connection.bufAccessor->append(kSconeFlowIndicatorSize);
+    encodedSize += kSconeFlowIndicatorSize;
+  }
+
   if (encodedSize > connection.udpSendPacketLen) {
     MVVLOG(3) << "Quic sending pkt larger than limit, encodedSize="
               << encodedSize;
+  }
+  // Egress policer: drop packet if rate exceeded (treat as network loss).
+  if (shouldPolicerDropPacket(connection, encodedSize)) {
+    connection.bufAccessor->trimEnd(encodedSize);
+    return DataPathResult::makeWriteResult(
+        true, std::move(result.value()), encodedSize, encodedBodySize);
   }
   // TODO: I think we should add an API that doesn't need a buffer.
   auto writeResult =
@@ -434,21 +508,18 @@ iobufChainBasedBuildScheduleEncrypt(
     uint64_t writableBytes,
     IOBufQuicBatch& ioBufBatch,
     const Aead& aead,
-    const PacketNumberCipher& headerCipher) {
+    const PacketNumberCipher& headerCipher,
+    TimePoint sendTime) {
   // SCONE: Pre-build SCONE packet and adjust max packet size to avoid overflow
-  std::unique_ptr<folly::IOBuf> preBuildSconePacket;
+  std::unique_ptr<Buf> preBuildSconePacket;
   uint64_t adjustedMaxPacketSize = connection.udpSendPacketLen;
-  uint8_t sconeRateSignal = kSconeNoAdvice;
-  bool needScone = connection.scone && connection.scone->negotiated &&
-      !connection.scone->sentThisLoop &&
-      pnSpace == PacketNumberSpace::AppData &&
-      connection.nodeType == QuicNodeType::Server;
+  bool needScone = shouldSendSconePacket(connection, pnSpace, sendTime);
   if (needScone) {
-    // AppData packets use short headers, so we get DCID from short header
     ConnectionId sconeDstCid = header.asShort()->getConnectionId();
-    ConnectionId sconeSrcCid = ConnectionId::createZeroLength();
-    auto scone = buildSconePacket(sconeRateSignal, sconeDstCid, sconeSrcCid);
-    preBuildSconePacket = std::make_unique<folly::IOBuf>(std::move(scone));
+    ConnectionId sconeSrcCid = *connection.serverConnectionId;
+    auto scone = buildSconePacket(
+        connection.scone->configuredRateSignal, sconeDstCid, sconeSrcCid);
+    preBuildSconePacket = std::make_unique<Buf>(std::move(scone));
     uint64_t sconeSize = preBuildSconePacket->computeChainDataLength();
 
     // SCONE packets are small; there should always be enough space
@@ -460,6 +531,11 @@ iobufChainBasedBuildScheduleEncrypt(
     VLOG(4) << "SCONE: Reserved " << sconeSize
             << " bytes, adjusted max packet size to " << adjustedMaxPacketSize;
   }
+
+  // SCONE flow indicator: reserve space for the 2-byte indicator appended
+  // after the encrypted packet (must check header before it's moved)
+  uint64_t flowIndSize = sconeFlowIndicatorSize(connection, header);
+  adjustedMaxPacketSize -= flowIndSize;
 
   RegularQuicPacketBuilder pktBuilder(
       adjustedMaxPacketSize,
@@ -538,25 +614,43 @@ iobufChainBasedBuildScheduleEncrypt(
   // SCONE: Prepend pre-built SCONE packet for co-alescing (size already
   // accounted for)
   if (needScone && preBuildSconePacket) {
-    preBuildSconePacket->prependChain(std::move(packetBuf));
+    preBuildSconePacket->appendChain(std::move(packetBuf));
     packetBuf = std::move(preBuildSconePacket);
     encodedSize = packetBuf->computeChainDataLength();
-    connection.scone->sentThisLoop = true;
+    connection.scone->lastSconeSentTime = sendTime;
     VLOG(4) << "SCONE: Prepended SCONE packet, total size=" << encodedSize;
 
     if (connection.qLogger) {
       connection.qLogger->addTransportStateUpdate(
-          fmt::format("scone_sent:rate={}", static_cast<int>(sconeRateSignal)));
+          fmt::format(
+              "scone_sent:rate={}",
+              static_cast<int>(connection.scone->configuredRateSignal)));
     }
-  }
-  if (encodedSize > connection.udpSendPacketLen) {
-    MVVLOG(3) << "Quic sending pkt larger than limit, encodedSize="
-              << encodedSize << " encodedBodySize=" << encodedBodySize;
   }
 
   if (connection.transportSettings.isPriming && packetBuf) {
     packetBuf->coalesce();
     connection.primingData.emplace_back(std::move(packetBuf));
+    return DataPathResult::makeWriteResult(
+        true, std::move(result.value()), encodedSize, encodedBodySize);
+  }
+
+  // Append SCONE flow indicator as the last 2 bytes of the datagram
+  if (flowIndSize > 0) {
+    auto indicator = BufHelpers::create(kSconeFlowIndicatorSize);
+    indicator->writableData()[0] = kSconeFlowIndicatorByte1;
+    indicator->writableData()[1] = kSconeFlowIndicatorByte2;
+    indicator->append(kSconeFlowIndicatorSize);
+    packetBuf->appendChain(std::move(indicator));
+    encodedSize += kSconeFlowIndicatorSize;
+  }
+
+  if (encodedSize > connection.udpSendPacketLen) {
+    MVVLOG(3) << "Quic sending pkt larger than limit, encodedSize="
+              << encodedSize << " encodedBodySize=" << encodedBodySize;
+  }
+  // Egress policer: drop packet if rate exceeded (treat as network loss).
+  if (shouldPolicerDropPacket(connection, encodedSize)) {
     return DataPathResult::makeWriteResult(
         true, std::move(result.value()), encodedSize, encodedBodySize);
   }
@@ -1505,7 +1599,7 @@ void writeCloseCommon(
   // best effort writing to the socket, ignore any errors.
 
   BufPtr packetBufPtr = packetBuf.clone();
-  iovec vec[kNumIovecBufferChains];
+  iovec vec[kNumIovecBufferChains]; // NOLINT(modernize-avoid-c-arrays)
   size_t iovec_len = fillIovec(packetBufPtr, vec);
   auto ret = sock.write(connection.peerAddress, vec, iovec_len);
   connection.lossState.totalBytesSent += packetSize;
@@ -1725,12 +1819,7 @@ quic::Expected<WriteQuicDataResult, QuicError> writeConnectionDataToSocket(
     connection.writeDebugState.noWriteReason = NoWriteReason::WRITE_OK;
   }
 
-  // Note: if a write is pending, it will be taken over by the batch writer when
-  // it's created. So this check has to be done before creating the batch
-  // writer.
-  bool pendingBufferedWrite = hasBufferedDataToWrite(connection);
-
-  if (!scheduler.hasData() && !pendingBufferedWrite) {
+  if (!scheduler.hasData()) {
     if (connection.loopDetectorCallback) {
       connection.writeDebugState.noWriteReason = NoWriteReason::EMPTY_SCHEDULER;
     }
@@ -1741,6 +1830,15 @@ quic::Expected<WriteQuicDataResult, QuicError> writeConnectionDataToSocket(
              << " writing data using scheduler=" << scheduler.name() << " "
              << connection;
 
+  // Reset the shared buffer at the start of each write loop when using
+  // ContinuousMemory data path.
+  if (connection.transportSettings.dataPathType ==
+          DataPathType::ContinuousMemory &&
+      connection.bufAccessor && connection.bufAccessor->ownsBuffer() &&
+      connection.bufAccessor->length() > 0) {
+    connection.bufAccessor->clear();
+  }
+
   if (!connection.gsoSupported.has_value()) {
     auto gsoResult = sock.getGSO();
     if (!gsoResult.has_value()) {
@@ -1748,12 +1846,19 @@ quic::Expected<WriteQuicDataResult, QuicError> writeConnectionDataToSocket(
       return quic::make_unexpected(gsoResult.error());
     }
     connection.gsoSupported = sock.getGSO().value() >= 0;
+  } else if (*connection.gsoSupported) {
+    // Re-check GSO state from the socket. The socket may have detected at
+    // runtime that GSO is not actually supported (e.g. EIO on sendmsg with
+    // UDP_SEGMENT) and updated its cached state.
+    auto gsoResult = sock.getGSO();
+    if (gsoResult.has_value() && gsoResult.value() < 0) {
+      connection.gsoSupported = false;
+    }
   }
 
   auto batchWriter = BatchWriterFactory::makeBatchWriter(
       connection.transportSettings.batchingMode,
       connection.transportSettings.maxBatchSize,
-      connection.transportSettings.enableWriterBackpressure,
       connection.transportSettings.dataPathType,
       connection,
       *connection.gsoSupported);
@@ -1767,22 +1872,6 @@ quic::Expected<WriteQuicDataResult, QuicError> writeConnectionDataToSocket(
       peerAddress,
       connection.statsCallback,
       happyEyeballsState);
-
-  // If we have a pending write to retry. Flush that first and make sure it
-  // succeeds before scheduling any new data.
-  if (pendingBufferedWrite) {
-    auto flushResult = ioBufBatch.flush();
-    if (!flushResult.has_value()) {
-      return quic::make_unexpected(flushResult.error());
-    }
-    auto flushSuccess = flushResult.value();
-    updateErrnoCount(connection, ioBufBatch);
-    if (!flushSuccess) {
-      // Could not flush retried data. Return empty write result and wait for
-      // next retry.
-      return WriteQuicDataResult{0, 0, 0};
-    }
-  }
 
   auto batchSize = connection.transportSettings.batchingMode ==
           QuicBatchingMode::BATCHING_MODE_NONE
@@ -1851,7 +1940,8 @@ quic::Expected<WriteQuicDataResult, QuicError> writeConnectionDataToSocket(
         writableBytes,
         ioBufBatch,
         aead,
-        headerCipher);
+        headerCipher,
+        sentTime);
 
     // This is a fatal error vs. a build error.
     if (!ret.has_value()) {
@@ -2065,10 +2155,6 @@ WriteDataReason shouldWriteData(/*const*/ QuicConnectionStateBase& conn) {
     return WriteDataReason::NO_WRITE;
   }
 
-  if (hasBufferedDataToWrite(conn)) {
-    return WriteDataReason::BUFFERED_WRITE;
-  }
-
   return hasNonAckDataToWrite(conn);
 }
 
@@ -2113,10 +2199,6 @@ bool hasAckDataToWrite(const QuicConnectionStateBase& conn) {
                            << conn.pendingEvents.scheduleAckTimeout << " "
                            << conn;
   return writeAcks;
-}
-
-bool hasBufferedDataToWrite(const QuicConnectionStateBase& conn) {
-  return (bool)conn.pendingWriteBatch_.buf;
 }
 
 WriteDataReason hasNonAckDataToWrite(const QuicConnectionStateBase& conn) {

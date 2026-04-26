@@ -28,6 +28,7 @@ class MockQuicStats : public QuicTransportStatsCallback {
   MOCK_METHOD(void, onPersistentCongestion, ());
   MOCK_METHOD(void, onPacketDropped, (PacketDropReason));
   MOCK_METHOD(void, onPacketForwarded, ());
+  MOCK_METHOD(void, onPacketDroppedByEgressPolicer, ());
   MOCK_METHOD(void, onForwardedPacketReceived, ());
   MOCK_METHOD(void, onForwardedPacketProcessed, ());
   MOCK_METHOD(void, onClientInitialReceived, (QuicVersion));
@@ -53,6 +54,7 @@ class MockQuicStats : public QuicTransportStatsCallback {
   MOCK_METHOD(void, onRttSample, (uint64_t));
   MOCK_METHOD(void, onBandwidthSample, (uint64_t));
   MOCK_METHOD(void, onCwndHintBytesSample, (uint64_t));
+  MOCK_METHOD(void, onCongestionControllerResumed, ());
   MOCK_METHOD(void, onNewCongestionController, (CongestionControlType));
   MOCK_METHOD(void, onPTO, ());
   MOCK_METHOD(void, onRead, (size_t));

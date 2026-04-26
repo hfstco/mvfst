@@ -21,6 +21,7 @@ createTicketTransportParameters(
     uint64_t initialMaxStreamsUni,
     ExtendedAckFeatureMaskType extendedAckFeatures,
     Optional<uint64_t> cwndHintBytes,
+    Optional<uint64_t> rttHintMs,
     Optional<uint64_t> savedCongestionWindow,
     Optional<uint64_t> savedRtt) {
   TicketTransportParameters params;
@@ -97,6 +98,15 @@ createTicketTransportParameters(
       return quic::make_unexpected(cwndHintBytesResult.error());
     }
     params.parameters.push_back(cwndHintBytesResult.value());
+  }
+
+  if (rttHintMs) {
+    auto rttHintMsResult =
+        encodeIntegerParameter(TransportParameterId::rtt_hint_ms, *rttHintMs);
+    if (rttHintMsResult.hasError()) {
+      return quic::make_unexpected(rttHintMsResult.error());
+    }
+    params.parameters.push_back(rttHintMsResult.value());
   }
 
   if(savedCongestionWindow && savedRtt) {

@@ -77,8 +77,6 @@ class QuicTransportBase : public QuicSocket,
   void unsetAllReadCallbacks() override;
   void unsetAllPeekCallbacks() override;
   void unsetAllDeliveryCallbacks() override;
-  quic::Expected<void, LocalErrorCode> pauseRead(StreamId id) override;
-  quic::Expected<void, LocalErrorCode> resumeRead(StreamId id) override;
 
   quic::Expected<void, LocalErrorCode> setPeekCallback(
       StreamId id,
@@ -97,11 +95,6 @@ class QuicTransportBase : public QuicSocket,
 
   quic::Expected<void, std::pair<LocalErrorCode, Optional<uint64_t>>>
   consume(StreamId id, uint64_t offset, size_t amount) override;
-
-  bool isClientStream(StreamId stream) noexcept override;
-  bool isServerStream(StreamId stream) noexcept override;
-  StreamDirectionality getStreamDirectionality(
-      StreamId stream) noexcept override;
 
   quic::Expected<void, LocalErrorCode> maybeResetStreamFromReadError(
       StreamId id,
@@ -176,6 +169,19 @@ class QuicTransportBase : public QuicSocket,
    */
   quic::Expected<void, LocalErrorCode> writeDatagram(BufPtr buf) override;
 
+  quic::Expected<uint32_t, LocalErrorCode> createDatagramFlowId() override;
+
+  quic::Expected<void, LocalErrorCode> writeDatagram(
+      uint32_t flowId,
+      BufPtr buf) override;
+
+  quic::Expected<void, LocalErrorCode> setDatagramFlowPriority(
+      uint32_t flowId,
+      PriorityQueue::Priority priority) override;
+
+  quic::Expected<void, LocalErrorCode> closeDatagramFlow(
+      uint32_t flowId) override;
+
   /**
    * Returns the currently available received Datagrams.
    * Returns all datagrams if atMost is 0.
@@ -229,9 +235,6 @@ class QuicTransportBase : public QuicSocket,
   }
 
  protected:
-  quic::Expected<void, LocalErrorCode> pauseOrResumeRead(
-      StreamId id,
-      bool resume);
   quic::Expected<void, LocalErrorCode> pauseOrResumePeek(
       StreamId id,
       bool resume);
@@ -286,6 +289,18 @@ class QuicTransportBase : public QuicSocket,
   TransportLooper::Ptr peekLooper_;
 
   bool handshakeDoneNotified_{false};
+
+  // Next datagram flow ID to allocate (counts up from kDefaultDatagramFlowId +
+  // 1)
+  uint32_t nextDatagramFlowId_{kDefaultDatagramFlowId + 1};
+
+ private:
+  /**
+   * Internal helper for writing datagrams with common validation logic.
+   */
+  quic::Expected<void, LocalErrorCode> writeDatagramInternal(
+      BufPtr buf,
+      uint32_t flowId);
 };
 
 } // namespace quic

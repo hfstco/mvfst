@@ -11,6 +11,10 @@ mvfst_cpp_library(
             "QuicBatchWriterFactory.cpp",
             "QuicGsoBatchWriters.cpp",
         ],
+        "fbsource//tools/build_defs/config/apps/shared:quic-gso-batch-writer-enabled-android": [
+            "QuicBatchWriterFactoryMobileGSO.cpp",
+            "QuicGsoBatchWriters.cpp",
+        ],
         "ovr_config//os/constraints:android": ["QuicBatchWriterFactoryMobile.cpp"],
         "ovr_config//os/constraints:iphoneos": ["QuicBatchWriterFactoryMobile.cpp"],
     }),
@@ -19,6 +23,9 @@ mvfst_cpp_library(
         "QuicBatchWriterFactory.h",
     ] + select({
         "DEFAULT": ["QuicGsoBatchWriters.h"],
+        "fbsource//tools/build_defs/config/apps/shared:quic-gso-batch-writer-enabled-android": [
+            "QuicGsoBatchWriters.h",
+        ],
         "ovr_config//os/constraints:android": [],
         "ovr_config//os/constraints:iphoneos": [],
     }),
@@ -35,9 +42,6 @@ mvfst_cpp_library(
         "//quic/common/events:eventbase",
         "//quic/common/udpsocket:quic_async_udp_socket",
         "//quic/state:quic_state_machine",
-    ],
-    exported_external_deps = [
-        "glog",
     ],
 )
 
@@ -147,6 +151,7 @@ mvfst_cpp_library(
         "//quic/congestion_control:pacer_factory",
         "//quic/flowcontrol:flow_control",
         "//quic/logging:qlogger_macros",
+        "//quic/logging/oops_logger:oops_fields",
         "//quic/loss:loss",
         "//quic/observer:socket_observer_macros",
         "//quic/state:pacing_functions",
@@ -157,8 +162,8 @@ mvfst_cpp_library(
         ":quic_callbacks",
         ":transport_helpers",
         ":transport_info",
+        "//fizz/protocol:certificate_base",
         "//folly:maybe_managed_ptr",
-        "//folly/io/async:async_transport_certificate",
         "//folly/io/async:delayed_destruction",
         "//quic:exception",
         "//quic/codec:types",
@@ -231,9 +236,6 @@ mvfst_cpp_library(
         "//quic/state:state_functions",
         "//quic/state:stats_callback",
         "//quic/state:stream_functions",
-    ],
-    exported_external_deps = [
-        "boost",
     ],
 )
 

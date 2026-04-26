@@ -11,11 +11,10 @@
 #include <quic/congestion_control/Bbr2.h>
 #include <quic/congestion_control/BbrBandwidthSampler.h>
 #include <quic/congestion_control/BbrRttSampler.h>
-#include <quic/congestion_control/BbrTesting.h>
 #include <quic/congestion_control/Copa.h>
-#include <quic/congestion_control/Copa2.h>
 #include <quic/congestion_control/NewReno.h>
 #include <quic/congestion_control/QuicCubic.h>
+#include <quic/congestion_control/modular/Bbr2Startup.h>
 
 #include <memory>
 
@@ -41,17 +40,8 @@ ServerCongestionControllerFactory::makeCongestionController(
     case CongestionControlType::Copa:
       congestionController = std::make_unique<Copa>(conn);
       break;
-    case CongestionControlType::Copa2:
-      congestionController = std::make_unique<Copa2>(conn);
-      break;
     case CongestionControlType::BBR: {
       auto bbr = std::make_unique<BbrCongestionController>(conn);
-      setupBBR(bbr.get());
-      congestionController = std::move(bbr);
-      break;
-    }
-    case CongestionControlType::BBRTesting: {
-      auto bbr = std::make_unique<BbrTestingCongestionController>(conn);
       setupBBR(bbr.get());
       congestionController = std::move(bbr);
       break;
@@ -59,6 +49,11 @@ ServerCongestionControllerFactory::makeCongestionController(
     case CongestionControlType::BBR2: {
       auto bbr2 = std::make_unique<Bbr2CongestionController>(conn);
       congestionController = std::move(bbr2);
+      break;
+    }
+    case CongestionControlType::BBR2Modular: {
+      auto bbr2Modular = std::make_unique<Bbr2Startup>(conn);
+      congestionController = std::move(bbr2Modular);
       break;
     }
     case CongestionControlType::StaticCwnd: {

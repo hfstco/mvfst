@@ -180,6 +180,14 @@ struct CongestionController {
    * Enable experimental settings of the congestion controller
    */
   virtual void setExperimental(bool /*experimental*/) {}
+
+  /**
+   * Set resume hints (cwnd and RTT) from a previous session for careful resume.
+   * Only the first call takes effect; subsequent calls are ignored.
+   */
+  virtual void setResumeHints(
+      uint64_t /*cwndHintBytes*/,
+      const Optional<std::chrono::milliseconds>& /*rttHint*/ = std::nullopt) {}
 };
 
 } // namespace quic

@@ -192,10 +192,11 @@ class QuicClientTransportLite
       std::unique_ptr<QuicAsyncUDPSocket> probeSocket,
       QuicPathManager::PathValidationCallback* probeResultCallback = nullptr);
 
-  // Migrate to the path with the given id. This will schedule the current path
-  // to be removed after srtt * kClientTimeToKeepOldPathAfterMigration. The
-  // delay allows the transport to read any inflight packets on the old path.
-  quic::Expected<void, QuicError> migrateConnection(PathIdType pathId);
+  // Migrate to the path with the given id. The previous path is kept until a
+  // packet is received on the new path, then cleaned up.
+  quic::Expected<void, QuicError> migrateConnection(
+      PathIdType pathId,
+      bool resetCongestionControllerAndRtt = true);
 
   quic::Expected<void, QuicError> removePath(PathIdType pathId);
 
@@ -252,8 +253,7 @@ class QuicClientTransportLite
   EncryptionLevel getReadEncryptionLevel() const;
   bool waitingForHandshakeData() const;
 
-  const std::shared_ptr<const folly::AsyncTransportCertificate>
-  getPeerCertificate() const override;
+  const std::shared_ptr<const fizz::Cert> getPeerCertificate() const override;
 
   Optional<Handshake::TLSSummary> getTLSSummary() const override;
 
@@ -367,8 +367,28 @@ class QuicClientTransportLite
   // supports GRO. otherwise kDefaultNumGROBuffers
   uint32_t numGROBuffers_{kDefaultNumGROBuffers};
 
-  void runOnEvbAsync(
-      std::function<void(std::shared_ptr<QuicClientTransportLite>)> func);
+  // Path ID from the most recent migration. Cleaned up when a packet is
+  // received on the new path, or immediately if another migration occurs.
+  Optional<PathIdType> previousPathId_;
+
+  // Override dispatchAsyncOp to handle client-specific operations
+  void dispatchAsyncOp(AsyncOpData data) override;
+
+  // Template-based async dispatch for complex cases with custom captures
+  template <typename F>
+  void runOnEvbAsync(F&& func) {
+    auto evb = getEventBase();
+    evb->runInLoop(
+        [self = sharedGuardClient(),
+         func = std::forward<F>(func),
+         evb]() mutable {
+          if (self->getEventBase() != evb) {
+            return;
+          }
+          func(std::move(self));
+        },
+        true);
+  }
 
   folly::SocketOptionMap socketOptions_;
 

@@ -68,6 +68,10 @@ class LogQuicStats : public quic::QuicTransportStatsCallback {
     MVVLOG(2) << prefix_ << __func__;
   }
 
+  void onPacketDroppedByEgressPolicer() override {
+    MVVLOG(2) << prefix_ << __func__;
+  }
+
   void onForwardedPacketReceived() override {
     MVVLOG(2) << prefix_ << __func__;
   }
@@ -182,6 +186,10 @@ class LogQuicStats : public quic::QuicTransportStatsCallback {
 
   void onCwndHintBytesSample(uint64_t cwndHintBytes) override {
     MVVLOG(2) << __func__ << " cwndHintBytes=" << cwndHintBytes;
+  }
+
+  void onCongestionControllerResumed() override {
+    MVVLOG(2) << __func__;
   }
 
   void onNewCongestionController(CongestionControlType type) override {

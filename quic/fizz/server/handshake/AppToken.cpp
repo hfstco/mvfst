@@ -20,29 +20,41 @@ std::unique_ptr<folly::IOBuf> encodeAppToken(const AppToken& appToken) {
   auto buf = folly::IOBuf::create(20);
   folly::io::Appender appender(buf.get(), 20);
   auto ext = encodeExtension(appToken.transportParams, QuicVersion::MVFST);
-  fizz::detail::write(ext, appender);
-  fizz::detail::writeVector<uint8_t>(appToken.sourceAddresses, appender);
-  fizz::detail::write(appToken.version, appender);
-  fizz::detail::writeBuf<uint16_t>(appToken.appParams, appender);
+  fizz::Error err;
+  FIZZ_THROW_ON_ERROR(fizz::detail::write(err, ext, appender), err);
+  FIZZ_THROW_ON_ERROR(
+      fizz::detail::writeVector<uint8_t>(
+          err, appToken.sourceAddresses, appender),
+      err);
+  FIZZ_THROW_ON_ERROR(
+      fizz::detail::write(err, appToken.version, appender), err);
+  FIZZ_THROW_ON_ERROR(
+      fizz::detail::writeBuf<uint16_t>(err, appToken.appParams, appender), err);
   return buf;
 }
 
 Optional<AppToken> decodeAppToken(const folly::IOBuf& buf) {
   AppToken appToken;
-  Cursor cursor(&buf);
+  folly::io::Cursor cursor(&buf);
   std::vector<fizz::Extension> extensions;
   fizz::Extension ext;
   try {
-    fizz::detail::read(ext, cursor);
+    size_t len;
+    fizz::Error err;
+    FIZZ_THROW_ON_ERROR(fizz::detail::read(len, err, ext, cursor), err);
     extensions.push_back(std::move(ext));
     // TODO plumb version
     appToken.transportParams =
         *fizz::getTicketExtension(extensions, QuicVersion::MVFST);
-    fizz::detail::readVector<uint8_t>(appToken.sourceAddresses, cursor);
+    FIZZ_THROW_ON_ERROR(
+        fizz::detail::readVector<uint8_t>(
+            len, err, appToken.sourceAddresses, cursor),
+        err);
     if (cursor.isAtEnd()) {
       return appToken;
     }
-    fizz::detail::read(appToken.version, cursor);
+    FIZZ_THROW_ON_ERROR(
+        fizz::detail::read(len, err, appToken.version, cursor), err);
     fizz::detail::readBuf<uint16_t>(appToken.appParams, cursor);
   } catch (const std::exception&) {
     return std::nullopt;

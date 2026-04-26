@@ -15,6 +15,10 @@
 
 #include <folly/io/async/DelayedDestruction.h>
 
+namespace proto_oops {
+class OopsLogger;
+} // namespace proto_oops
+
 namespace quic {
 
 enum class LooperType : uint8_t {
@@ -26,6 +30,30 @@ enum class LooperType : uint8_t {
 std::ostream& operator<<(std::ostream& out, const LooperType& rhs);
 
 enum class CloseState { OPEN, GRACEFUL_CLOSING, CLOSED };
+
+// Async operation types for enum-based dispatch (reduces binary size vs
+// std::function)
+enum class AsyncOpType : uint8_t {
+  ProcessCallbacksAfterNetworkData,
+  ConnectionWriteReady,
+  StreamWriteReady,
+  ByteEventReady,
+  TransportReady,
+  MarkZeroRttPacketsLost,
+  AsyncClose,
+  RemoveNonCurrentPathClient,
+};
+
+// Data for async operations - captures needed state without type erasure
+struct AsyncOpData {
+  AsyncOpType type;
+  StreamId streamId{0};
+  uint64_t offset{0};
+  ByteEvent::Type byteEventType{ByteEvent::Type::TX};
+  ByteEventCallback* callback{nullptr};
+  PathIdType pathId{0};
+  Optional<QuicError> error{};
+};
 
 class QuicTransportBaseLite : virtual public QuicSocketLite,
                               QuicAsyncUDPSocket::WriteCallback {
@@ -67,6 +95,8 @@ class QuicTransportBaseLite : virtual public QuicSocketLite,
 
   void closeNow(Optional<QuicError> error) override;
 
+  void sendPing(std::chrono::milliseconds pingTimeout = {}) override;
+
   quic::Expected<void, LocalErrorCode> stopSending(
       StreamId id,
       ApplicationErrorCode error) override;
@@ -77,16 +107,12 @@ class QuicTransportBaseLite : virtual public QuicSocketLite,
       bool replaySafe = true) override;
   [[nodiscard]] uint64_t getNumOpenableBidirectionalStreams() const override;
   [[nodiscard]] uint64_t getNumOpenableUnidirectionalStreams() const override;
-  bool isUnidirectionalStream(StreamId stream) noexcept override;
-  bool isBidirectionalStream(StreamId stream) noexcept override;
 
   WriteResult writeChain(
       StreamId id,
       BufPtr data,
       bool eof,
       ByteEventCallback* cb = nullptr) override;
-
-  Optional<LocalErrorCode> shutdownWrite(StreamId id) override;
 
   quic::Expected<void, LocalErrorCode> registerDeliveryCallback(
       StreamId id,
@@ -175,6 +201,13 @@ class QuicTransportBaseLite : virtual public QuicSocketLite,
       Optional<ApplicationErrorCode> err =
           GenericApplicationErrorCode::NO_ERROR) override;
 
+  quic::Expected<void, LocalErrorCode> setStopSendingCallback(
+      StreamId id,
+      StopSendingCallback* ss) noexcept override;
+
+  quic::Expected<void, LocalErrorCode> pauseRead(StreamId id) override;
+  quic::Expected<void, LocalErrorCode> resumeRead(StreamId id) override;
+
   quic::Expected<std::pair<BufPtr, bool>, LocalErrorCode> read(
       StreamId id,
       size_t maxLen) override;
@@ -182,6 +215,9 @@ class QuicTransportBaseLite : virtual public QuicSocketLite,
   virtual void setQLogger(std::shared_ptr<QLogger> qLogger);
 
   [[nodiscard]] const std::shared_ptr<QLogger> getQLogger() const;
+
+  virtual void setOopsLogger(
+      std::shared_ptr<proto_oops::OopsLogger> oopsLogger);
 
   void setReceiveWindow(StreamId, size_t /*recvWindowSize*/) override {}
 
@@ -562,9 +598,11 @@ class QuicTransportBaseLite : virtual public QuicSocketLite,
    */
   virtual void unbindConnection() = 0;
 
-  StreamInitiator getStreamInitiator(StreamId stream) noexcept override;
+  [[nodiscard]] QuicNodeType getNodeType() const noexcept final;
 
   [[nodiscard]] QuicConnectionStats getConnectionsStats() const override;
+
+  Optional<SconeRateInfo> consumePendingSconeRate() override;
 
   /**
    * Returns a shared_ptr which can be used as a guard to keep this
@@ -682,8 +720,23 @@ class QuicTransportBaseLite : virtual public QuicSocketLite,
   quic::Expected<StreamId, LocalErrorCode> createStreamInternal(
       bool bidirectional);
 
-  void runOnEvbAsync(
-      std::function<void(std::shared_ptr<QuicTransportBaseLite>)> func);
+  // Enum-based async dispatch for binary size optimization
+  void runOnEvbAsyncOp(AsyncOpData data);
+  virtual void dispatchAsyncOp(AsyncOpData data);
+
+  // Template-based async dispatch for complex cases with custom captures
+  template <typename F>
+  void runOnEvbAsync(F&& func) {
+    auto evb = getEventBase();
+    evb->runInLoop(
+        [self = sharedGuard(), func = std::forward<F>(func), evb]() mutable {
+          if (self->getEventBase() != evb) {
+            return;
+          }
+          func(std::move(self));
+        },
+        true);
+  }
 
   void updateWriteLooper(bool thisIteration);
   void updateReadLooper();
@@ -725,6 +778,10 @@ class QuicTransportBaseLite : virtual public QuicSocketLite,
       StreamId id,
       ReadCallback* cb,
       Optional<ApplicationErrorCode> err) noexcept;
+
+  quic::Expected<void, LocalErrorCode> pauseOrResumeRead(
+      StreamId id,
+      bool resume);
 
   /**
    * The callback function for AsyncUDPSocket to provide the additional cmsgs
@@ -834,7 +891,8 @@ class QuicTransportBaseLite : virtual public QuicSocketLite,
   UnorderedMap<StreamId, ReadCallbackData> readCallbacks_;
 
   ConnectionWriteCallback* connWriteCallback_{nullptr};
-  std::map<StreamId, StreamWriteCallback*> pendingWriteCallbacks_;
+  UnorderedMap<StreamId, StreamWriteCallback*> pendingWriteCallbacks_;
+  UnorderedMap<StreamId, StopSendingCallback*> stopSendingCallbacks_;
 
   struct ByteEventDetail {
     ByteEventDetail(uint64_t offsetIn, ByteEventCallback* callbackIn)

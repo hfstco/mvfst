@@ -189,9 +189,9 @@ struct ReadAckFrame {
   OptionalMicros maybeLatestRecvdPacketTime;
   OptionalIntegral<PacketNum> maybeLatestRecvdPacketNum;
   RecvdPacketsTimestampsRangeVec recvdPacketsTimestampRanges;
-  uint32_t ecnECT0Count{0};
-  uint32_t ecnECT1Count{0};
-  uint32_t ecnCECount{0};
+  uint64_t ecnECT0Count{0};
+  uint64_t ecnECT1Count{0};
+  uint64_t ecnCECount{0};
 
   bool operator==(const ReadAckFrame& /*rhs*/) const {
     // Can't compare ackBlocks, function is just here to appease compiler.
@@ -210,9 +210,9 @@ struct WriteAckFrame {
   OptionalMicros maybeLatestRecvdPacketTime;
   OptionalIntegral<PacketNum> maybeLatestRecvdPacketNum;
   RecvdPacketsTimestampsRangeVec recvdPacketsTimestampRanges;
-  uint32_t ecnECT0Count{0};
-  uint32_t ecnECT1Count{0};
-  uint32_t ecnCECount{0};
+  uint64_t ecnECT0Count{0};
+  uint64_t ecnECT1Count{0};
+  uint64_t ecnCECount{0};
 
   bool operator==(const WriteAckFrame& /*rhs*/) const {
     // Can't compare ackBlocks, function is just here to appease compiler.
@@ -266,13 +266,17 @@ struct WriteAckFrameState {
   // The packet number of entries in the deque is guaranteed to increase
   // monotonically because an entry is only added for a received packet
   // if the packet number is greater than the packet number of the last
-  // element in the deque (e.g., entries are not added for packets that
-  // arrive out of order relative to previously received packets).
+  // element in the deque.
+  //
+  // Receive timestamps are guaranteed to increase monotonically. Packets
+  // with receive times earlier than the last entry are skipped to preserve
+  // this invariant.
+  // TODO: update this when we support out-of-order packets.
   CircularDeque<ReceivedPacket> recvdPacketInfos;
   // The count of ECN marks seen on received packets.
-  uint32_t ecnECT0CountReceived{0};
-  uint32_t ecnECT1CountReceived{0};
-  uint32_t ecnCECountReceived{0};
+  uint64_t ecnECT0CountReceived{0};
+  uint64_t ecnECT1CountReceived{0};
+  uint64_t ecnCECountReceived{0};
 };
 
 struct WriteAckFrameMetaData {
@@ -379,7 +383,7 @@ struct ReadCryptoFrame {
     return *this;
   }
 
-  ReadCryptoFrame& operator=(ReadCryptoFrame&& other) {
+  ReadCryptoFrame& operator=(ReadCryptoFrame&& other) noexcept {
     offset = other.offset;
     data = std::move(other.data);
     return *this;
@@ -414,6 +418,9 @@ struct NewTokenFrame {
     }
   }
 
+  NewTokenFrame(NewTokenFrame&& other) noexcept = default;
+  NewTokenFrame& operator=(NewTokenFrame&& other) noexcept = default;
+
   bool operator==(const NewTokenFrame& rhs) const {
     BufEq eq;
     return eq(token, rhs.token);
@@ -432,12 +439,16 @@ struct ReadNewTokenFrame {
     }
   }
 
+  ReadNewTokenFrame(ReadNewTokenFrame&& other) noexcept = default;
+
   ReadNewTokenFrame& operator=(const ReadNewTokenFrame& other) {
     if (other.token) {
       token = other.token->clone();
     }
     return *this;
   }
+
+  ReadNewTokenFrame& operator=(ReadNewTokenFrame&& other) noexcept = default;
 
   bool operator==(const ReadNewTokenFrame& other) const {
     BufEq eq;
@@ -736,6 +747,9 @@ struct DatagramFrame {
         data(other.data.front() ? other.data.front()->clone() : nullptr) {
     MVCHECK_EQ(length, data.chainLength());
   }
+
+  DatagramFrame(DatagramFrame&& other) noexcept = default;
+  DatagramFrame& operator=(DatagramFrame&& other) noexcept = default;
 
   bool operator==(const DatagramFrame& other) const {
     if (length != other.length) {

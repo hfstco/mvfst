@@ -5,3 +5,4 @@
 
 add_subdirectory(client)
 add_subdirectory(handshake)
+add_subdirectory(server)

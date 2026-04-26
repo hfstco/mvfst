@@ -1202,6 +1202,125 @@ TYPED_TEST(
   this->destroyTransport();
 }
 
+/**
+ * Verify PacketProcessor preread and postread methods are invoked on all
+ * attached processors when a packet is received.
+ */
+TYPED_TEST(
+    QuicTypedTransportAfterStartTest,
+    PacketProcessorPrereadPostreadInvoked) {
+  // clear any outstanding packets
+  this->getNonConstConn().outstandings.reset();
+
+  // First packet processor
+  auto mockPacketProcessor = std::make_unique<MockPacketProcessor>();
+  auto rawPacketProcessor = mockPacketProcessor.get();
+  this->getNonConstConn().packetProcessors.push_back(
+      std::move(mockPacketProcessor));
+
+  bool prereadFlagOne = false;
+  bool postreadFlagOne = false;
+  EXPECT_CALL(*rawPacketProcessor, preread())
+      .Times(1)
+      .WillOnce([&prereadFlagOne]() { prereadFlagOne = true; });
+  EXPECT_CALL(*rawPacketProcessor, postread())
+      .Times(1)
+      .WillOnce([&postreadFlagOne]() { postreadFlagOne = true; });
+
+  // Second packet processor
+  auto mockPacketProcessor2 = std::make_unique<MockPacketProcessor>();
+  auto rawPacketProcessor2 = mockPacketProcessor2.get();
+  this->getNonConstConn().packetProcessors.push_back(
+      std::move(mockPacketProcessor2));
+
+  bool prereadFlagTwo = false;
+  bool postreadFlagTwo = false;
+  EXPECT_CALL(*rawPacketProcessor2, preread())
+      .Times(1)
+      .WillOnce([&prereadFlagTwo]() { prereadFlagTwo = true; });
+  EXPECT_CALL(*rawPacketProcessor2, postread())
+      .Times(1)
+      .WillOnce([&postreadFlagTwo]() { postreadFlagTwo = true; });
+
+  // Send a packet so we can deliver an ACK
+  auto streamId = this->getTransport()->createBidirectionalStream().value();
+  auto buf = buildRandomInputData(1000);
+  this->getTransport()->writeChain(streamId, std::move(buf), false);
+  const auto maybeWrittenPackets = this->loopForWrites();
+  ASSERT_TRUE(maybeWrittenPackets.has_value());
+
+  // Deliver an ACK packet — this triggers onNetworkData and the read path
+  this->deliverPacket(
+      this->buildAckPacketForSentAppDataPackets(maybeWrittenPackets),
+      std::chrono::steady_clock::time_point());
+
+  EXPECT_TRUE(prereadFlagOne);
+  EXPECT_TRUE(postreadFlagOne);
+  EXPECT_TRUE(prereadFlagTwo);
+  EXPECT_TRUE(postreadFlagTwo);
+  this->destroyTransport();
+}
+
+/**
+ * Verify PacketProcessor postread is still invoked even if onReadData
+ * encounters an error (guaranteed by SCOPE_EXIT).
+ */
+TYPED_TEST(
+    QuicTypedTransportAfterStartTest,
+    PacketProcessorPostreadInvokedOnError) {
+  // clear any outstanding packets
+  this->getNonConstConn().outstandings.reset();
+
+  auto mockPacketProcessor = std::make_unique<MockPacketProcessor>();
+  auto rawPacketProcessor = mockPacketProcessor.get();
+  this->getNonConstConn().packetProcessors.push_back(
+      std::move(mockPacketProcessor));
+
+  bool postreadFlag = false;
+  EXPECT_CALL(*rawPacketProcessor, postread())
+      .Times(1)
+      .WillOnce([&postreadFlag]() { postreadFlag = true; });
+
+  // Deliver a garbage packet — it will fail to parse but postread should
+  // still be called via SCOPE_EXIT
+  this->deliverPacket(
+      IOBuf::copyBuffer("garbage"), std::chrono::steady_clock::time_point());
+
+  EXPECT_TRUE(postreadFlag);
+  this->destroyTransport();
+}
+
+/**
+ * Verify PacketProcessor onPacketRead is called for each received UDP packet.
+ */
+TYPED_TEST(
+    QuicTypedTransportAfterStartTest,
+    PacketProcessorOnPacketReadInvoked) {
+  // clear any outstanding packets
+  this->getNonConstConn().outstandings.reset();
+
+  auto mockPacketProcessor = std::make_unique<MockPacketProcessor>();
+  auto rawPacketProcessor = mockPacketProcessor.get();
+  this->getNonConstConn().packetProcessors.push_back(
+      std::move(mockPacketProcessor));
+
+  EXPECT_CALL(*rawPacketProcessor, onPacketRead(_)).Times(1);
+
+  // Send a packet so we can deliver an ACK
+  auto streamId = this->getTransport()->createBidirectionalStream().value();
+  auto buf = buildRandomInputData(1000);
+  this->getTransport()->writeChain(streamId, std::move(buf), false);
+  const auto maybeWrittenPackets = this->loopForWrites();
+  ASSERT_TRUE(maybeWrittenPackets.has_value());
+
+  // Deliver a single ACK packet
+  this->deliverPacket(
+      this->buildAckPacketForSentAppDataPackets(maybeWrittenPackets),
+      std::chrono::steady_clock::time_point());
+
+  this->destroyTransport();
+}
+
 TYPED_TEST(
     QuicTypedTransportAfterStartTest,
     StreamAckedIntervalsDeliveryCallbacks) {
@@ -6072,6 +6191,142 @@ TYPED_TEST(
   EXPECT_EQ(
       initialState.maybeLastPacketSentTime,
       postLoopState.maybeLastPacketSentTime);
+
+  this->destroyTransport();
+}
+
+/**
+ * End-to-end test for prioritized datagram flow APIs.
+ *
+ * Exercises the full public API path:
+ *   createDatagramFlowId() -> writeDatagram(flowId, buf) ->
+ *   setDatagramFlowPriority(flowId, priority)
+ * and verifies that datagram frames are scheduled between a higher-priority
+ * stream and a lower-priority stream when scheduleDatagramsWithStreams is
+ * enabled.
+ *
+ * Expected priority order: highStream (urgency 1) > datagram flow (urgency 3)
+ *                          > lowStream (urgency 5)
+ * Expected frame order: WriteStreamFrame(highStream), DatagramFrame,
+ *                       WriteStreamFrame(lowStream)
+ */
+TYPED_TEST(
+    QuicTypedTransportAfterStartTestDatagram,
+    DatagramFlowPriorityScheduledBetweenStreams) {
+  if (!TypeParam::scheduleDatagramsWithStreams) {
+    GTEST_SKIP();
+  }
+
+  this->getNonConstConn().transportSettings.datagramConfig.trackingMode =
+      DatagramConfig::CongestionControlMode::ConstrainedAndTracked;
+  this->setWritableBytes(2000);
+
+  // Create a datagram flow via the public API
+  auto maybeFlowId = this->getTransport()->createDatagramFlowId();
+  ASSERT_TRUE(maybeFlowId.has_value());
+  auto flowId = maybeFlowId.value();
+
+  // Write a datagram to the flow (creates the flow entry in FlowManager)
+  auto dgWriteResult = this->getTransport()->writeDatagram(
+      flowId, folly::IOBuf::copyBuffer("DatagramPayload"));
+  ASSERT_TRUE(dgWriteResult.has_value());
+
+  // Set medium priority (urgency 3) on the datagram flow
+  auto setPriResult = this->getTransport()->setDatagramFlowPriority(
+      flowId, HTTPPriorityQueue::Priority(3, false));
+  ASSERT_TRUE(setPriResult.has_value());
+
+  // Create a high-priority stream (urgency 1)
+  auto maybeHighStreamId = this->getTransport()->createBidirectionalStream();
+  ASSERT_TRUE(maybeHighStreamId.has_value());
+  auto highStreamId = maybeHighStreamId.value();
+  this->getTransport()->setStreamPriority(
+      highStreamId, HTTPPriorityQueue::Priority(1, false));
+  auto highWriteResult = this->getTransport()->writeChain(
+      highStreamId, IOBuf::copyBuffer("HighPriStream"), false);
+  ASSERT_TRUE(highWriteResult.has_value());
+
+  // Create a low-priority stream (urgency 5)
+  auto maybeLowStreamId = this->getTransport()->createBidirectionalStream();
+  ASSERT_TRUE(maybeLowStreamId.has_value());
+  auto lowStreamId = maybeLowStreamId.value();
+  this->getTransport()->setStreamPriority(
+      lowStreamId, HTTPPriorityQueue::Priority(5, false));
+  auto lowWriteResult = this->getTransport()->writeChain(
+      lowStreamId, IOBuf::copyBuffer("LowPriStream"), false);
+  ASSERT_TRUE(lowWriteResult.has_value());
+
+  // Trigger the write loop
+  this->loopForWrites();
+
+  // Inspect frames across all sent packets and verify priority ordering:
+  //   highStream (urgency 1) before datagram (urgency 3) before
+  //   lowStream (urgency 5)
+  enum class FrameType { HighStream, Datagram, LowStream };
+  std::vector<FrameType> frameOrder;
+  for (const auto& pkt : this->getConn().outstandings.packets) {
+    for (const auto& frame : pkt.packet.frames) {
+      if (auto* sf = frame.asWriteStreamFrame()) {
+        if (sf->streamId == highStreamId) {
+          frameOrder.push_back(FrameType::HighStream);
+        } else if (sf->streamId == lowStreamId) {
+          frameOrder.push_back(FrameType::LowStream);
+        }
+      } else if (frame.asDatagramFrame()) {
+        frameOrder.push_back(FrameType::Datagram);
+      }
+    }
+  }
+
+  ASSERT_EQ(frameOrder.size(), 3);
+  EXPECT_EQ(frameOrder[0], FrameType::HighStream);
+  EXPECT_EQ(frameOrder[1], FrameType::Datagram);
+  EXPECT_EQ(frameOrder[2], FrameType::LowStream);
+
+  this->destroyTransport();
+}
+
+/**
+ * Verify that setDatagramFlowPriority succeeds on a flow that has been
+ * created via createDatagramFlowId() but has not yet had any datagrams
+ * written to it.
+ */
+TYPED_TEST(
+    QuicTypedTransportAfterStartTestDatagram,
+    SetPriorityBeforeFirstWrite) {
+  if (!TypeParam::scheduleDatagramsWithStreams) {
+    GTEST_SKIP();
+  }
+
+  // Create a datagram flow
+  auto maybeFlowId = this->getTransport()->createDatagramFlowId();
+  ASSERT_TRUE(maybeFlowId.has_value());
+  auto flowId = maybeFlowId.value();
+
+  // Set priority BEFORE writing any datagrams — this should succeed
+  auto setPriResult = this->getTransport()->setDatagramFlowPriority(
+      flowId, HTTPPriorityQueue::Priority(3, false));
+  ASSERT_TRUE(setPriResult.has_value());
+
+  this->destroyTransport();
+}
+
+/**
+ * Verify that writeDatagram rejects a flowId that was not created via
+ * createDatagramFlowId().
+ */
+TYPED_TEST(
+    QuicTypedTransportAfterStartTestDatagram,
+    WriteToUncreatedFlowReturnsError) {
+  if (!TypeParam::scheduleDatagramsWithStreams) {
+    GTEST_SKIP();
+  }
+
+  // Write to a flowId that was never created
+  auto result = this->getTransport()->writeDatagram(
+      12345, folly::IOBuf::copyBuffer("payload"));
+  ASSERT_TRUE(result.hasError());
+  EXPECT_EQ(LocalErrorCode::INVALID_OPERATION, result.error());
 
   this->destroyTransport();
 }

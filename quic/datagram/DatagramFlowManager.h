@@ -12,6 +12,7 @@
 #include <quic/QuicConstants.h>
 #include <quic/common/BufUtil.h>
 #include <quic/common/CircularDeque.h>
+#include <quic/common/Expected.h>
 #include <quic/priority/PriorityQueue.h>
 #include <chrono>
 
@@ -32,13 +33,14 @@ class DatagramFlowManager {
   struct DatagramFlowQueue {
     BufQueue single;
     std::unique_ptr<CircularDeque<BufQueue>> multi;
+    PriorityQueue::Priority priority{kDefaultDatagramPriority};
 
     DatagramFlowQueue() = default;
     ~DatagramFlowQueue() = default;
 
     // Move-only
-    DatagramFlowQueue(DatagramFlowQueue&&) = default;
-    DatagramFlowQueue& operator=(DatagramFlowQueue&&) = default;
+    DatagramFlowQueue(DatagramFlowQueue&&) noexcept = default;
+    DatagramFlowQueue& operator=(DatagramFlowQueue&&) noexcept = default;
     DatagramFlowQueue(const DatagramFlowQueue&) = delete;
     DatagramFlowQueue& operator=(const DatagramFlowQueue&) = delete;
 
@@ -66,8 +68,8 @@ class DatagramFlowManager {
   ~DatagramFlowManager() = default;
 
   // Move-only
-  DatagramFlowManager(DatagramFlowManager&&) = default;
-  DatagramFlowManager& operator=(DatagramFlowManager&&) = default;
+  DatagramFlowManager(DatagramFlowManager&&) noexcept = default;
+  DatagramFlowManager& operator=(DatagramFlowManager&&) noexcept = default;
   DatagramFlowManager(const DatagramFlowManager&) = delete;
   DatagramFlowManager& operator=(const DatagramFlowManager&) = delete;
 
@@ -92,9 +94,36 @@ class DatagramFlowManager {
   }
 
   /**
-   * Add a datagram to a flow's write buffer.
+   * Create an empty flow entry in the write buffer.
+   * No-op if the flow already exists.
    */
-  void addDatagram(BufQueue buf, uint32_t flowId = kDefaultDatagramFlowId);
+  void createFlow(uint32_t flowId) {
+    writeBuffer_.try_emplace(flowId);
+  }
+
+  /**
+   * Check if a flow exists in the write buffer (created or has datagrams).
+   */
+  [[nodiscard]] bool hasFlow(uint32_t flowId) const {
+    return writeBuffer_.find(flowId) != writeBuffer_.end();
+  }
+
+  /**
+   * Add a datagram to a flow's write buffer.
+   * Returns the flow's priority.
+   */
+  PriorityQueue::Priority addDatagram(
+      BufQueue buf,
+      uint32_t flowId = kDefaultDatagramFlowId);
+
+  /**
+   * Set priority for an existing flow.
+   * Returns error if flow doesn't exist, otherwise returns whether flow is
+   * empty.
+   */
+  quic::Expected<bool, LocalErrorCode> setFlowPriority(
+      uint32_t flowId,
+      PriorityQueue::Priority priority);
 
   /**
    * Pop a datagram from a flow if it fits in the available space.
@@ -114,6 +143,12 @@ class DatagramFlowManager {
    * Check if a flow exists and is not empty.
    */
   [[nodiscard]] bool hasDatagramsForFlow(uint32_t flowId) const;
+
+  /**
+   * Close a datagram flow and drop any queued datagrams.
+   * Returns error if flow doesn't exist.
+   */
+  quic::Expected<void, LocalErrorCode> closeFlow(uint32_t flowId);
 
  private:
   // Buffers Outgoing Datagrams per-flow

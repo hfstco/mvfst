@@ -23,6 +23,7 @@
 #include <quic/datagram/DatagramFlowManager.h>
 #include <quic/handshake/HandshakeLayer.h>
 #include <quic/logging/QLogger.h>
+#include <quic/logging/oops_logger/OopsLogger.h>
 #include <quic/observer/SocketObserverTypes.h>
 #include <quic/state/AckEvent.h>
 #include <quic/state/AckStates.h>
@@ -37,6 +38,7 @@
 #include <quic/state/StreamData.h>
 #include <quic/state/TransportSettings.h>
 
+#include <folly/TokenBucket.h>
 #include <folly/container/F14Map.h>
 #include <folly/io/async/DelayedDestruction.h>
 #include <quic/common/Optional.h>
@@ -216,8 +218,6 @@ struct Pacer {
 
   virtual void onPacketSent() = 0;
   virtual void onPacketsLoss() = 0;
-
-  virtual void setExperimental(bool experimental) = 0;
 };
 
 struct PacingRate {
@@ -328,6 +328,11 @@ struct QuicConnectionStateBase : public folly::DelayedDestruction {
 
   // Pacer
   std::unique_ptr<Pacer> pacer;
+
+  // Egress token bucket policer for rate limiting outgoing packets.
+  // Server-only: only set via server transport knob handlers.
+  std::unique_ptr<folly::TokenBucket> egressPolicer;
+  Optional<TimePoint> egressPolicerActivationTime;
 
   // Congestion Controller factory to create specific impl of cc algorithm
   std::shared_ptr<CongestionControllerFactory> congestionControllerFactory;
@@ -497,6 +502,12 @@ struct QuicConnectionStateBase : public folly::DelayedDestruction {
 
     // Send an immediate ack frame (requesting an ack)
     bool requestImmediateAck{false};
+
+    // Set by onPTOAlarm when ptoCount reaches path degrading threshold
+    bool notifyPathDegrading{false};
+
+    // Set by onPTOAlarm when ptoCount reaches blackhole threshold
+    bool notifyBlackholeDetected{false};
   };
 
   PendingEvents pendingEvents;
@@ -551,15 +562,6 @@ struct QuicConnectionStateBase : public folly::DelayedDestruction {
   // Current state of flow control.
   ConnectionFlowControlState flowControlState;
 
-  struct PendingWriteBatch {
-    BufPtr buf;
-    // More fields will be needed here for other batch writer types.
-  };
-
-  // A write batch that was attempted but did not succeed.
-  // This is only used by the SinglePacketBackpressureBatchWriter.
-  PendingWriteBatch pendingWriteBatch_;
-
   // Settings for transports.
   TransportSettings transportSettings;
 
@@ -590,6 +592,9 @@ struct QuicConnectionStateBase : public folly::DelayedDestruction {
 
   // QLogger for this connection
   std::shared_ptr<QLogger> qLogger;
+
+  // Protocol OOPS logger for this connection
+  std::shared_ptr<proto_oops::OopsLogger> oopsLogger;
 
   // Track stats for various server events
   QuicTransportStatsCallback* statsCallback{nullptr};
@@ -692,8 +697,8 @@ struct QuicConnectionStateBase : public folly::DelayedDestruction {
     ~DatagramState() = default;
 
     // Move-only (due to DatagramFlowManager being move-only)
-    DatagramState(DatagramState&&) = default;
-    DatagramState& operator=(DatagramState&&) = default;
+    DatagramState(DatagramState&&) noexcept = default;
+    DatagramState& operator=(DatagramState&&) noexcept = default;
     DatagramState(const DatagramState&) = delete;
     DatagramState& operator=(const DatagramState&) = delete;
   };
@@ -713,6 +718,8 @@ struct QuicConnectionStateBase : public folly::DelayedDestruction {
   bool peerAdvertisedKnobFrameSupport{false};
 
   ExtendedAckFeatureMaskType peerAdvertisedExtendedAckFeatures{0};
+
+  Optional<uint16_t> peerQuicExperimentId;
 
   // Negotiated ACK related config. These don't change throughout the connection
   // so cache them once we've receive the relevant transport parameters.
@@ -763,7 +770,18 @@ struct QuicConnectionStateBase : public folly::DelayedDestruction {
   struct SconeState {
     CircularDeque<SconeRateSignal> pendingRateSignals;
     bool negotiated{false};
-    bool sentThisLoop{false};
+    Optional<TimePoint> lastSconeSentTime;
+    uint8_t configuredRateSignal{kSconeNoAdvice};
+
+    // Edge-triggered received signal. Set when a SCONE rate signal is received
+    // from the peer, cleared when consumed via consumePendingSconeRate().
+    struct PendingReceivedSignal {
+      uint8_t rate;
+      QuicVersion version;
+      TimePoint receivedTime;
+    };
+
+    Optional<PendingReceivedSignal> pendingReceivedSignal;
   };
 
   Optional<SconeState> scone;

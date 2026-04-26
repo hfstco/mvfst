@@ -122,6 +122,7 @@ mvfst_cpp_library(
         ":stats_callback",
         ":transport_settings",
         "//folly:network_address",
+        "//folly:token_bucket",
         "//folly/container:f14_hash",
         "//folly/io/async:delayed_destruction",
         "//quic:config",
@@ -142,6 +143,7 @@ mvfst_cpp_library(
         "//quic/datagram:datagram_flow_manager",
         "//quic/handshake:handshake",
         "//quic/logging:qlogger",
+        "//quic/logging/oops_logger:oops_logger",
         "//quic/observer:socket_observer_types",
         "//quic/priority:priority_queue",
     ],
@@ -229,7 +231,12 @@ mvfst_cpp_library(
     name = "stats_callback",
     headers = select({
         "DEFAULT": {"QuicTransportStatsCallback.h": "QuicTransportStatsCallback.h"},
-        "ovr_config//os/constraints:android": {"QuicTransportStatsCallback.h": "facebook/QuicTransportStatsCallbackMobile.h"},
+        # Mobile: use minimal stats callback (no TransportKnob methods)
+        # ARVR Android uses full stats callback
+        "ovr_config//os/constraints:android": select({
+            "DEFAULT": {"QuicTransportStatsCallback.h": "facebook/QuicTransportStatsCallbackMobile.h"},
+            "ovr_config//build_mode:arvr_mode[enabled]": {"QuicTransportStatsCallback.h": "QuicTransportStatsCallback.h"},
+        }),
         "ovr_config//os/constraints:iphoneos": {"QuicTransportStatsCallback.h": "facebook/QuicTransportStatsCallbackMobile.h"},
     }),
     exported_deps = select({
@@ -239,17 +246,20 @@ mvfst_cpp_library(
             "//quic:exception",
             "//quic/common:optional",
         ],
-        "ovr_config//os/constraints:android": [
-            "//quic:constants",
-            "//quic:exception",
-            "//quic/common:optional",
-        ],
+        "ovr_config//os/constraints:android": select({
+            "DEFAULT": [
+                "//quic:constants",
+                "//quic:exception",
+                "//quic/common:optional",
+            ],
+            "ovr_config//build_mode:arvr_mode[enabled]": [
+                "//folly/functional:invoke",
+                "//quic:constants",
+                "//quic:exception",
+                "//quic/common:optional",
+            ],
+        }),
         "ovr_config//os/constraints:iphoneos": [
-            "//quic:constants",
-            "//quic:exception",
-            "//quic/common:optional",
-        ],
-        "ovr_config//os/constraints:macos": [
             "//quic:constants",
             "//quic:exception",
             "//quic/common:optional",

@@ -8,6 +8,7 @@
 #pragma once
 
 #include <quic/QuicException.h>
+#include <quic/QuicTypealiases.h>
 #include <quic/common/Expected.h>
 #include <quic/common/MvfstLogging.h> // For QuicError
 #include <quic/common/NetworkData.h>
@@ -48,30 +49,19 @@ class LibevQuicAsyncUDPSocket : public QuicAsyncUDPSocketImpl {
       size_t iovec_len) override;
 
   int writem(
-      folly::Range<folly::SocketAddress const*> addrs,
+      AddressRange addrs,
       iovec* iov,
       size_t* numIovecsInBuffer,
       size_t count) override;
 
   ssize_t writeGSO(
-      const folly::SocketAddress& /*address*/,
-      const struct iovec* /* vec */,
-      size_t /* iovec_len */,
-      WriteOptions /*options*/) override {
-    MVCHECK(false, __func__ << " not supported in LibevQuicAsyncUDPSocket");
-  }
+      const folly::SocketAddress& address,
+      const struct iovec* vec,
+      size_t iovec_len,
+      WriteOptions options) override;
 
-  /**
-   * Send the data in buffers to destination. Returns the return code from
-   * ::sendmmsg.
-   * bufs is an array of BufPtr
-   * of size num
-   * options is an array of WriteOptions or nullptr
-   *  Before calling writeGSO with a positive value
-   *  verify GSO is supported on this platform by calling getGSO
-   */
   int writemGSO(
-      folly::Range<folly::SocketAddress const*> /*addrs*/,
+      AddressRange /*addrs*/,
       const BufPtr* /*bufs*/,
       size_t /*count*/,
       const WriteOptions* /*options*/) override {
@@ -79,7 +69,7 @@ class LibevQuicAsyncUDPSocket : public QuicAsyncUDPSocketImpl {
   }
 
   int writemGSO(
-      folly::Range<folly::SocketAddress const*> /* addrs */,
+      AddressRange /* addrs */,
       iovec* /* iov */,
       size_t* /* numIovecsInBuffer */,
       size_t /* count */,
@@ -245,6 +235,8 @@ class LibevQuicAsyncUDPSocket : public QuicAsyncUDPSocketImpl {
 
   bool bound_{false};
   bool connected_{false};
+  int gso_{0};
+  bool gsoProbed_{false};
   bool reuseAddr_{false};
   bool reusePort_{false};
   int rcvBuf_{0};

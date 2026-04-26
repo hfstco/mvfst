@@ -193,13 +193,19 @@ Optional<std::vector<uint8_t>> FizzClientHandshake::getExportedKeyingMaterial(
     return std::nullopt;
   }
 
-  auto ekm = fizz::Exporter::getExportedKeyingMaterial(
-      *state_.context()->getFactory(),
-      cipherSuite.value(),
-      ems.value()->coalesce(),
-      label,
-      context == std::nullopt ? nullptr : BufHelpers::wrapBuffer(*context),
-      keyLength);
+  BufPtr ekm;
+  fizz::Error fizzErr;
+  FIZZ_THROW_ON_ERROR(
+      fizz::Exporter::getExportedKeyingMaterial(
+          ekm,
+          fizzErr,
+          *state_.context()->getFactory(),
+          cipherSuite.value(),
+          ems.value()->coalesce(),
+          label,
+          context == std::nullopt ? nullptr : BufHelpers::wrapBuffer(*context),
+          keyLength),
+      fizzErr);
 
   std::vector<uint8_t> result(ekm->coalesce());
   return result;
@@ -210,7 +216,7 @@ EncryptionLevel FizzClientHandshake::getReadRecordLayerEncryptionLevel() {
       state_.readRecordLayer()->getEncryptionLevel());
 }
 
-void FizzClientHandshake::processSocketData(folly::IOBufQueue& queue) {
+void FizzClientHandshake::processSocketData(quic::IOBufQueue& queue) {
   processActions(
       machine_.processSocketData(state_, queue, fizz::Aead::AeadOptions()));
 }
@@ -226,20 +232,31 @@ quic::Expected<std::unique_ptr<Aead>, QuicError> FizzClientHandshake::buildAead(
     bool isEarlyTraffic = kind == CipherKind::ZeroRttWrite;
     fizz::CipherSuite cipher =
         isEarlyTraffic ? state_.earlyDataParams()->cipher : *state_.cipher();
-    std::unique_ptr<fizz::KeyScheduler> keySchedulerPtr = isEarlyTraffic
-        ? state_.context()->getFactory()->makeKeyScheduler(cipher)
-        : nullptr;
+    std::unique_ptr<fizz::KeyScheduler> keySchedulerPtr;
+    if (isEarlyTraffic) {
+      fizz::Error fizzErr;
+      FIZZ_THROW_ON_ERROR(
+          state_.context()->getFactory()->makeKeyScheduler(
+              keySchedulerPtr, fizzErr, cipher),
+          fizzErr);
+    }
     fizz::KeyScheduler& keyScheduler =
         isEarlyTraffic ? *keySchedulerPtr : *state_.keyScheduler();
 
-    auto aead = FizzAead::wrap(
+    std::unique_ptr<fizz::Aead> derivedAead;
+    fizz::Error fizzErr;
+    FIZZ_THROW_ON_ERROR(
         fizz::Protocol::deriveRecordAeadWithLabel(
+            derivedAead,
+            fizzErr,
             *state_.context()->getFactory(),
             keyScheduler,
             cipher,
             secret,
             kQuicKeyLabel,
-            kQuicIVLabel));
+            kQuicIVLabel),
+        fizzErr);
+    auto aead = FizzAead::wrap(std::move(derivedAead));
 
     return aead;
   } catch (const std::exception& ex) {
@@ -256,8 +273,12 @@ FizzClientHandshake::buildHeaderCipher(ByteRange secret) {
 quic::Expected<BufPtr, QuicError> FizzClientHandshake::getNextTrafficSecret(
     ByteRange secret) const {
   try {
-    auto deriver =
-        state_.context()->getFactory()->makeKeyDeriver(*state_.cipher());
+    std::unique_ptr<fizz::KeyDerivation> deriver;
+    fizz::Error fizzErr;
+    FIZZ_THROW_ON_ERROR(
+        state_.context()->getFactory()->makeKeyDeriver(
+            deriver, fizzErr, *state_.cipher()),
+        fizzErr);
     auto nextSecret = deriver->expandLabel(
         secret, kQuicKULabel, BufHelpers::create(0), secret.size());
     return nextSecret;
@@ -298,7 +319,7 @@ void FizzClientHandshake::echRetryAvailable(
   }
 }
 
-const std::shared_ptr<const folly::AsyncTransportCertificate>
+const std::shared_ptr<const fizz::Cert>
 FizzClientHandshake::getPeerCertificate() const {
   return state_.serverCert();
 }

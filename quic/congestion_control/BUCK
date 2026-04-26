@@ -63,9 +63,9 @@ mvfst_cpp_library(
             ":bbr_bandwidth_sampler",
             ":bbr_rtt_sampler",
             ":copa",
-            ":copa2",
             ":cubic",
             ":newreno",
+            "//quic/congestion_control/modular:bbr2_startup",
         ],
         "ovr_config//os/constraints:android": [
             ":copa",
@@ -75,7 +75,9 @@ mvfst_cpp_library(
             ":copa",
             ":cubic",
         ],
-    }) + ["//quic/common:mvfst_logging"],
+    }) + [
+        "//quic/common:mvfst_logging",
+    ],
     exported_deps = [
         "//quic:constants",
     ],
@@ -113,11 +115,10 @@ mvfst_cpp_library(
         ":bbr2",
         ":bbr_bandwidth_sampler",
         ":bbr_rtt_sampler",
-        ":bbr_testing",
         ":copa",
-        ":copa2",
         ":cubic",
         ":newreno",
+        "//quic/congestion_control/modular:bbr2_startup",
     ],
     exported_deps = [
         ":congestion_controller_factory",
@@ -197,28 +198,6 @@ mvfst_cpp_library(
 )
 
 mvfst_cpp_library(
-    name = "copa2",
-    srcs = [
-        "Copa2.cpp",
-    ],
-    headers = [
-        "Copa2.h",
-    ],
-    deps = [
-        ":congestion_control_functions",
-        "//quic/common:mvfst_logging",
-        "//quic/logging:qlogger_constants",
-        "//quic/logging:qlogger_macros",
-    ],
-    exported_deps = [
-        ":congestion_controller",
-        "//quic/congestion_control/third_party:chromium_windowed_filter",
-        "//quic/state:ack_event",
-        "//quic/state:quic_state_machine",
-    ],
-)
-
-mvfst_cpp_library(
     name = "bbr",
     srcs = [
         "Bbr.cpp",
@@ -256,6 +235,7 @@ mvfst_cpp_library(
     deps = [
         ":congestion_control_functions",
         "//quic/common:mvfst_logging",
+        "//quic/logging:qlogger_constants",
         "//quic/logging:qlogger_macros",
     ],
     exported_deps = [
@@ -296,19 +276,6 @@ mvfst_cpp_library(
         ":bbr",
         "//quic/congestion_control/third_party:chromium_windowed_filter",
         "//quic/state:quic_state_machine",
-    ],
-)
-
-mvfst_cpp_library(
-    name = "bbr_testing",
-    srcs = [
-        "BbrTesting.cpp",
-    ],
-    headers = [
-        "BbrTesting.h",
-    ],
-    exported_deps = [
-        ":bbr",
     ],
 )
 
@@ -356,6 +323,7 @@ mvfst_cpp_library(
     exported_deps = [
         ":congestion_controller",
         "//folly/io:socket_option_map",
+        "//quic/common:network_data",
         "//quic/state:cloned_packet_identifier",
         "//quic/state:outstanding_packet",
     ],
@@ -374,11 +342,9 @@ mvfst_cpp_library(
         "//quic/common:mvfst_logging",
     ],
     exported_deps = [
+        "fbsource//third-party/glog:glog",
         "//folly:token_bucket",
         "//quic:constants",
-    ],
-    exported_external_deps = [
-        "glog",
     ],
 )
 

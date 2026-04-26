@@ -8,9 +8,10 @@
 #include <fizz/crypto/Utils.h>
 #include <quic/fizz/handshake/FizzCryptoFactory.h>
 
-#include <quic/fizz/handshake/FizzBridge.h>
 #include <quic/fizz/handshake/FizzPacketNumberCipher.h>
 #include <quic/handshake/HandshakeLayer.h>
+
+#include QUIC_DEFAULT_AEAD_HEADER
 
 namespace quic {
 
@@ -18,8 +19,12 @@ quic::Expected<BufPtr, QuicError> FizzCryptoFactory::makeInitialTrafficSecret(
     folly::StringPiece label,
     const ConnectionId& clientDestinationConnId,
     QuicVersion version) const {
-  auto deriver =
-      fizzFactory_->makeKeyDeriver(fizz::CipherSuite::TLS_AES_128_GCM_SHA256);
+  std::unique_ptr<fizz::KeyDerivation> deriver;
+  fizz::Error err;
+  FIZZ_THROW_ON_ERROR(
+      fizzFactory_->makeKeyDeriver(
+          deriver, err, fizz::CipherSuite::TLS_AES_128_GCM_SHA256),
+      err);
   auto connIdRange = quic::ByteRange(
       clientDestinationConnId.data(), clientDestinationConnId.size());
   folly::StringPiece salt = getQuicVersionSalt(version);
@@ -44,9 +49,18 @@ FizzCryptoFactory::makeInitialAead(
   }
   auto& trafficSecret = trafficSecretResult.value();
 
-  auto deriver =
-      fizzFactory_->makeKeyDeriver(fizz::CipherSuite::TLS_AES_128_GCM_SHA256);
-  auto aead = fizzFactory_->makeAead(fizz::CipherSuite::TLS_AES_128_GCM_SHA256);
+  std::unique_ptr<fizz::KeyDerivation> deriver;
+  fizz::Error err;
+  FIZZ_THROW_ON_ERROR(
+      fizzFactory_->makeKeyDeriver(
+          deriver, err, fizz::CipherSuite::TLS_AES_128_GCM_SHA256),
+      err);
+
+  std::unique_ptr<fizz::Aead> aead;
+  FIZZ_THROW_ON_ERROR(
+      fizzFactory_->makeAead(
+          aead, err, fizz::CipherSuite::TLS_AES_128_GCM_SHA256),
+      err);
   auto key = deriver->expandLabel(
       trafficSecret->coalesce(),
       kQuicKeyLabel,
@@ -62,7 +76,7 @@ FizzCryptoFactory::makeInitialAead(
   trafficKey.key = std::move(key);
   trafficKey.iv = std::move(iv);
   aead->setKey(std::move(trafficKey));
-  return FizzAead::wrap(std::move(aead));
+  return QUIC_DEFAULT_AEAD::wrap(std::move(aead));
 }
 
 quic::Expected<std::unique_ptr<PacketNumberCipher>, QuicError>
@@ -74,8 +88,12 @@ FizzCryptoFactory::makePacketNumberCipher(ByteRange baseSecret) const {
   }
   auto pnCipher = std::move(pnCipherResult.value());
 
-  auto deriver =
-      fizzFactory_->makeKeyDeriver(fizz::CipherSuite::TLS_AES_128_GCM_SHA256);
+  std::unique_ptr<fizz::KeyDerivation> deriver;
+  fizz::Error err;
+  FIZZ_THROW_ON_ERROR(
+      fizzFactory_->makeKeyDeriver(
+          deriver, err, fizz::CipherSuite::TLS_AES_128_GCM_SHA256),
+      err);
   auto pnKey = deriver->expandLabel(
       baseSecret, kQuicPNLabel, BufHelpers::create(0), pnCipher->keyLength());
   auto setKeyResult = pnCipher->setKey(pnKey->coalesce());

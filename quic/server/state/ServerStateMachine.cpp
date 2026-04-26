@@ -54,7 +54,6 @@ void maybeSetExperimentalSettings(QuicServerConnectionState& conn) {
   } else if (conn.version == QuicVersion::MVFST_EXPERIMENTAL3) {
   } else if (conn.version == QuicVersion::MVFST_EXPERIMENTAL4) {
   } else if (conn.version == QuicVersion::MVFST_EXPERIMENTAL5) {
-    conn.transportSettings.sendAckOnlyInitial = true;
   }
 }
 
@@ -322,6 +321,14 @@ quic::Expected<void, QuicError> processClientInitialParams(
   }
   auto extendedAckFeatures = extendedAckFeaturesResult.value();
 
+  auto quicExperimentResult = getIntegerParameter(
+      static_cast<TransportParameterId>(TransportParameterId::quic_experiment),
+      clientParams.parameters);
+  if (quicExperimentResult.hasError()) {
+    return quic::make_unexpected(quicExperimentResult.error());
+  }
+  auto quicExperiment = quicExperimentResult.value();
+
   auto reliableResetTpIter = findParameter(
       clientParams.parameters,
       static_cast<TransportParameterId>(
@@ -461,11 +468,11 @@ quic::Expected<void, QuicError> processClientInitialParams(
     if (maxReceiveTimestampsPerAck.has_value() &&
         receiveTimestampsExponent.has_value()) {
       conn.maybePeerAckReceiveTimestampsConfig = {
-          std::min(
+          .maxReceiveTimestampsPerAck = std::min(
               static_cast<uint8_t>(maxReceiveTimestampsPerAck.value()),
               static_cast<uint8_t>(
                   conn.transportSettings.maxReceiveTimestampsPerAckStored)),
-          std::max(
+          .receiveTimestampsExponent = std::max(
               static_cast<uint8_t>(receiveTimestampsExponent.value()),
               static_cast<uint8_t>(0))};
     }
@@ -473,6 +480,9 @@ quic::Expected<void, QuicError> processClientInitialParams(
 
   conn.peerAdvertisedKnobFrameSupport = knobFrameSupported.value_or(0) > 0;
   conn.peerAdvertisedExtendedAckFeatures = extendedAckFeatures.value_or(0);
+  if (quicExperiment.has_value()) {
+    conn.peerQuicExperimentId = static_cast<uint16_t>(*quicExperiment);
+  }
 
   return {};
 }
@@ -687,57 +697,58 @@ void updateWritableByteLimitOnRecvPacket(QuicServerConnectionState& conn) {
 
 void maybeUpdateTransportFromAppToken(
     QuicServerConnectionState& conn,
-    const Optional<BufPtr>& tokenBuf)
-{
-    if (!tokenBuf) {
-        return;
-    }
-    auto appToken = decodeAppToken(*tokenBuf.value());
-    if (!appToken) {
-        MVVLOG(10) << "Failed to decode app token";
-        return;
-    }
-    auto& params = appToken->transportParams.parameters;
-    auto maybeCwndHintBytesResult =
-        getIntegerParameter(TransportParameterId::cwnd_hint_bytes, params);
-    if (!maybeCwndHintBytesResult.hasError()) {
-        auto maybeCwndHintBytes = maybeCwndHintBytesResult.value();
-        if (maybeCwndHintBytes) {
-            QUIC_STATS(conn.statsCallback, onCwndHintBytesSample, *maybeCwndHintBytes);
+    const Optional<BufPtr>& tokenBuf) {
+  if (!tokenBuf) {
+    return;
+  }
+  auto appToken = decodeAppToken(*tokenBuf.value());
+  if (!appToken) {
+    MVVLOG(10) << "Failed to decode app token";
+    return;
+  }
+  auto& params = appToken->transportParams.parameters;
 
-            // Only use the cwndHint if the source address is included in the token
-            MVDCHECK(conn.peerAddress.isInitialized());
-            auto addressMatches =
-                std::find(
-                    appToken->sourceAddresses.begin(),
-                    appToken->sourceAddresses.end(),
-                    conn.peerAddress.getIPAddress()) != appToken->sourceAddresses.end();
-            if (addressMatches) {
-                conn.maybeCwndHintBytes = maybeCwndHintBytes;
-            }
-        }
-        auto maybeSavedCongestionWindowResult = getIntegerParameter(TransportParameterId::saved_congestion_window, params);
-        auto maybeSavedRttResult = getIntegerParameter(TransportParameterId::saved_rtt, params);
-        if (!maybeSavedCongestionWindowResult.hasError() && !maybeSavedRttResult.hasError()) {
-            auto maybeSavedCongestionWindow = maybeSavedCongestionWindowResult.value();
-            auto maybeSavedRtt = maybeSavedRttResult.value();
-            VLOG(1) << "Read Careful Resume parameters from Ticket. savedCongestionWindow=" << maybeSavedCongestionWindow.value()
-              << " savedRtt=" << maybeSavedRtt.value();
-            if (maybeSavedCongestionWindow && maybeSavedRtt) {
-                // Only use the Careful Resume if the source address is included in the token
-                DCHECK(conn.peerAddress.isInitialized());
-                auto addressMatches =
-                    std::find(
-                        appToken->sourceAddresses.begin(),
-                        appToken->sourceAddresses.end(),
-                        conn.peerAddress.getIPAddress()) != appToken->sourceAddresses.end();
-                if (addressMatches) {
-                    conn.maybeSavedCongestionWindow = maybeSavedCongestionWindow;
-                    conn.maybeSavedRtt = maybeSavedRtt;
-                }
-            }
-        }
+  // Extract cwnd and rtt hints
+  auto maybeCwndHintBytesResult =
+      getIntegerParameter(TransportParameterId::cwnd_hint_bytes, params);
+  if (maybeCwndHintBytesResult.hasError()) {
+    return;
+  }
+  auto maybeCwndHintBytes = maybeCwndHintBytesResult.value();
+
+  auto maybeRttHintMsResult =
+      getIntegerParameter(TransportParameterId::rtt_hint_ms, params);
+  if (maybeRttHintMsResult.hasError()) {
+    return;
+  }
+  const auto& maybeRttHintMs = maybeRttHintMsResult.value();
+
+  if (maybeCwndHintBytes && maybeRttHintMs) {
+    QUIC_STATS(conn.statsCallback, onCwndHintBytesSample, *maybeCwndHintBytes);
+
+    // Only use the cwndHint and rtt hints if the source address prefix matches
+    // the most recent address in the token (/24 for IPv4, /48 for IPv6).
+    // We only check the last address because the cwnd hint was captured when
+    // the client was on that address; matching against older addresses could
+    // apply a hint from a different network (e.g., WiFi hint on cellular).
+    MVDCHECK(conn.peerAddress.isInitialized());
+    const auto& currentAddr = conn.peerAddress.getIPAddress();
+    bool addressMatches = false;
+    if (!appToken->sourceAddresses.empty()) {
+      const auto& tokenAddr = appToken->sourceAddresses.back();
+      if (currentAddr.isV4() && tokenAddr.isV4()) {
+        addressMatches = currentAddr.inSubnet(tokenAddr, 24);
+      } else if (currentAddr.isV6() && tokenAddr.isV6()) {
+        addressMatches = currentAddr.inSubnet(tokenAddr, 48);
+      }
     }
+    if (addressMatches) {
+      if (conn.congestionController) {
+        conn.congestionController->setResumeHints(
+            *maybeCwndHintBytes, std::chrono::milliseconds(*maybeRttHintMs));
+      }
+    }
+  }
 }
 
 quic::Expected<void, QuicError> onConnectionMigration(
@@ -806,6 +817,12 @@ quic::Expected<void, QuicError> onConnectionMigration(
   }
 
   QUIC_STATS(conn.statsCallback, onConnectionMigration);
+
+  // Reset SCONE timer so a fresh SCONE packet is sent on the new path.
+  // New network elements on the migrated path need to observe the rate signal.
+  if (conn.scone) {
+    conn.scone->lastSconeSentTime.reset();
+  }
 
   if (!isNATRebinding) {
     auto ccaRestored =
@@ -1141,7 +1158,8 @@ quic::Expected<void, QuicError> onServerReadDataFromOpen(
             // Store rate signal conditionally - only queue if subsequent packet
             // processes successfully
             pendingSconeRateSignal = QuicConnectionStateBase::SconeRateSignal{
-                sp->rate, static_cast<QuicVersion>(sp->version)};
+                .rate = sp->rate,
+                .version = static_cast<QuicVersion>(sp->version)};
           }
         }
         continue; // SCONE packet carries no frames - continue to next packet
@@ -1175,6 +1193,12 @@ quic::Expected<void, QuicError> onServerReadDataFromOpen(
       return quic::make_unexpected(QuicError(
           TransportErrorCode::PROTOCOL_VIOLATION, "Packet has no frames"));
     }
+
+    // A valid packet was successfully parsed from this datagram. Clear the
+    // firstPacketFromPeer flag so that trailing unparseable bytes (e.g.,
+    // random padding added by some implementations like picoquic) do not
+    // cause the connection to be abandoned.
+    firstPacketFromPeer = false;
 
     auto protectionLevel = regularOptional->header.getProtectionType();
     auto encryptionLevel = protectionTypeToEncryptionLevel(protectionLevel);

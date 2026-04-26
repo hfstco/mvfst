@@ -144,6 +144,12 @@ class MockQuicSocket : public QuicSocket {
       setReadCallback,
       (StreamId, ReadCallback*, Optional<ApplicationErrorCode> err));
   MOCK_METHOD(
+      (quic::Expected<void, LocalErrorCode>),
+      setStopSendingCallback,
+      (StreamId, StopSendingCallback*),
+      (noexcept));
+
+  MOCK_METHOD(
       void,
       setConnectionSetupCallback,
       (folly::MaybeManagedPtr<ConnectionSetupCallback>));
@@ -189,16 +195,7 @@ class MockQuicSocket : public QuicSocket {
       (bool));
   MOCK_METHOD(uint64_t, getNumOpenableBidirectionalStreams, (), (const));
   MOCK_METHOD(uint64_t, getNumOpenableUnidirectionalStreams, (), (const));
-  MOCK_METHOD((bool), isClientStream, (StreamId), (noexcept));
-  MOCK_METHOD((bool), isServerStream, (StreamId), (noexcept));
-  MOCK_METHOD((StreamInitiator), getStreamInitiator, (StreamId), (noexcept));
-  MOCK_METHOD((bool), isBidirectionalStream, (StreamId), (noexcept));
-  MOCK_METHOD((bool), isUnidirectionalStream, (StreamId), (noexcept));
-  MOCK_METHOD(
-      (StreamDirectionality),
-      getStreamDirectionality,
-      (StreamId),
-      (noexcept));
+  MOCK_METHOD((QuicNodeType), getNodeType, (), (const, noexcept));
   MOCK_METHOD(
       (quic::Expected<void, LocalErrorCode>),
       notifyPendingWriteOnConnection,
@@ -262,7 +259,6 @@ class MockQuicSocket : public QuicSocket {
       (quic::Expected<void, LocalErrorCode>),
       registerDeliveryCallback,
       (StreamId, uint64_t, ByteEventCallback*));
-  MOCK_METHOD(Optional<LocalErrorCode>, shutdownWrite, (StreamId));
   MOCK_METHOD(
       (quic::Expected<void, LocalErrorCode>),
       resetStream,
@@ -344,6 +340,31 @@ class MockQuicSocket : public QuicSocket {
   }
 
   MOCK_METHOD(WriteResult, writeDatagram, (SharedBuf));
+
+  MOCK_METHOD(
+      (quic::Expected<uint32_t, LocalErrorCode>),
+      createDatagramFlowId,
+      ());
+
+  quic::Expected<void, LocalErrorCode> writeDatagram(
+      uint32_t flowId,
+      BufPtr data) override {
+    SharedBuf sharedData(data.release());
+    return writeDatagramWithFlowId(flowId, sharedData);
+  }
+
+  MOCK_METHOD(WriteResult, writeDatagramWithFlowId, (uint32_t, SharedBuf));
+
+  MOCK_METHOD(
+      (quic::Expected<void, LocalErrorCode>),
+      setDatagramFlowPriority,
+      (uint32_t, PriorityQueue::Priority));
+
+  MOCK_METHOD(
+      (quic::Expected<void, LocalErrorCode>),
+      closeDatagramFlow,
+      (uint32_t));
+
   MOCK_METHOD(
       (quic::Expected<std::vector<ReadDatagram>, LocalErrorCode>),
       readDatagrams,
@@ -363,7 +384,7 @@ class MockQuicSocket : public QuicSocket {
       (StreamId, bool),
       (noexcept));
   MOCK_METHOD(
-      (const std::shared_ptr<const folly::AsyncTransportCertificate>),
+      (const std::shared_ptr<const fizz::Cert>),
       getPeerCertificate,
       (),
       (const));

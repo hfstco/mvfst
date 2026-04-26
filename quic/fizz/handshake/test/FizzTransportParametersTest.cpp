@@ -15,6 +15,7 @@
 
 using namespace fizz;
 using namespace folly;
+using folly::io::Cursor;
 
 namespace quic::test {
 
@@ -29,7 +30,10 @@ class QuicExtensionsTest : public testing::Test {
     auto buf = QuicExtensionsTest::getBuf(hex);
     Cursor cursor(buf.get());
     Extension ext;
-    EXPECT_EQ(fizz::detail::read(ext, cursor), buf->computeChainDataLength());
+    size_t len;
+    Error err;
+    FIZZ_THROW_ON_ERROR(fizz::detail::read(len, err, ext, cursor), err);
+    EXPECT_EQ(len, buf->computeChainDataLength());
     EXPECT_TRUE(cursor.isAtEnd());
     std::vector<Extension> exts;
     exts.push_back(std::move(ext));
@@ -44,7 +48,8 @@ class QuicExtensionsTest : public testing::Test {
     auto encoded = encodeExtension(std::forward<T>(ext), encodingVersion);
     auto buf = folly::IOBuf::create(0);
     folly::io::Appender appender(buf.get(), 10);
-    fizz::detail::write(encoded, appender);
+    Error err;
+    FIZZ_THROW_ON_ERROR(fizz::detail::write(err, encoded, appender), err);
     EXPECT_TRUE(folly::IOBufEqualTo()(buf, getBuf(expectedHex)));
   }
 };

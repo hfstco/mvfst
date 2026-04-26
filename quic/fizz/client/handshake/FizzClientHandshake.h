@@ -8,7 +8,7 @@
 #pragma once
 
 #include <fizz/client/Actions.h>
-#include <fizz/client/AsyncFizzClient.h>
+#include <fizz/client/ECHRetryCallback.h>
 #include <quic/client/handshake/ClientHandshake.h>
 #include <quic/fizz/handshake/FizzCryptoFactory.h>
 
@@ -56,8 +56,7 @@ class FizzClientHandshake : public ClientHandshake {
     echRetryCallback_ = cb;
   }
 
-  const std::shared_ptr<const folly::AsyncTransportCertificate>
-  getPeerCertificate() const override;
+  const std::shared_ptr<const fizz::Cert> getPeerCertificate() const override;
 
   TLSSummary getTLSSummary() const override;
 
@@ -75,7 +74,7 @@ class FizzClientHandshake : public ClientHandshake {
       connectImpl(Optional<std::string> hostname) override;
 
   EncryptionLevel getReadRecordLayerEncryptionLevel() override;
-  void processSocketData(folly::IOBufQueue& queue) override;
+  void processSocketData(quic::IOBufQueue& queue) override;
   bool matchEarlyParameters() override;
   [[nodiscard]] quic::Expected<std::unique_ptr<Aead>, QuicError> buildAead(
       CipherKind kind,

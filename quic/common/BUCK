@@ -12,8 +12,8 @@ mvfst_cpp_library(
         "ovr_config//os/constraints:macos": {"MvfstCheck.h": "facebook/MvfstCheck-mobile.h"},  # @fb-only
         "ovr_config//os/constraints:windows": {"MvfstCheck.h": "facebook/MvfstCheck-mobile.h"},  # @fb-only
     }),
-    exported_external_deps = select({
-        "DEFAULT": ["glog"],
+    exported_deps = select({
+        "DEFAULT": ["fbsource//third-party/glog:glog"],
         "ovr_config//os/constraints:android": [],
         "ovr_config//os/constraints:iphoneos": [],
         "ovr_config//os/constraints:macos": [],
@@ -42,10 +42,8 @@ mvfst_cpp_library(
         }),
     }),
     exported_deps = [
+        "fbsource//third-party/glog:glog",
         ":mvfst_check",
-    ],
-    exported_external_deps = [
-        "glog",
     ],
 )
 
@@ -59,11 +57,6 @@ mvfst_cpp_library(
         ":circular_deque",
         ":expected",
         ":mvfst_logging",
-        ":optional",
-        "//folly:likely",
-    ],
-    exported_external_deps = [
-        "glog",
     ],
 )
 
@@ -76,12 +69,11 @@ mvfst_cpp_library(
         "QuicBuffer.h",
         "QuicRange.h",
     ],
-    deps = [":mvfst_logging"],
+    deps = [
+        ":mvfst_logging",
+    ],
     exported_deps = [
         "//folly/portability:sys_uio",
-    ],
-    external_deps = [
-        "glog",
     ],
 )
 
@@ -132,10 +124,8 @@ mvfst_cpp_library(
         "EnumArray.h",
     ],
     exported_deps = [
+        "fbsource//third-party/glog:glog",
         "//folly:portability",
-    ],
-    exported_external_deps = [
-        "glog",
     ],
 )
 
@@ -178,10 +168,8 @@ mvfst_cpp_library(
         "CircularDeque-inl.h",
     ],
     exported_deps = [
+        "fbsource//third-party/glog:glog",
         ":mvfst_logging",
-    ],
-    exported_external_deps = [
-        "glog",
     ],
 )
 
@@ -236,9 +224,6 @@ mvfst_cpp_library(
     exported_deps = [
         ":optional",
     ],
-    external_deps = [
-        "glog",
-    ],
 )
 
 mvfst_cpp_library(
@@ -274,5 +259,18 @@ mvfst_cpp_library(
     ],
     exported_deps = [
         "//quic/common/third-party:expected",
+    ],
+)
+
+mvfst_cpp_library(
+    name = "quic_iobuf_queue",
+    srcs = [
+        "QuicIOBufQueue.cpp",
+    ],
+    headers = [
+        "QuicIOBufQueue.h",
+    ],
+    exported_deps = [
+        ":quic_buffer",
     ],
 )

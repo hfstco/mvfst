@@ -9,13 +9,14 @@
 #include <quic/fizz/server/handshake/FizzServerHandshake.h>
 
 #include <quic/QuicConstants.h>
-#include <quic/fizz/handshake/FizzBridge.h>
 #include <quic/fizz/server/handshake/AppToken.h>
 #include <quic/fizz/server/handshake/FizzServerQuicHandshakeContext.h>
 
 #include <fizz/protocol/Protocol.h>
 #include <fizz/server/ReplayCache.h>
 #include <fizz/server/State.h>
+
+#include QUIC_DEFAULT_AEAD_HEADER
 
 // This is necessary for the conversion between QuicServerConnectionState and
 // QuicConnectionStateBase and can be removed once ServerHandshake accepts
@@ -98,20 +99,26 @@ EncryptionLevel FizzServerHandshake::getReadRecordLayerEncryptionLevel() {
       state_.readRecordLayer()->getEncryptionLevel());
 }
 
-void FizzServerHandshake::processSocketData(folly::IOBufQueue& queue) {
+void FizzServerHandshake::processSocketData(quic::IOBufQueue& queue) {
   startActions(
       machine_.processSocketData(state_, queue, fizz::Aead::AeadOptions()));
 }
 
 std::unique_ptr<Aead> FizzServerHandshake::buildAead(ByteRange secret) {
-  return FizzAead::wrap(
+  std::unique_ptr<fizz::Aead> derivedAead;
+  fizz::Error err;
+  FIZZ_THROW_ON_ERROR(
       fizz::Protocol::deriveRecordAeadWithLabel(
+          derivedAead,
+          err,
           *state_.context()->getFactory(),
           *state_.keyScheduler(),
           *state_.cipher(),
           secret,
           kQuicKeyLabel,
-          kQuicIVLabel));
+          kQuicIVLabel),
+      err);
+  return QUIC_DEFAULT_AEAD::wrap(std::move(derivedAead));
 }
 
 quic::Expected<std::unique_ptr<PacketNumberCipher>, QuicError>
@@ -120,8 +127,12 @@ FizzServerHandshake::buildHeaderCipher(ByteRange secret) {
 }
 
 BufPtr FizzServerHandshake::getNextTrafficSecret(ByteRange secret) const {
-  auto deriver =
-      state_.context()->getFactory()->makeKeyDeriver(*state_.cipher());
+  std::unique_ptr<fizz::KeyDerivation> deriver;
+  fizz::Error err;
+  FIZZ_THROW_ON_ERROR(
+      state_.context()->getFactory()->makeKeyDeriver(
+          deriver, err, *state_.cipher()),
+      err);
   auto nextSecret = deriver->expandLabel(
       secret, kQuicKULabel, BufHelpers::create(0), secret.size());
   return nextSecret;

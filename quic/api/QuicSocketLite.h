@@ -7,8 +7,8 @@
 
 #pragma once
 
+#include <fizz/protocol/CertificateBase.h>
 #include <folly/MaybeManagedPtr.h>
-#include <folly/io/async/AsyncTransportCertificate.h>
 #include <quic/QuicException.h>
 #include <quic/api/QuicCallbacks.h>
 #include <quic/api/TransportInfo.h>
@@ -83,7 +83,7 @@ class QuicSocketLite {
 
     /**
      * Invoked when stream id's flow control state changes.  This is an edge
-     * triggred API and will be only invoked at the point that the flow control
+     * triggered API and will be only invoked at the point that the flow control
      * changes.
      */
     virtual void onFlowControlUpdate(StreamId /*id*/) noexcept {}
@@ -164,6 +164,27 @@ class QuicSocketLite {
     virtual void onSconeRateSignal(
         uint8_t /*rateSignal*/,
         QuicVersion /*sconeVersion*/) noexcept {}
+
+    /**
+     * Called when the path is detected to be degrading (early warning).
+     * Fires when ptoCount reaches numPtosForPathDegrading (default: 4)
+     * consecutive PTOs without an ACK.
+     *
+     * Applications may use this signal to begin probing alternate paths.
+     * Only fires once per degradation episode (resets on ACK receipt).
+     */
+    virtual void onPathDegrading() noexcept {}
+
+    /**
+     * Called when the path is detected to be blackholed.
+     * Fires when ptoCount reaches numPtosForBlackhole (default: 6)
+     * consecutive PTOs without an ACK.
+     *
+     * Applications should attempt migration to an alternate path
+     * or prepare for connection closure.
+     * Only fires once per degradation episode (resets on ACK receipt).
+     */
+    virtual void onBlackholeDetected() noexcept {}
   };
 
   /**
@@ -194,9 +215,9 @@ class QuicSocketLite {
     // Total number of stream bytes received on this stream.
     Optional<uint64_t> streamBytesReceived{0};
 
-    // Stream read error (if one occured)
+    // Stream read error (if one occurred)
     Optional<QuicErrorCode> streamReadError;
-    // Stream write error (if one occured)
+    // Stream write error (if one occurred)
     Optional<QuicErrorCode> streamWriteError;
   };
 
@@ -260,12 +281,16 @@ class QuicSocketLite {
   /**
    * Returns whether a stream ID represents a unidirectional stream.
    */
-  virtual bool isUnidirectionalStream(StreamId stream) noexcept = 0;
+  bool isUnidirectionalStream(StreamId stream) noexcept {
+    return quic::isUnidirectionalStream(stream);
+  }
 
   /**
    * Returns whether a stream ID represents a bidirectional stream.
    */
-  virtual bool isBidirectionalStream(StreamId stream) noexcept = 0;
+  bool isBidirectionalStream(StreamId stream) noexcept {
+    return quic::isBidirectionalStream(stream);
+  }
 
   /**
    * ===== Read API ====
@@ -310,6 +335,16 @@ class QuicSocketLite {
       ReadCallback* cb,
       Optional<ApplicationErrorCode> err =
           GenericApplicationErrorCode::NO_ERROR) = 0;
+
+  virtual quic::Expected<void, LocalErrorCode> setStopSendingCallback(
+      StreamId id,
+      StopSendingCallback* ss) noexcept = 0;
+
+  /**
+   * Pause/Resume read callback being triggered when data is available.
+   */
+  virtual quic::Expected<void, LocalErrorCode> pauseRead(StreamId id) = 0;
+  virtual quic::Expected<void, LocalErrorCode> resumeRead(StreamId id) = 0;
 
   /**
    * ===== Peek/Consume API =====
@@ -423,11 +458,6 @@ class QuicSocketLite {
       ByteEventCallback* cb = nullptr) = 0;
 
   /**
-   * Close the stream for writing.  Equivalent to writeChain(id, nullptr, true).
-   */
-  virtual Optional<LocalErrorCode> shutdownWrite(StreamId id) = 0;
-
-  /**
    * Register a callback to be invoked when the peer has acknowledged the
    * given offset on the given stream.
    */
@@ -464,6 +494,12 @@ class QuicSocketLite {
    */
   virtual void onNetworkSwitch(std::unique_ptr<QuicAsyncUDPSocket> /*unused*/) {
   }
+
+  /**
+   * Send a ping to the peer.  When the ping is acknowledged by the peer or
+   * times out, the transport will invoke the callback.
+   */
+  virtual void sendPing(std::chrono::milliseconds /* pingTimeout */ = {}) {}
 
   /**
    * Cancel the given stream
@@ -675,8 +711,7 @@ class QuicSocketLite {
   /**
    * Get the cert presented by peer
    */
-  [[nodiscard]] virtual const std::shared_ptr<
-      const folly::AsyncTransportCertificate>
+  [[nodiscard]] virtual const std::shared_ptr<const fizz::Cert>
   getPeerCertificate() const {
     return nullptr;
   }
@@ -684,8 +719,7 @@ class QuicSocketLite {
   /**
    * Get the cert presented by self
    */
-  [[nodiscard]] virtual const std::shared_ptr<
-      const folly::AsyncTransportCertificate>
+  [[nodiscard]] virtual const std::shared_ptr<const fizz::Cert>
   getSelfCertificate() const {
     return nullptr;
   }
@@ -744,15 +778,39 @@ class QuicSocketLite {
    */
   [[nodiscard]] virtual uint64_t maxWritableOnConn() const = 0;
 
+  virtual QuicNodeType getNodeType() const noexcept = 0;
+
   /**
    * Returns initiator (self or peer) of a stream by ID.
    */
-  virtual StreamInitiator getStreamInitiator(StreamId stream) noexcept = 0;
+  StreamInitiator getStreamInitiator(StreamId id) const noexcept {
+    return quic::getStreamInitiator(getNodeType(), id);
+  }
 
   /**
-   * Returns varios stats of the connection.
+   * Returns various stats of the connection.
    */
   [[nodiscard]] virtual QuicConnectionStats getConnectionsStats() const = 0;
+
+  /**
+   * Information about a received SCONE rate signal.
+   */
+  struct SconeRateInfo {
+    // SCONE rate converted to bits per second.
+    uint64_t bps;
+    // steady_clock time when the signal was received.
+    TimePoint receivedTime;
+  };
+
+  /**
+   * Returns and clears the pending SCONE rate signal received from the peer.
+   * The rate is converted from the SCONE logarithmic encoding to bps.
+   * Edge-triggered: subsequent calls return nullopt until a new signal arrives.
+   * Must be called from the event base thread.
+   */
+  [[nodiscard]] virtual Optional<SconeRateInfo> consumePendingSconeRate() {
+    return std::nullopt;
+  }
 
   virtual ~QuicSocketLite() = default;
 
@@ -764,7 +822,7 @@ class QuicSocketLite {
    * function and return the socket observer list that they hold in memory.
    *
    * We have a default implementation to ensure that there is no risk of a
-   * pure-virtual function being called during constructon or destruction of
+   * pure-virtual function being called during construction or destruction of
    * the socket. If this was to occur the derived class which implements this
    * function may be unavailable leading to undefined behavior. While this is
    * true for any pure-virtual function, the potential for this issue is

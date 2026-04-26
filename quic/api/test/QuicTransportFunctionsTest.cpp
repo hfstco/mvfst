@@ -6,6 +6,7 @@
  */
 
 #include <folly/Range.h>
+#include <folly/TokenBucket.h>
 #include <quic/api/QuicTransportFunctions.h>
 #include <quic/common/MvfstLogging.h>
 
@@ -4105,7 +4106,7 @@ TEST_F(
       pathInfo.id, PathResponseFrame(12345));
   EXPECT_EQ(WriteDataReason::PATH_VALIDATION, shouldWriteData(*conn));
 
-  // There is a reponse but no writable bytes
+  // There is a response but no writable bytes
   conn->pathManager->onPathPacketSent(pathInfo.id, 1200);
   ASSERT_EQ(pathInfo.writableBytes, 0);
   EXPECT_EQ(WriteDataReason::NO_WRITE, shouldWriteData(*conn));
@@ -4277,8 +4278,10 @@ TEST_F(QuicTransportFunctionsTest, HasDatagramsToWrite) {
   auto conn = createConn();
   conn->oneRttWriteCipher = test::createNoOpAead();
   EXPECT_EQ(WriteDataReason::NO_WRITE, hasNonAckDataToWrite(*conn));
+  BufQueue buf;
+  buf.append(folly::IOBuf::copyBuffer("I'm an unreliable Datagram"));
   conn->datagramState.flowManager.addDatagram(
-      folly::IOBuf::copyBuffer("I'm an unreliable Datagram"));
+      std::move(buf), kDefaultDatagramFlowId);
   EXPECT_EQ(WriteDataReason::DATAGRAM, hasNonAckDataToWrite(*conn));
 }
 
@@ -5444,7 +5447,7 @@ TEST_F(QuicTransportFunctionsTest, WriterCoalescesSconeAndShortHeader) {
 
   EXPECT_TRUE(conn->scone->negotiated);
 
-  EXPECT_FALSE(conn->scone->sentThisLoop);
+  EXPECT_FALSE(conn->scone->lastSconeSentTime.has_value());
 }
 
 TEST_F(QuicTransportFunctionsTest, SconePacketSizeValidation) {
@@ -5499,8 +5502,6 @@ TEST_F(QuicTransportFunctionsTest, SCONEWithContinuousMemory) {
 
   conn->scone.emplace();
   conn->scone->negotiated = true;
-  conn->scone->sentThisLoop = false;
-
   auto bufAccessor = std::make_unique<BufAccessor>(conn->udpSendPacketLen * 16);
   auto outputBuf = bufAccessor->obtain();
   auto bufPtr = outputBuf.get();
@@ -5548,7 +5549,335 @@ TEST_F(QuicTransportFunctionsTest, SCONEWithContinuousMemory) {
                    conn->transportSettings.writeConnectionDataPacketsLimit)
                    .hasError());
 
-  EXPECT_TRUE(conn->scone->sentThisLoop);
+  EXPECT_TRUE(conn->scone->lastSconeSentTime.has_value());
+}
+
+TEST_F(QuicTransportFunctionsTest, SconeFlowIndicatorOnInitialPackets) {
+  auto conn = createConn();
+  conn->transportSettings.enableScone = true;
+
+  auto cryptoStream = &conn->cryptoState->initialStream;
+  auto buf = buildRandomInputData(200);
+  writeDataToQuicStream(*cryptoStream, buf->clone());
+
+  EventBase evb;
+  std::shared_ptr<FollyQuicEventBase> qEvb =
+      std::make_shared<FollyQuicEventBase>(&evb);
+  auto socket =
+      std::make_unique<NiceMock<quic::test::MockAsyncUDPSocket>>(qEvb);
+  auto rawSocket = socket.get();
+  ON_CALL(*rawSocket, getGSO).WillByDefault(testing::Return(0));
+
+  // Capture the written datagram
+  std::vector<uint8_t> writtenData;
+  EXPECT_CALL(*rawSocket, write(_, _, _))
+      .WillOnce(
+          [&](const SocketAddress&, const struct iovec* vec, size_t iovec_len) {
+            for (size_t i = 0; i < iovec_len; ++i) {
+              auto* data = static_cast<uint8_t*>(vec[i].iov_base);
+              writtenData.insert(
+                  writtenData.end(), data, data + vec[i].iov_len);
+            }
+            return getTotalIovecLen(vec, iovec_len);
+          });
+
+  auto res = writeCryptoAndAckDataToSocket(
+      *rawSocket,
+      *conn,
+      *conn->clientConnectionId,
+      *conn->serverConnectionId,
+      LongHeader::Types::Initial,
+      *conn->initialWriteCipher,
+      *conn->initialHeaderCipher,
+      getVersion(*conn),
+      conn->transportSettings.writeConnectionDataPacketsLimit);
+  ASSERT_FALSE(res.hasError());
+  EXPECT_GT(res->bytesWritten, 0);
+
+  // Last 2 bytes should be the SCONE flow indicator
+  ASSERT_GE(writtenData.size(), kSconeFlowIndicatorSize);
+  EXPECT_EQ(writtenData[writtenData.size() - 2], kSconeFlowIndicatorByte1);
+  EXPECT_EQ(writtenData[writtenData.size() - 1], kSconeFlowIndicatorByte2);
+}
+
+TEST_F(
+    QuicTransportFunctionsTest,
+    SconeFlowIndicatorNotSentAfterReceivingPackets) {
+  auto conn = createConn();
+  conn->transportSettings.enableScone = true;
+
+  auto cryptoStream = &conn->cryptoState->initialStream;
+  auto buf = buildRandomInputData(200);
+  writeDataToQuicStream(*cryptoStream, buf->clone());
+
+  // Simulate having received a server packet
+  conn->ackStates.initialAckState->largestRecvdPacketNum = 0;
+
+  EventBase evb;
+  std::shared_ptr<FollyQuicEventBase> qEvb =
+      std::make_shared<FollyQuicEventBase>(&evb);
+  auto socket =
+      std::make_unique<NiceMock<quic::test::MockAsyncUDPSocket>>(qEvb);
+  auto rawSocket = socket.get();
+  ON_CALL(*rawSocket, getGSO).WillByDefault(testing::Return(0));
+
+  std::vector<uint8_t> writtenData;
+  EXPECT_CALL(*rawSocket, write(_, _, _))
+      .WillOnce(
+          [&](const SocketAddress&, const struct iovec* vec, size_t iovec_len) {
+            for (size_t i = 0; i < iovec_len; ++i) {
+              auto* data = static_cast<uint8_t*>(vec[i].iov_base);
+              writtenData.insert(
+                  writtenData.end(), data, data + vec[i].iov_len);
+            }
+            return getTotalIovecLen(vec, iovec_len);
+          });
+
+  auto res = writeCryptoAndAckDataToSocket(
+      *rawSocket,
+      *conn,
+      *conn->clientConnectionId,
+      *conn->serverConnectionId,
+      LongHeader::Types::Initial,
+      *conn->initialWriteCipher,
+      *conn->initialHeaderCipher,
+      getVersion(*conn),
+      conn->transportSettings.writeConnectionDataPacketsLimit);
+  ASSERT_FALSE(res.hasError());
+  EXPECT_GT(res->bytesWritten, 0);
+
+  // Last 2 bytes should NOT be the flow indicator since we already
+  // received packets
+  ASSERT_GE(writtenData.size(), kSconeFlowIndicatorSize);
+  bool hasIndicator =
+      writtenData[writtenData.size() - 2] == kSconeFlowIndicatorByte1 &&
+      writtenData[writtenData.size() - 1] == kSconeFlowIndicatorByte2;
+  EXPECT_FALSE(hasIndicator);
+}
+
+TEST_F(QuicTransportFunctionsTest, SconeFlowIndicatorNotSentOnShortHeader) {
+  auto conn = createConn();
+  conn->transportSettings.enableScone = true;
+
+  // Write app data (short header)
+  auto stream = conn->streamManager->createNextBidirectionalStream().value();
+  auto buf = IOBuf::copyBuffer("test data");
+  ASSERT_FALSE(writeDataToQuicStream(*stream, buf->clone(), true).hasError());
+
+  EventBase evb;
+  std::shared_ptr<FollyQuicEventBase> qEvb =
+      std::make_shared<FollyQuicEventBase>(&evb);
+  auto socket =
+      std::make_unique<NiceMock<quic::test::MockAsyncUDPSocket>>(qEvb);
+  auto rawSocket = socket.get();
+  ON_CALL(*rawSocket, getGSO).WillByDefault(testing::Return(0));
+
+  std::vector<uint8_t> writtenData;
+  EXPECT_CALL(*rawSocket, write(_, _, _))
+      .WillOnce(
+          [&](const SocketAddress&, const struct iovec* vec, size_t iovec_len) {
+            for (size_t i = 0; i < iovec_len; ++i) {
+              auto* data = static_cast<uint8_t*>(vec[i].iov_base);
+              writtenData.insert(
+                  writtenData.end(), data, data + vec[i].iov_len);
+            }
+            return getTotalIovecLen(vec, iovec_len);
+          });
+
+  ASSERT_FALSE(writeQuicDataToSocket(
+                   *rawSocket,
+                   *conn,
+                   *conn->clientConnectionId,
+                   *conn->serverConnectionId,
+                   *aead,
+                   *headerCipher,
+                   QuicVersion::MVFST,
+                   conn->transportSettings.writeConnectionDataPacketsLimit)
+                   .hasError());
+
+  // Short header packets should never have the flow indicator
+  ASSERT_GE(writtenData.size(), kSconeFlowIndicatorSize);
+  bool hasIndicator =
+      writtenData[writtenData.size() - 2] == kSconeFlowIndicatorByte1 &&
+      writtenData[writtenData.size() - 1] == kSconeFlowIndicatorByte2;
+  EXPECT_FALSE(hasIndicator);
+}
+
+TEST_F(QuicTransportFunctionsTest, EgressPolicerNoPolicer) {
+  auto conn = createConn();
+  EventBase evb;
+  std::shared_ptr<FollyQuicEventBase> qEvb =
+      std::make_shared<FollyQuicEventBase>(&evb);
+  auto socket =
+      std::make_unique<NiceMock<quic::test::MockAsyncUDPSocket>>(qEvb);
+  auto rawSocket = socket.get();
+  ON_CALL(*rawSocket, getGSO).WillByDefault(testing::Return(0));
+
+  auto stream = conn->streamManager->createNextBidirectionalStream().value();
+  auto buf = IOBuf::copyBuffer("hello world, this is a test of the policer");
+  ASSERT_FALSE(writeDataToQuicStream(*stream, buf->clone(), true).hasError());
+
+  // No policer set, so all packets should be written to socket.
+  EXPECT_CALL(*rawSocket, write(_, _, _)).Times(AtLeast(1));
+  EXPECT_CALL(*quicStats_, onPacketDroppedByEgressPolicer()).Times(0);
+  ASSERT_FALSE(writeQuicDataToSocket(
+                   *rawSocket,
+                   *conn,
+                   *conn->clientConnectionId,
+                   *conn->serverConnectionId,
+                   *aead,
+                   *headerCipher,
+                   getVersion(*conn),
+                   conn->transportSettings.writeConnectionDataPacketsLimit)
+                   .hasError());
+}
+
+TEST_F(QuicTransportFunctionsTest, EgressPolicerDropsPacketsChainedMemory) {
+  auto conn = createConn();
+  conn->transportSettings.dataPathType = DataPathType::ChainedMemory;
+  // Use near-zero rate and burst just above one packet so the first packet
+  // passes but subsequent packets are deterministically dropped regardless
+  // of wall-clock timing.
+  double burst = static_cast<double>(conn->udpSendPacketLen + 100);
+  conn->egressPolicer = std::make_unique<folly::TokenBucket>(0.001, burst);
+  // Explicitly fill the bucket so it doesn't depend on system uptime
+  // (TokenBucket starts at zeroTime=0, so available tokens =
+  // min(steady_clock_uptime * rate, burst) which may be < burst).
+  conn->egressPolicer->setCapacity(
+      burst, folly::TokenBucket::defaultClockNow());
+  // Set activation time in the past so the policer is active.
+  conn->egressPolicerActivationTime = Clock::now() - std::chrono::seconds(1);
+
+  EventBase evb;
+  std::shared_ptr<FollyQuicEventBase> qEvb =
+      std::make_shared<FollyQuicEventBase>(&evb);
+  auto socket =
+      std::make_unique<NiceMock<quic::test::MockAsyncUDPSocket>>(qEvb);
+  auto rawSocket = socket.get();
+  ON_CALL(*rawSocket, getGSO).WillByDefault(testing::Return(0));
+
+  auto stream = conn->streamManager->createNextBidirectionalStream().value();
+  // Write plenty of data to guarantee many packets.
+  auto buf = IOBuf::copyBuffer(std::string(40000, 'x'));
+  ASSERT_FALSE(writeDataToQuicStream(*stream, buf->clone(), true).hasError());
+
+  uint32_t socketWrites = 0;
+  ON_CALL(*rawSocket, write(_, _, _))
+      .WillByDefault(
+          [&](const SocketAddress&, const struct iovec* vec, size_t iovec_len) {
+            socketWrites++;
+            return getTotalIovecLen(vec, iovec_len);
+          });
+
+  EXPECT_CALL(*quicStats_, onPacketDroppedByEgressPolicer()).Times(AtLeast(1));
+
+  ASSERT_FALSE(writeQuicDataToSocket(
+                   *rawSocket,
+                   *conn,
+                   *conn->clientConnectionId,
+                   *conn->serverConnectionId,
+                   *aead,
+                   *headerCipher,
+                   getVersion(*conn),
+                   conn->transportSettings.writeConnectionDataPacketsLimit)
+                   .hasError());
+
+  // At least one packet should have been written to socket.
+  EXPECT_GE(socketWrites, 1u);
+  // But also packets should be in outstandings (including dropped ones).
+  EXPECT_GT(conn->outstandings.packets.size(), socketWrites);
+}
+
+TEST_F(QuicTransportFunctionsTest, EgressPolicerDropsPacketsContinuousMemory) {
+  auto conn = createConn();
+  conn->transportSettings.dataPathType = DataPathType::ContinuousMemory;
+
+  auto bufAccessor = std::make_unique<BufAccessor>(conn->udpSendPacketLen * 16);
+  auto outputBuf = bufAccessor->obtain();
+  bufAccessor->release(std::move(outputBuf));
+  conn->bufAccessor = bufAccessor.get();
+  conn->transportSettings.batchingMode = QuicBatchingMode::BATCHING_MODE_GSO;
+
+  // Use near-zero rate and burst just above one packet.
+  double burst = static_cast<double>(conn->udpSendPacketLen + 100);
+  conn->egressPolicer = std::make_unique<folly::TokenBucket>(0.001, burst);
+  conn->egressPolicer->setCapacity(
+      burst, folly::TokenBucket::defaultClockNow());
+  conn->egressPolicerActivationTime = Clock::now() - std::chrono::seconds(1);
+
+  EventBase evb;
+  std::shared_ptr<FollyQuicEventBase> qEvb =
+      std::make_shared<FollyQuicEventBase>(&evb);
+  quic::test::MockAsyncUDPSocket mockSock(qEvb);
+  EXPECT_CALL(mockSock, getGSO()).WillRepeatedly(Return(true));
+
+  auto stream = conn->streamManager->createNextBidirectionalStream().value();
+  auto buf = IOBuf::copyBuffer(std::string(40000, 'x'));
+  ASSERT_FALSE(writeDataToQuicStream(*stream, buf->clone(), true).hasError());
+
+  uint32_t socketWrites = 0;
+  EXPECT_CALL(mockSock, writeGSO(_, _, _, _))
+      .WillRepeatedly([&](const SocketAddress&,
+                          const struct iovec* vec,
+                          size_t iovec_len,
+                          auto) {
+        socketWrites++;
+        return getTotalIovecLen(vec, iovec_len);
+      });
+
+  EXPECT_CALL(*quicStats_, onPacketDroppedByEgressPolicer()).Times(AtLeast(1));
+
+  ASSERT_FALSE(writeQuicDataToSocket(
+                   mockSock,
+                   *conn,
+                   *conn->clientConnectionId,
+                   *conn->serverConnectionId,
+                   *aead,
+                   *headerCipher,
+                   getVersion(*conn),
+                   conn->transportSettings.writeConnectionDataPacketsLimit)
+                   .hasError());
+
+  // Packets should be in outstandings (both written and dropped).
+  EXPECT_GT(conn->outstandings.packets.size(), 0u);
+}
+
+TEST_F(QuicTransportFunctionsTest, EgressPolicerActivationDelay) {
+  auto conn = createConn();
+  // Set policer with near-zero rate (would drop everything after burst) but
+  // activation time in the future — so nothing should be policed.
+  double burst = static_cast<double>(conn->udpSendPacketLen + 100);
+  conn->egressPolicer = std::make_unique<folly::TokenBucket>(0.001, burst);
+  conn->egressPolicer->setCapacity(
+      burst, folly::TokenBucket::defaultClockNow());
+  conn->egressPolicerActivationTime = Clock::now() + std::chrono::seconds(60);
+
+  EventBase evb;
+  std::shared_ptr<FollyQuicEventBase> qEvb =
+      std::make_shared<FollyQuicEventBase>(&evb);
+  auto socket =
+      std::make_unique<NiceMock<quic::test::MockAsyncUDPSocket>>(qEvb);
+  auto rawSocket = socket.get();
+  ON_CALL(*rawSocket, getGSO).WillByDefault(testing::Return(0));
+
+  auto stream = conn->streamManager->createNextBidirectionalStream().value();
+  auto buf = IOBuf::copyBuffer(std::string(4000, 'x'));
+  ASSERT_FALSE(writeDataToQuicStream(*stream, buf->clone(), true).hasError());
+
+  // Policer not yet active, so no drops.
+  EXPECT_CALL(*quicStats_, onPacketDroppedByEgressPolicer()).Times(0);
+  EXPECT_CALL(*rawSocket, write(_, _, _)).Times(AtLeast(1));
+
+  ASSERT_FALSE(writeQuicDataToSocket(
+                   *rawSocket,
+                   *conn,
+                   *conn->clientConnectionId,
+                   *conn->serverConnectionId,
+                   *aead,
+                   *headerCipher,
+                   getVersion(*conn),
+                   conn->transportSettings.writeConnectionDataPacketsLimit)
+                   .hasError());
 }
 
 } // namespace quic::test

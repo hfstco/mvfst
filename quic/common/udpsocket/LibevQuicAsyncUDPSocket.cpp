@@ -8,7 +8,6 @@
 #include <quic/QuicException.h>
 #include <quic/common/Expected.h>
 #include <quic/common/MvfstLogging.h> // For QuicError, QuicErrorCode, TransportErrorCode
-#include <quic/common/Optional.h>
 #include <quic/common/StringUtils.h>
 #include <quic/common/udpsocket/LibevQuicAsyncUDPSocket.h>
 
@@ -19,6 +18,11 @@
 #include <sys/errno.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#ifdef __linux__
+#ifndef UDP_SEGMENT
+#define UDP_SEGMENT 103
+#endif
+#endif
 
 namespace quic {
 
@@ -129,12 +133,148 @@ ssize_t LibevQuicAsyncUDPSocket::write(
 }
 
 quic::Expected<int, QuicError> LibevQuicAsyncUDPSocket::getGSO() {
-  // TODO: Implement GSO
+#if defined(UDP_SEGMENT)
+  // If runtime fallback in writeGSO() marked GSO as unsupported, return -1
+  // immediately so the transport switches to SinglePacketBatchWriter.
+  if (gso_ == -1) {
+    return gso_;
+  }
+  if (!gsoProbed_) {
+    gsoProbed_ = true;
+    if (fd_ == -1) {
+      gso_ = -1;
+      return gso_;
+    }
+    int gso = -1;
+    socklen_t optlen = sizeof(gso);
+    if (::getsockopt(fd_, SOL_UDP, UDP_SEGMENT, &gso, &optlen) == 0) {
+      gso_ = gso;
+    } else {
+      gso_ = -1;
+    }
+  }
+  return gso_;
+#else
   return -1;
+#endif
+}
+
+ssize_t LibevQuicAsyncUDPSocket::writeGSO(
+    const folly::SocketAddress& address,
+    const struct iovec* vec,
+    size_t iovec_len,
+    WriteOptions options) {
+#if defined(UDP_SEGMENT)
+  if (fd_ == -1) {
+    errno = EBADF;
+    MVLOG_ERROR
+        << "LibevQuicAsyncUDPSocket::writeGSO failed: socket not initialized";
+    return -1;
+  }
+
+  sockaddr_storage addrStorage;
+  address.getAddress(&addrStorage);
+
+  struct msghdr msg = {};
+  if (!connected_) {
+    msg.msg_name = reinterpret_cast<void*>(&addrStorage);
+    msg.msg_namelen = address.getActualSize();
+  } else {
+    if (connectedAddress_ != address) {
+      errno = EINVAL;
+      MVLOG_ERROR
+          << "LibevQuicAsyncUDPSocket::writeGSO failed: wrong destination for connected socket";
+      return -1;
+    }
+  }
+  msg.msg_iov = const_cast<struct iovec*>(vec);
+  msg.msg_iovlen = iovec_len;
+
+  char control[CMSG_SPACE(sizeof(uint16_t))] = {};
+  if (options.gso > 0) {
+    msg.msg_control = control;
+    msg.msg_controllen = sizeof(control);
+    struct cmsghdr* cm = CMSG_FIRSTHDR(&msg);
+    cm->cmsg_level = SOL_UDP;
+    cm->cmsg_type = UDP_SEGMENT;
+    cm->cmsg_len = CMSG_LEN(sizeof(uint16_t));
+    auto gsoLen = static_cast<uint16_t>(options.gso);
+    memcpy(CMSG_DATA(cm), &gsoLen, sizeof(gsoLen));
+  }
+
+  auto ret = ::sendmsg(fd_, &msg, 0);
+  if (ret < 0 && options.gso > 0) {
+    int errnoCopy = errno;
+    // On some platforms (e.g., Android kernel 6.1.x), the kernel may
+    // reject UDP GSO with EIO/EINVAL/EMSGSIZE even though
+    // getsockopt(UDP_SEGMENT) succeeds. Fall back to sending each QUIC
+    // packet individually without GSO and mark GSO as unsupported so the
+    // transport layer switches to SinglePacketBatchWriter.
+    //
+    // We split by options.gso (the segment size) rather than by iovec,
+    // because the ContinuousMemory path concatenates all packets into a
+    // single iovec.
+    if (errnoCopy == EIO || errnoCopy == EINVAL || errnoCopy == EMSGSIZE) {
+      gso_ = -1;
+
+      auto gsoSize = static_cast<size_t>(options.gso);
+      ssize_t totalSent = 0;
+      size_t vi = 0;
+      size_t vo = 0;
+
+      while (vi < iovec_len) {
+        auto avail = vec[vi].iov_len - vo;
+        if (avail == 0) {
+          vi++;
+          vo = 0;
+          continue;
+        }
+
+        auto segLen = std::min(gsoSize, avail);
+        struct iovec segVec = {
+            static_cast<uint8_t*>(vec[vi].iov_base) + vo, segLen};
+
+        struct msghdr perPktMsg = {};
+        if (!connected_) {
+          perPktMsg.msg_name = reinterpret_cast<void*>(&addrStorage);
+          perPktMsg.msg_namelen = address.getActualSize();
+        }
+        perPktMsg.msg_iov = &segVec;
+        perPktMsg.msg_iovlen = 1;
+
+        auto pktRet = ::sendmsg(fd_, &perPktMsg, 0);
+        if (pktRet < 0) {
+          if (totalSent > 0) {
+            return totalSent;
+          }
+          return -1;
+        }
+        totalSent += pktRet;
+
+        vo += segLen;
+        if (vo >= vec[vi].iov_len) {
+          vi++;
+          vo = 0;
+        }
+      }
+      return totalSent;
+    }
+
+    errno = errnoCopy;
+  }
+  return ret;
+#else
+  (void)address;
+  (void)vec;
+  (void)iovec_len;
+  (void)options;
+  errno = ENOTSUP;
+  return -1;
+#endif
 }
 
 int LibevQuicAsyncUDPSocket::writem(
-    folly::Range<folly::SocketAddress const*> /*addrs*/,
+    AddressRange /*addrs*/,
     iovec* /*iov*/,
     size_t* /*numIovecsInBuffer*/,
     size_t /*count*/) {

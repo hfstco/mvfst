@@ -61,14 +61,16 @@ quic::Optional<HTTPPriorityQueue::FindResult> HTTPPriorityQueue::find(
     Identifier id) const {
   auto it = indexMap_.find(id);
   if (it != indexMap_.end()) {
-    return FindResult{it->second, it};
+    return FindResult{.elem = it->second, .indexIt = it};
   }
   if (!useIndexMapForSequential_) {
     // linear search the heap
     for (size_t i = 0; i < heap_.size(); i++) {
       auto& elem = heap_[i];
       if (!elem.priority->incremental && elem.identifier == id) {
-        return FindResult{IndexMapElem{false, i}, indexMap_.end()};
+        return FindResult{
+            .elem = IndexMapElem{.incremental = false, .index = i},
+            .indexIt = indexMap_.end()};
       }
     }
   }
@@ -92,7 +94,7 @@ void HTTPPriorityQueue::buildSequentialIndex() {
   for (size_t i = 0; i < heap_.size(); i++) {
     auto& elem = heap_[i];
     if (!elem.priority->incremental) {
-      addIndex(elem.identifier, {false, i});
+      addIndex(elem.identifier, {.incremental = false, .index = i});
     }
   }
 }
@@ -112,6 +114,11 @@ void HTTPPriorityQueue::insertOrUpdate(
     Identifier id,
     PriorityQueue::Priority basePriority) {
   Priority priority(basePriority);
+  // When disablePausedPriority is set, treat paused streams as lowest-urgency
+  // incremental instead of skipping them entirely.
+  if (priority->paused && disablePausedPriority_) {
+    priority = Priority(7, true);
+  }
   auto findResult = find(id);
   if (findResult) {
     if (updateInSequential(findResult->elem, priority)) {
@@ -223,12 +230,12 @@ void HTTPPriorityQueue::consume(quic::Optional<uint64_t> consumed) {
   }
 }
 
-HTTPPriorityQueue::Priority HTTPPriorityQueue::headPriority() const {
+quic::PriorityQueue::Priority HTTPPriorityQueue::headPriority() const {
   auto elem = top();
   if (elem) {
     return elem->priority;
   } else {
-    return {lowestRoundRobin_, true};
+    return Priority{lowestRoundRobin_, true};
   }
 }
 
@@ -276,7 +283,7 @@ void HTTPPriorityQueue::heapifyDown(size_t index) {
 
 void HTTPPriorityQueue::assignIndex(Element& element, size_t index) {
   MVCHECK(!element.priority->incremental);
-  addIndex(element.identifier, {false, index});
+  addIndex(element.identifier, {.incremental = false, .index = index});
 }
 
 void HTTPPriorityQueue::insert(Identifier id, const Priority& priority) {
@@ -288,14 +295,14 @@ void HTTPPriorityQueue::insert(Identifier id, const Priority& priority) {
     auto& rr = roundRobins_[priority->urgency];
     rr.insert(id);
     roundRobinElements_++;
-    addIndex(id, {true, priority->urgency});
+    addIndex(id, {.incremental = true, .index = priority->urgency});
     if (priority->urgency < lowestRoundRobin_) {
       lowestRoundRobin_ = priority->urgency;
     }
   } else {
     heap_.emplace_back(priority, id);
     auto index = heap_.size() - 1;
-    addIndex(id, {false, index});
+    addIndex(id, {.incremental = false, .index = index});
     heapifyUp(index);
   }
 }

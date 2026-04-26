@@ -7,13 +7,35 @@
 
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
+#include <iterator>
 #include <string>
+#include <type_traits>
+#include <vector>
 
 namespace quic {
 template <class Iter>
 struct Range {
   Iter begin_;
   Iter end_;
+
+  template <class T, class Alloc>
+  explicit Range(
+      std::vector<T, Alloc>& vec,
+      typename std::enable_if<std::is_convertible<T*, Iter>::value>::type* =
+          nullptr)
+      : begin_(vec.data()), end_(vec.data() + vec.size()) {}
+
+  template <class T, class Alloc>
+  /* implicit */ Range(
+      const std::vector<T, Alloc>& vec,
+      typename std::enable_if<
+          std::is_convertible<const T*, Iter>::value>::type* = nullptr)
+      : begin_(vec.data()), end_(vec.data() + vec.size()) {}
+
+  template <class T, class Alloc>
+  Range(std::vector<T, Alloc>&&) = delete;
 
   Range(Iter begin, size_t size) : begin_(begin), end_(begin + size) {}
 
@@ -29,7 +51,7 @@ struct Range {
           std::is_convertible<OtherIter, Iter>::value>::type* = nullptr)
       : begin_(other.begin_), end_(other.end_) {}
 
-  size_t size() const {
+  [[nodiscard]] size_t size() const {
     return end_ - begin_;
   }
 
@@ -37,7 +59,7 @@ struct Range {
     begin_ += amount;
   }
 
-  bool empty() const {
+  [[nodiscard]] bool empty() const {
     return begin_ == end_;
   }
 
@@ -64,7 +86,7 @@ struct Range {
     return *(begin_ + index);
   }
 
-  std::string toString() const {
+  [[nodiscard]] std::string toString() const {
     return std::string(
         reinterpret_cast<const char*>(begin_),
         reinterpret_cast<const char*>(end_));

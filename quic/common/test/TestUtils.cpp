@@ -12,6 +12,7 @@
 #include <fizz/crypto/test/TestUtil.h>
 #include <fizz/protocol/clock/test/Mocks.h>
 #include <fizz/protocol/test/Mocks.h>
+#include <fizz/server/DefaultCertManager.h>
 #include <quic/api/QuicTransportFunctions.h>
 #include <quic/codec/DefaultConnectionIdAlgo.h>
 #include <quic/codec/QuicConnectionId.h>
@@ -98,8 +99,6 @@ PacketNum rstStreamAndSendPacket(
     }
   }
   CHECK(false) << "no packet with reset stream";
-  // some compilers are weird.
-  return 0;
 }
 
 void writeStreamFrameData(
@@ -143,12 +142,15 @@ std::shared_ptr<fizz::client::FizzClientContext> createClientCtx() {
   auto clientCtx = std::make_shared<fizz::client::FizzClientContext>();
   clientCtx->setClock(std::make_shared<NiceMock<fizz::test::MockClock>>());
   clientCtx->setSupportedAlpns({"quic_test"});
+  clientCtx->setSupportedGroups(
+      {fizz::NamedGroup::x25519, fizz::NamedGroup::secp256r1});
+  clientCtx->setDefaultShares({fizz::NamedGroup::x25519});
   return clientCtx;
 }
 
 std::shared_ptr<fizz::server::FizzServerContext> createServerCtx() {
   auto cert = readCert();
-  auto certManager = std::make_unique<fizz::server::CertManager>();
+  auto certManager = std::make_unique<fizz::server::DefaultCertManager>();
   certManager->addCertAndSetDefault(std::move(cert));
   auto serverCtx = std::make_shared<fizz::server::FizzServerContext>();
   serverCtx->setFactory(std::make_shared<QuicFizzFactory>());
@@ -163,7 +165,7 @@ class AcceptingTicketCipher : public fizz::server::TicketCipher {
  public:
   ~AcceptingTicketCipher() override = default;
 
-  folly::SemiFuture<folly::Optional<
+  [[nodiscard]] folly::SemiFuture<folly::Optional<
       std::pair<std::unique_ptr<folly::IOBuf>, std::chrono::seconds>>>
   encrypt(fizz::server::ResumptionState) const override {
     // Fake handshake, no need todo anything here.
@@ -174,7 +176,7 @@ class AcceptingTicketCipher : public fizz::server::TicketCipher {
     cachedPsk_ = cachedPsk;
   }
 
-  fizz::server::ResumptionState createResumptionState() const {
+  [[nodiscard]] fizz::server::ResumptionState createResumptionState() const {
     fizz::server::ResumptionState resState;
     resState.version = cachedPsk_.cachedPsk.version;
     resState.cipher = cachedPsk_.cachedPsk.cipher;
@@ -204,7 +206,7 @@ class AcceptingTicketCipher : public fizz::server::TicketCipher {
     return resState;
   }
 
-  folly::SemiFuture<
+  [[nodiscard]] folly::SemiFuture<
       std::pair<fizz::PskType, folly::Optional<fizz::server::ResumptionState>>>
   decrypt(std::unique_ptr<folly::IOBuf>) const override {
     return std::make_pair(fizz::PskType::Resumption, createResumptionState());
@@ -269,7 +271,7 @@ QuicCachedPsk setupZeroRttOnClientCtx(
 
 void setupCtxWithTestCert(fizz::server::FizzServerContext& ctx) {
   auto cert = readCert();
-  auto certManager = std::make_unique<fizz::server::CertManager>();
+  auto certManager = std::make_unique<fizz::server::DefaultCertManager>();
   certManager->addCertAndSetDefault(std::move(cert));
   ctx.setCertManager(std::move(certManager));
 }
@@ -594,7 +596,7 @@ OutstandingPacketWrapper makeTestingWritePacket(
       QuicVersion::MVFST);
   RegularQuicWritePacket packet(std::move(longHeader));
   return OutstandingPacketWrapper(
-      packet,
+      std::move(packet),
       sentTime,
       pathId,
       desiredSize,
@@ -884,8 +886,12 @@ std::unique_ptr<folly::IOBuf> getProtectionKey() {
       factory.makePacketNumberCipher(fizz::CipherSuite::TLS_AES_128_GCM_SHA256);
   CHECK(!pnCipherResult.hasError()) << "Failed to make packet number cipher";
   auto& pnCipher = pnCipherResult.value();
-  auto deriver = factory.getFizzFactory()->makeKeyDeriver(
-      fizz::CipherSuite::TLS_AES_128_GCM_SHA256);
+  std::unique_ptr<fizz::KeyDerivation> deriver;
+  fizz::Error fizzErr;
+  FIZZ_THROW_ON_ERROR(
+      factory.getFizzFactory()->makeKeyDeriver(
+          deriver, fizzErr, fizz::CipherSuite::TLS_AES_128_GCM_SHA256),
+      fizzErr);
   auto pnKey = deriver->expandLabel(
       quic::ByteRange(secret.data(), secret.size()),
       kQuicPNLabel,

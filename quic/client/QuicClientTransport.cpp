@@ -45,20 +45,15 @@ void QuicClientTransport::onNotifyDataAvailable(
       numGROBuffers_;
   const uint16_t numPackets = conn_->transportSettings.maxRecvBatchSize;
 
-  const size_t readAllocSize =
-      conn_->transportSettings.readCoalescingSize > kDefaultUDPSendPacketLen
-      ? conn_->transportSettings.readCoalescingSize
-      : readBufferSize;
-
   auto result = [&]() -> quic::Expected<void, QuicError> {
     if (conn_->transportSettings.networkDataPerSocketRead) {
-      return readWithRecvmsgSinglePacketLoop(sock, readAllocSize);
+      return readWithRecvmsgSinglePacketLoop(sock, readBufferSize);
     } else if (conn_->transportSettings.shouldUseWrapperRecvmmsgForBatchRecv) {
-      return readWithRecvmmsgWrapper(sock, readAllocSize, numPackets);
+      return readWithRecvmmsgWrapper(sock, readBufferSize, numPackets);
     } else if (conn_->transportSettings.shouldUseRecvmmsgForBatchRecv) {
-      return readWithRecvmmsg(sock, readAllocSize, numPackets);
+      return readWithRecvmmsg(sock, readBufferSize, numPackets);
     } else {
-      return readWithRecvmsg(sock, readAllocSize, numPackets);
+      return readWithRecvmsg(sock, readBufferSize, numPackets);
     }
   }();
   if (!result.has_value()) {
@@ -407,11 +402,7 @@ void QuicClientTransport::
   happyEyeballsStartSecondSocket(clientConn_->happyEyeballsState);
   // If this gets called from the write path then we haven't added the packets
   // to the outstanding packet list yet.
-  runOnEvbAsync([&](auto) {
-    auto result = markZeroRttPacketsLost(*conn_, markPacketLoss);
-    LOG_IF(ERROR, !result.has_value())
-        << "Failed to mark 0-RTT packets as lost.";
-  });
+  runOnEvbAsyncOp({.type = AsyncOpType::MarkZeroRttPacketsLost});
 }
 
 void QuicClientTransport::cleanupHappyEyeballsState() {

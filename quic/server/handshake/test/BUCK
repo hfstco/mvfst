@@ -21,6 +21,7 @@ fb_dirsync_cpp_unittest(
         "//quic/common:string_utils",
         "//quic/common/test:test_utils",
         "//quic/fizz/client/handshake:fizz_client_handshake",
+        "//quic/fizz/handshake:fizz_bridge",
         "//quic/fizz/handshake:fizz_handshake",
         "//quic/fizz/server/handshake:fizz_server_handshake",
         "//quic/fizz/server/handshake:handshake_app_token",
@@ -54,7 +55,6 @@ fb_dirsync_cpp_unittest(
     deps = [
         "fbsource//third-party/googletest:gtest",
         "//quic:constants",
-        "//quic/common:optional",
         "//quic/fizz/server/handshake:handshake_app_token",
         "//quic/server/state:server",
     ],
@@ -71,7 +71,6 @@ fb_dirsync_cpp_unittest(
         "//fizz/server:resumption_state",
         "//quic:constants",
         "//quic/api/test:mocks",
-        "//quic/common:optional",
         "//quic/fizz/server/handshake:fizz_server_handshake",
         "//quic/fizz/server/handshake:handshake_app_token",
         "//quic/server/handshake:default_app_token_validator",

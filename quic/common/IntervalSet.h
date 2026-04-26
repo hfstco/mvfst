@@ -11,8 +11,6 @@
 #include <cstdint>
 #include <limits>
 
-#include <folly/Likely.h>
-#include <glog/logging.h>
 #include <quic/common/CircularDeque.h>
 #include <quic/common/Expected.h>
 
@@ -131,7 +129,7 @@ class IntervalSet : private Container<Interval<T, Unit>> {
   /**
    * The version changes whenever we insert into the ack list.
    */
-  uint64_t insertVersion() const;
+  [[nodiscard]] uint64_t insertVersion() const;
 
   bool operator==(const IntervalSet& rhs) const {
     return static_cast<container_type>(*this) ==

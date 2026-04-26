@@ -24,7 +24,7 @@ class MockCongestionControllerFactory : public CongestionControllerFactory {
 
 class MockCongestionController : public CongestionController {
  public:
-  ~MockCongestionController() override {}
+  ~MockCongestionController() override = default;
 
   MOCK_METHOD(void, onRemoveBytesFromInflight, (uint64_t));
   MOCK_METHOD(void, onPacketSent, (const OutstandingPacketWrapper&));
@@ -58,6 +58,9 @@ class MockPacketProcessor : public PacketProcessor {
       onPacketDestroyed,
       (const OutstandingPacketWrapper&),
       (override));
+  MOCK_METHOD(void, preread, (), (override));
+  MOCK_METHOD(void, onPacketRead, (const ReceivedUdpPacket&), (override));
+  MOCK_METHOD(void, postread, (), (override));
   MOCK_METHOD(Optional<PrewriteRequest>, prewrite, (), (override));
   MOCK_METHOD(void, postwrite, (), (override));
 };
@@ -98,7 +101,6 @@ class MockPacer : public Pacer {
   MOCK_METHOD(void, setAppLimited, (bool));
   MOCK_METHOD(void, onPacketSent, ());
   MOCK_METHOD(void, onPacketsLoss, ());
-  MOCK_METHOD(void, setExperimental, (bool));
 };
 
 } // namespace quic::test

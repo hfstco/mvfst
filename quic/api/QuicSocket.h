@@ -138,12 +138,6 @@ class QuicSocket : virtual public QuicSocketLite {
   virtual void unsetAllDeliveryCallbacks() = 0;
 
   /**
-   * Pause/Resume read callback being triggered when data is available.
-   */
-  virtual quic::Expected<void, LocalErrorCode> pauseRead(StreamId id) = 0;
-  virtual quic::Expected<void, LocalErrorCode> resumeRead(StreamId id) = 0;
-
-  /**
    * ===== Peek/Consume API =====
    */
 
@@ -260,18 +254,23 @@ class QuicSocket : virtual public QuicSocketLite {
   /**
    * Returns whether a stream ID represents a client-initiated stream.
    */
-  virtual bool isClientStream(StreamId stream) noexcept = 0;
+  bool isClientStream(StreamId stream) noexcept {
+    return quic::isClientStream(stream);
+  }
 
   /**
    * Returns whether a stream ID represents a server-initiated stream.
    */
-  virtual bool isServerStream(StreamId stream) noexcept = 0;
+  bool isServerStream(StreamId stream) noexcept {
+    return quic::isServerStream(stream);
+  }
 
   /**
    * Returns directionality (unidirectional or bidirectional) of a stream by ID.
    */
-  virtual StreamDirectionality getStreamDirectionality(
-      StreamId stream) noexcept = 0;
+  StreamDirectionality getStreamDirectionality(StreamId stream) noexcept {
+    return quic::getStreamDirectionality(stream);
+  }
 
   /**
    * Register a callback to be invoked when the stream offset was transmitted.
@@ -335,12 +334,6 @@ class QuicSocket : virtual public QuicSocketLite {
       PingCallback* cb) = 0;
 
   /**
-   * Send a ping to the peer.  When the ping is acknowledged by the peer or
-   * times out, the transport will invoke the callback.
-   */
-  virtual void sendPing(std::chrono::milliseconds pingTimeout) = 0;
-
-  /**
    * Detaches the eventbase from the socket. This must be called from the
    * eventbase of socket.
    * Normally this is invoked by an app when the connection is idle, i.e.
@@ -391,6 +384,33 @@ class QuicSocket : virtual public QuicSocketLite {
    * dropped, and a LocalErrorCode will be returned to caller.
    */
   virtual WriteResult writeDatagram(BufPtr buf) = 0;
+
+  /**
+   * Creates a new datagram flow ID that can be used to send datagrams
+   * with a specific priority.
+   */
+  virtual quic::Expected<uint32_t, LocalErrorCode> createDatagramFlowId() = 0;
+
+  /**
+   * Writes a Datagram frame to a specific flow. The flow's priority
+   * determines scheduling order relative to other flows and streams.
+   */
+  virtual WriteResult writeDatagram(uint32_t flowId, BufPtr buf) = 0;
+
+  /**
+   * Sets the priority for a datagram flow. Lower values = higher priority.
+   * Priority determines scheduling order when scheduleDatagramsWithStreams
+   * is enabled.
+   */
+  virtual quic::Expected<void, LocalErrorCode> setDatagramFlowPriority(
+      uint32_t flowId,
+      PriorityQueue::Priority priority) = 0;
+
+  /**
+   * Closes a datagram flow. Any queued datagrams in the flow will be dropped.
+   */
+  virtual quic::Expected<void, LocalErrorCode> closeDatagramFlow(
+      uint32_t flowId) = 0;
 
   /**
    * Returns the currently available received Datagrams.

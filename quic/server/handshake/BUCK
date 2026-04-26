@@ -13,7 +13,7 @@ mvfst_cpp_library(
     ],
     deps = [
         "//quic/common:mvfst_logging",
-        "//quic/fizz/handshake:fizz_handshake",
+        "//quic/fizz/handshake:fizz_bridge",  # @manual direct include from ServerHandshake.cpp
         "//quic/state:stream_functions",
     ],
     exported_deps = [
@@ -23,7 +23,6 @@ mvfst_cpp_library(
         "//fizz/server:fizz_server",
         "//fizz/server:fizz_server_context",
         "//folly:optional",
-        "//folly/io:iobuf",
         "//folly/io/async:delayed_destruction",
         "//quic:constants",
         "//quic:exception",
@@ -84,9 +83,6 @@ mvfst_cpp_library(
         "//fizz/server:protocol",
         "//folly/io:iobuf",
         "//quic/common:optional",
-    ],
-    external_deps = [
-        "glog",
     ],
 )
 

@@ -156,11 +156,19 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacket(
     for (uint16_t processedPackets = 0;
          !udpData.empty() && processedPackets < kMaxNumCoalescedPackets;
          processedPackets++) {
+      bool hadPendingScone = pendingSconeRateSignal_.has_value();
       auto res = processUdpPacketData(localAddress, udpPacket, peerAddress);
       if (!res.has_value()) {
         return res;
       }
-      subsequentPacketProcessedSuccessfully = true;
+      // Only count non-SCONE packets as successful subsequent processing.
+      // SCONE packets are unencrypted, so a standalone spoofed SCONE datagram
+      // must not validate its own rate signal.
+      bool wasSconePacket =
+          !hadPendingScone && pendingSconeRateSignal_.has_value();
+      if (!wasSconePacket) {
+        subsequentPacketProcessedSuccessfully = true;
+      }
     }
     MVVLOG_IF(4, !udpData.empty())
         << "Leaving " << udpData.chainLength()
@@ -339,7 +347,53 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacketData(
         std::move(codecError->error.message)));
   }
 
+  // Extract destination connection ID from the parsed packet for validation.
+  // This covers both regular packets and SCONE packets in one place.
+  const ConnectionId* packetDstCid = nullptr;
+  if (auto* regularOptional = parsedPacket.regularPacket()) {
+    if (auto* lh = regularOptional->header.asLong()) {
+      packetDstCid = &lh->getDestinationConnId();
+    } else if (auto* sh = regularOptional->header.asShort()) {
+      packetDstCid = &sh->getConnectionId();
+    }
+  } else if (auto* sp = parsedPacket.sconePacket()) {
+    packetDstCid = &sp->dstCid;
+  }
+
+  // Validate DCID if we extracted one. CipherUnavailable and Nothing packets
+  // may fall through without a DCID and are handled below.
+  if (packetDstCid &&
+      std::find_if(
+          conn_->selfConnectionIds.begin(),
+          conn_->selfConnectionIds.end(),
+          [&](const auto& cidData) {
+            return cidData.connId == *packetDstCid;
+          }) == conn_->selfConnectionIds.end()) {
+    QUIC_STATS(
+        statsCallback_, onPacketDropped, PacketDropReason::PARSE_ERROR_CLIENT);
+    return quic::make_unexpected(QuicError(
+        TransportErrorCode::PROTOCOL_VIOLATION, "Invalid connection id"));
+  }
+
   if (auto* sp = parsedPacket.sconePacket()) {
+    // Validate SCID matches the server's connection ID.
+    // SCONE packets are unencrypted so we need explicit validation.
+    // A zero-length SCID is also invalid since the server must identify itself.
+    if (std::find_if(
+            conn_->peerConnectionIds.begin(),
+            conn_->peerConnectionIds.end(),
+            [&](const auto& cidData) {
+              return cidData.connId == sp->srcCid;
+            }) == conn_->peerConnectionIds.end()) {
+      VLOG(4) << "Dropping SCONE packet: SCID " << sp->srcCid.hex()
+              << " does not match any peer connection ID";
+      QUIC_STATS(
+          statsCallback_,
+          onPacketDropped,
+          PacketDropReason::PARSE_ERROR_CLIENT);
+      return {};
+    }
+
     if (conn_->qLogger) {
       conn_->qLogger->addTransportStateUpdate(
           fmt::format("scone_received:rate={}", static_cast<int>(sp->rate)));
@@ -372,11 +426,7 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacketData(
         conn_->statsCallback,
         onPacketDropped,
         PacketDropReason::PROTOCOL_VIOLATION);
-    QLOG(
-        *conn_,
-        addPacketDrop,
-        packetSize,
-        PacketDropReason(PacketDropReason::PROTOCOL_VIOLATION)._to_string());
+    QLOG(*conn_, addPacketDrop, packetSize, "PROTOCOL_VIOLATION");
     return quic::make_unexpected(QuicError(
         TransportErrorCode::PROTOCOL_VIOLATION, "Packet has no frames"));
   }
@@ -433,25 +483,6 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacketData(
     }
   }
 
-  // Error out if the connection id on the packet is not the one that is
-  // expected.
-  bool connidMatched = true;
-  auto& destinationCidInPacket = longHeader ? longHeader->getDestinationConnId()
-                                            : shortHeader->getConnectionId();
-
-  if (std::find_if(
-          conn_->selfConnectionIds.begin(),
-          conn_->selfConnectionIds.end(),
-          [&](const auto& cidData) {
-            return cidData.connId == destinationCidInPacket;
-          }) == conn_->selfConnectionIds.end()) {
-    connidMatched = false;
-  }
-  if (!connidMatched) {
-    return quic::make_unexpected(QuicError(
-        TransportErrorCode::PROTOCOL_VIOLATION, "Invalid connection id"));
-  }
-
   auto readPath = conn_->pathManager->getPath(localAddress, peerAddress);
   if (!readPath) {
     // Drop packets that are not from known peers, i.e., current, probing, or
@@ -463,13 +494,20 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacketData(
     return {};
   }
 
+  MVCHECK(packetDstCid, "regular packet must have a destination connection ID");
   if (conn_->currentPathId == readPath->id &&
-      destinationCidInPacket != conn_->clientConnectionId) {
+      *packetDstCid != conn_->clientConnectionId) {
     // The server is using a new CID for the current path.
-    conn_->clientConnectionId = destinationCidInPacket;
+    conn_->clientConnectionId = *packetDstCid;
     conn_->readCodec->setClientConnectionId(conn_->clientConnectionId.value());
-    MVVLOG(4) << "The server switched its dest cid to: "
-              << destinationCidInPacket.hex();
+    MVVLOG(4) << "The server switched its dest cid to: " << packetDstCid->hex();
+  }
+
+  // A packet arrived on the current path. If we recently migrated, clean up
+  // the previous path.
+  if (previousPathId_.has_value() && conn_->currentPathId == readPath->id) {
+    (void)conn_->pathManager->removePath(*previousPathId_);
+    previousPathId_.reset();
   }
 
   // Add the packet to the AckState associated with the packet number space.
@@ -1284,11 +1322,6 @@ QuicClientTransportLite::startCryptoHandshake() {
     customTransportParameters_.push_back(*maybeEncodedDirectEncapParam);
   }
 
-  if (conn_->transportSettings.enableScone) {
-    VLOG(4) << "Sending SCONE transport parameter";
-    customTransportParameters_.push_back(encodeSconeSupportedParameter());
-  }
-
   auto paramsExtension = std::make_shared<ClientTransportParametersExtension>(
       conn_->originalVersion.value(),
       conn_->transportSettings.advertisedInitialConnectionFlowControlWindow,
@@ -1319,12 +1352,7 @@ QuicClientTransportLite::startCryptoHandshake() {
 
   if (!transportReadyNotified_ && clientConn_->zeroRttWriteCipher) {
     transportReadyNotified_ = true;
-    runOnEvbAsync([](auto self) {
-      auto clientPtr = dynamic_cast<QuicClientTransportLite*>(self.get());
-      if (clientPtr->connSetupCallback_) {
-        clientPtr->connSetupCallback_->onTransportReady();
-      }
-    });
+    runOnEvbAsyncOp({.type = AsyncOpType::TransportReady});
   } else if (clientConn_->transportSettings.isPriming) {
     auto clientPtr = dynamic_cast<QuicClientTransportLite*>(self.get());
     if (clientPtr->connSetupCallback_) {
@@ -1386,7 +1414,7 @@ void QuicClientTransportLite::errMessage(
       }
     }
 
-    const struct sock_extended_err* serr =
+    const auto* serr =
         reinterpret_cast<const struct sock_extended_err*>(CMSG_DATA(&cmsg));
     auto errStr = quic::errnoStr(serr->ee_errno);
     if (!happyEyeballsState.shouldWriteToFirstSocket &&
@@ -1555,7 +1583,7 @@ quic::Expected<void, QuicError> QuicClientTransportLite::recvMsg(
           QuicAsyncUDPSocket::convertToSocketTimestampExt(*params.ts);
     }
 
-    size_t bytesRead = size_t(ret);
+    auto bytesRead = size_t(ret);
     totalData += bytesRead;
     if (!server) {
       server = folly::SocketAddress();
@@ -1661,7 +1689,7 @@ QuicClientTransportLite::readWithRecvmsgSinglePacketLoop(
       return recvResult;
     }
 
-    if (!socket_) {
+    if (!socket_ || closeState_ == CloseState::CLOSED) {
       // Socket has been closed.
       return {};
     }
@@ -1681,7 +1709,7 @@ QuicClientTransportLite::readWithRecvmsgSinglePacketLoop(
       return processResult;
     }
 
-    if (!socket_) {
+    if (!socket_ || closeState_ == CloseState::CLOSED) {
       // Socket has been closed.
       return {};
     }
@@ -1706,12 +1734,7 @@ void QuicClientTransportLite::onNotifyDataAvailable(
                             uint64_t(kDefaultUDPReadBufferSize)) *
       numGROBuffers_;
 
-  const size_t readAllocSize =
-      conn_->transportSettings.readCoalescingSize > kDefaultUDPSendPacketLen
-      ? conn_->transportSettings.readCoalescingSize
-      : readBufferSize;
-
-  auto result = readWithRecvmsgSinglePacketLoop(sock, readAllocSize);
+  auto result = readWithRecvmsgSinglePacketLoop(sock, readBufferSize);
   if (!result.has_value()) {
     asyncClose(result.error());
   }
@@ -1888,26 +1911,46 @@ void QuicClientTransportLite::setSupportedVersions(
   conn_->readCodec->setCodecParameters(params);
 }
 
-void QuicClientTransportLite::runOnEvbAsync(
-    std::function<void(std::shared_ptr<QuicClientTransportLite>)> func) {
-  auto evb = getEventBase();
-  evb->runInLoop(
-      [self = sharedGuardClient(), func = std::move(func), evb]() mutable {
-        if (self->getEventBase() != evb) {
-          // The eventbase changed between scheduling the loop and invoking
-          // the callback, ignore this
-          return;
-        }
-        func(std::move(self));
-      },
-      true);
+void QuicClientTransportLite::dispatchAsyncOp(AsyncOpData data) {
+  switch (data.type) {
+    case AsyncOpType::TransportReady:
+      if (connSetupCallback_) {
+        connSetupCallback_->onTransportReady();
+      }
+      break;
+    case AsyncOpType::AsyncClose:
+      if (data.error) {
+        closeImpl(std::move(*data.error), false, false);
+      }
+      break;
+    case AsyncOpType::MarkZeroRttPacketsLost: {
+      auto result = markZeroRttPacketsLost(*conn_, markPacketLoss);
+      LOG_IF(ERROR, !result.has_value())
+          << "Failed to mark 0-RTT packets as lost.";
+      break;
+    }
+    case AsyncOpType::RemoveNonCurrentPathClient: {
+      // Remove a path that is not the current path after validation callback.
+      // The path may have become current if the callback migrated to it.
+      auto pathId = data.pathId;
+      if (conn_->currentPathId == pathId) {
+        return;
+      }
+      auto removeRes = conn_->pathManager->removePath(pathId);
+      if (removeRes.hasError()) {
+        MVLOG_WARNING << "Failed to remove path " << pathId
+                      << " after validation: " << removeRes.error();
+      }
+      break;
+    }
+    default:
+      QuicTransportBaseLite::dispatchAsyncOp(data);
+      break;
+  }
 }
 
 void QuicClientTransportLite::asyncClose(QuicError error) {
-  runOnEvbAsync([error = std::move(error)](auto self) {
-    auto clientPtr = static_cast<QuicClientTransportLite*>(self.get());
-    clientPtr->closeImpl(std::move(error), false, false);
-  });
+  runOnEvbAsyncOp({.type = AsyncOpType::AsyncClose, .error = std::move(error)});
 }
 
 void QuicClientTransportLite::onNetworkSwitch(
@@ -2033,12 +2076,36 @@ quic::Expected<void, QuicError> QuicClientTransportLite::removePath(
 }
 
 quic::Expected<void, QuicError> QuicClientTransportLite::migrateConnection(
-    PathIdType pathId) {
+    PathIdType pathId,
+    bool resetCongestionControllerAndRtt) {
   auto oldPathId = conn_->currentPathId;
+
+  auto prevPathCCType = conn_->congestionController
+      ? conn_->congestionController->type()
+      : CongestionControlType::None;
 
   auto switchPathResult = conn_->pathManager->switchCurrentPath(pathId);
   if (switchPathResult.hasError()) {
     return quic::make_unexpected(switchPathResult.error());
+  }
+
+  if (resetCongestionControllerAndRtt) {
+    // Create a fresh congestion controller for the new path.
+    if (conn_->congestionControllerFactory) {
+      conn_->congestionController =
+          conn_->congestionControllerFactory->makeCongestionController(
+              *conn_, prevPathCCType);
+    }
+    // Reset RTT state. Use the probe's RTT sample if available,
+    // otherwise leave RTT as-is so PTO timeouts remain functional.
+    auto* pathInfo = conn_->pathManager->getPath(pathId);
+    if (pathInfo && pathInfo->rttSample) {
+      auto rttSample = pathInfo->rttSample.value();
+      conn_->lossState.srtt = rttSample;
+      conn_->lossState.lrtt = rttSample;
+      conn_->lossState.rttvar = 0us;
+      conn_->lossState.mrtt = rttSample;
+    }
   }
 
   auto newSocket = std::move(switchPathResult.value());
@@ -2063,19 +2130,12 @@ quic::Expected<void, QuicError> QuicClientTransportLite::migrateConnection(
 
   QUIC_STATS(conn_->statsCallback, onConnectionMigration);
 
-  // Keep the old path for some time so we can read any packets that might
-  // already be inflight
-  auto removePathLambda = [conn = shared_from_this(), oldPathId]() {
-    auto removePathRes = conn->clientConn_->pathManager->removePath(oldPathId);
-    if (removePathRes.hasError()) {
-      MVLOG_WARNING << "Failed to remove old path after migration. "
-                    << removePathRes.error();
-    }
-  };
-  auto delay = kClientTimeToKeepOldPathAfterMigration *
-      std::chrono::ceil<std::chrono::milliseconds>(conn_->lossState.srtt)
-          .count();
-  evb_->runAfterDelay(removePathLambda, delay);
+  // If there's already a previous path from an earlier migration, remove it
+  // now. We only keep track of one old path at a time.
+  if (previousPathId_.has_value()) {
+    (void)conn_->pathManager->removePath(*previousPathId_);
+  }
+  previousPathId_ = oldPathId;
 
   // Write something to trigger the migration.
   conn_->pendingEvents.sendPing = true;
@@ -2246,7 +2306,7 @@ bool QuicClientTransportLite::waitingForHandshakeData() const {
   return clientConn_->clientHandshakeLayer->waitingForData();
 }
 
-const std::shared_ptr<const folly::AsyncTransportCertificate>
+const std::shared_ptr<const fizz::Cert>
 QuicClientTransportLite::getPeerCertificate() const {
   const auto clientHandshakeLayer = clientConn_->clientHandshakeLayer;
   if (clientHandshakeLayer) {
@@ -2285,18 +2345,9 @@ void QuicClientTransportLite::onPathValidationResult(const PathInfo& pathInfo) {
     // The upper layer should decide to migrate or not in the callback. After
     // the callback, if this path is not the current one, remove it to avoid
     // dangling paths/sockets.
-    evb_->runInLoop(
-        [&, pathId = pathInfo.id]() {
-          if (conn_->currentPathId == pathId) {
-            return;
-          }
-          auto removeRes = conn_->pathManager->removePath(pathId);
-          if (removeRes.hasError()) {
-            MVLOG_WARNING << "Failed to remove path " << pathId
-                          << " after validation: " << removeRes.error();
-          }
-        },
-        /*thisIteration=*/true);
+    runOnEvbAsyncOp(
+        {.type = AsyncOpType::RemoveNonCurrentPathClient,
+         .pathId = pathInfo.id});
   } else if (pathInfo.status != PathStatus::Validated) {
     // This is the current path and it has failed validation, we need to close
     // the connection.

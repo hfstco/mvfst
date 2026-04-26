@@ -71,7 +71,8 @@ class MockQLogger : public QLogger {
       addCongestionStateUpdate,
       (Optional<std::string> oldState,
        std::string newState,
-       Optional<std::string> trigger));
+       Optional<std::string> trigger,
+       Optional<uint64_t> resumption));
   MOCK_METHOD(
       void,
       addStreamStateUpdate,

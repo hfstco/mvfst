@@ -1,0 +1,86 @@
+load("@fbcode//quic:defs.bzl", "mvfst_cpp_library")
+
+oncall("traffic_protocols")
+
+mvfst_cpp_library(
+    name = "bbr2_shared",
+    srcs = [
+        "Bbr2Shared.cpp",
+    ],
+    headers = [
+        "Bbr2Shared.h",
+    ],
+    deps = [
+        "//quic/congestion_control:congestion_control_functions",
+        "//quic/logging:qlogger_constants",
+        "//quic/logging:qlogger_macros",
+    ],
+    exported_deps = [
+        "//quic/congestion_control:bandwidth",
+        "//quic/congestion_control:congestion_controller",
+        "//quic/congestion_control/third_party:chromium_windowed_filter",
+        "//quic/state:quic_state_machine",
+        "//quic/state:transport_settings",
+    ],
+)
+
+mvfst_cpp_library(
+    name = "bbr2_probe_rtt",
+    srcs = [
+        "Bbr2ProbeRtt.cpp",
+    ],
+    headers = [
+        "Bbr2ProbeRtt.h",
+    ],
+    deps = [
+        "//quic/congestion_control:congestion_control_functions",
+    ],
+    exported_deps = [
+        ":bbr2_shared",
+        "//quic/congestion_control:congestion_controller",
+    ],
+)
+
+mvfst_cpp_library(
+    name = "bbr2_probe_bw",
+    srcs = [
+        "Bbr2ProbeBw.cpp",
+    ],
+    headers = [
+        "Bbr2ProbeBw.h",
+    ],
+    deps = [
+        ":bbr2_probe_rtt",
+        "//quic/congestion_control:congestion_control_functions",
+    ],
+    exported_deps = [
+        ":bbr2_shared",
+        "//quic/congestion_control:bandwidth",
+        "//quic/congestion_control:congestion_controller",
+    ],
+)
+
+mvfst_cpp_library(
+    name = "bbr2_startup",
+    srcs = [
+        "Bbr2Startup.cpp",
+    ],
+    headers = [
+        "Bbr2Startup.h",
+    ],
+    deps = [
+        ":bbr2_probe_bw",
+        ":bbr2_probe_rtt",
+        "//quic/congestion_control:congestion_control_functions",
+        "//quic/logging:qlogger_macros",
+        "//quic/state:stats_callback",
+    ],
+    exported_deps = [
+        ":bbr2_shared",
+        "//quic/congestion_control:bandwidth",
+        "//quic/congestion_control:congestion_controller",
+        "//quic/congestion_control/third_party:chromium_windowed_filter",
+        "//quic/state:quic_state_machine",
+        "//quic/state:transport_settings",
+    ],
+)

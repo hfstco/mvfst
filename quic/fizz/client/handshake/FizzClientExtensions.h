@@ -24,7 +24,9 @@ class FizzClientExtensions : public fizz::ClientExtensions {
 
   ~FizzClientExtensions() override = default;
 
-  std::vector<fizz::Extension> getClientHelloExtensions() const override {
+  fizz::Status getClientHelloExtensions(
+      std::vector<fizz::Extension>& ret,
+      fizz::Error& err) const override {
     std::vector<fizz::Extension> exts;
 
     ClientTransportParameters params;
@@ -42,23 +44,28 @@ class FizzClientExtensions : public fizz::ClientExtensions {
 
     if (chloPaddingBytes_ > 0) {
       fizz::extensions::Padding padding{chloPaddingBytes_};
-      exts.push_back(fizz::encodeExtension(padding));
+      fizz::Extension ext;
+      FIZZ_RETURN_ON_ERROR(fizz::encodeExtension(ext, err, padding));
+      exts.push_back(std::move(ext));
     }
-    return exts;
+    ret = std::move(exts);
+    return fizz::Status::Success;
   }
 
-  void onEncryptedExtensions(
+  fizz::Status onEncryptedExtensions(
+      fizz::Error& err,
       const std::vector<fizz::Extension>& exts) override {
     fizz::validateTransportExtensions(
         exts, clientParameters_->encodingVersion_);
     auto serverParams =
         fizz::getServerExtension(exts, clientParameters_->encodingVersion_);
     if (!serverParams) {
-      throw fizz::FizzException(
+      return err.error(
           "missing server quic transport parameters extension",
           fizz::AlertDescription::missing_extension);
     }
     clientParameters_->serverTransportParameters_ = std::move(serverParams);
+    return fizz::Status::Success;
   }
 
  private:

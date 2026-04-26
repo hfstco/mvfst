@@ -5,6 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include <quic/QuicConstants.h>
 #include <quic/common/MvfstLogging.h>
 #include <quic/congestion_control/Bbr.h>
 #include <quic/congestion_control/ServerCongestionControllerFactory.h>
@@ -19,6 +20,8 @@
 #include <quic/common/TransportKnobs.h>
 #include <chrono>
 #include <memory>
+
+#include <folly/TokenBucket.h>
 
 namespace quic {
 
@@ -170,6 +173,12 @@ quic::Expected<void, QuicError> QuicServerTransport::onReadData(
   auto readDataResult = onServerReadData(*serverConn_, readData);
   if (readDataResult.hasError()) {
     return quic::make_unexpected(readDataResult.error());
+  }
+  if (!quicExperimentApplied_ && quicExperimentHandlerFn_ &&
+      serverConn_->peerQuicExperimentId.has_value() &&
+      *serverConn_->peerQuicExperimentId != 0) {
+    quicExperimentHandlerFn_(*conn_, *serverConn_->peerQuicExperimentId);
+    quicExperimentApplied_ = true;
   }
   processPendingData(true);
 
@@ -452,6 +461,12 @@ void QuicServerTransport::onCryptoEventAvailable() noexcept {
       closeImpl(handshakeResult.error());
       return;
     }
+    if (!quicExperimentApplied_ && quicExperimentHandlerFn_ &&
+        serverConn_->peerQuicExperimentId.has_value() &&
+        *serverConn_->peerQuicExperimentId != 0) {
+      quicExperimentHandlerFn_(*conn_, *serverConn_->peerQuicExperimentId);
+      quicExperimentApplied_ = true;
+    }
     processPendingData(false);
     // pending data may contain connection close
     if (closeState_ == CloseState::CLOSED) {
@@ -574,19 +589,17 @@ bool QuicServerTransport::shouldWriteNewSessionTicket() {
   // 3. We haven't sent any session ticket in the last
   // kMinIntervalBetweenSessionTickets
 
-  /* Forcefully enable for Careful Resume. */
-  if (/* conn_->transportSettings.includeCwndHintsInSessionTicket && */
-      conn_->congestionController &&
-      Clock::now() - newSessionTicketWrittenTimestamp_.value() >
-          kMinIntervalBetweenSessionTickets) {
+    /*TODO forefully enable CR. */
+  if (conn_->transportSettings.includeCwndHintsInSessionTicket &&
+      conn_->congestionController) {
     const auto& targetBDP = conn_->congestionController->getBDP();
-    /* TODO adjust congestion window changed limits. */
     bool bdpChangedSinceLastHint =
         !newSessionTicketWrittenCwndHint_.has_value() ||
         targetBDP / 2 > *newSessionTicketWrittenCwndHint_ ||
         targetBDP < *newSessionTicketWrittenCwndHint_;
-    /* TODO check if minimum rtt has changed? */
-    if (bdpChangedSinceLastHint) {
+    if (bdpChangedSinceLastHint &&
+        Clock::now() - newSessionTicketWrittenTimestamp_.value() >
+            kMinIntervalBetweenSessionTickets) {
       return true;
     }
   }
@@ -598,13 +611,12 @@ QuicServerTransport::maybeWriteNewSessionTicket() {
   if (shouldWriteNewSessionTicket() &&
       serverConn_->serverHandshakeLayer->isHandshakeDone()) {
     newSessionTicketWrittenTimestamp_ = Clock::now();
-    Optional<uint64_t> cwndHint = std::nullopt;
     if (conn_->transportSettings.includeCwndHintsInSessionTicket &&
         conn_->congestionController) {
       const auto& bdp = conn_->congestionController->getBDP();
-      MVVLOG(7) << "Writing a new session ticket with cwnd hint=" << bdp;
-      cwndHint = bdp;
-      newSessionTicketWrittenCwndHint_ = cwndHint;
+      newSessionTicketWrittenCwndHint_ = std::max(
+          bdp,
+          conn_->udpSendPacketLen * conn_->transportSettings.initCwndInMss);
     }
     /* Careful Resume. */
     Optional<uint64_t> savedCongestionWindow = std::nullopt;
@@ -618,6 +630,13 @@ QuicServerTransport::maybeWriteNewSessionTicket() {
       newSessionTicketWrittenSavedRtt_ = savedRtt;
     }
     AppToken appToken;
+    Optional<uint64_t> rttHintMs;
+    if (conn_->lossState.srtt > 0us) {
+      rttHintMs = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              conn_->lossState.srtt)
+              .count());
+    }
     auto transportParamsResult = createTicketTransportParameters(
         conn_->transportSettings.idleTimeout.count(),
         conn_->transportSettings.maxRecvPacketSize,
@@ -630,7 +649,8 @@ QuicServerTransport::maybeWriteNewSessionTicket() {
         conn_->transportSettings.advertisedInitialMaxStreamsBidi,
         conn_->transportSettings.advertisedInitialMaxStreamsUni,
         conn_->transportSettings.advertisedExtendedAckFeatures,
-        cwndHint,
+        newSessionTicketWrittenCwndHint_,
+        rttHintMs,
         savedCongestionWindow,
         savedRtt);
     if (transportParamsResult.hasError()) {
@@ -758,6 +778,11 @@ void QuicServerTransport::setShouldRegisterKnobParamHandlerFn(
   shouldRegisterKnobParamHandlerFn_ = std::move(fn);
 }
 
+void QuicServerTransport::setQuicExperimentHandlerFn(
+    QuicExperimentHandlerFn fn) {
+  quicExperimentHandlerFn_ = std::move(fn);
+}
+
 void QuicServerTransport::registerTransportKnobParamHandler(
     uint64_t paramId,
     std::function<quic::Expected<void, QuicError>(
@@ -781,7 +806,7 @@ void QuicServerTransport::setBufAccessor(BufAccessor* bufAccessor) {
   conn_->bufAccessor = bufAccessor;
 }
 
-const std::shared_ptr<const folly::AsyncTransportCertificate>
+const std::shared_ptr<const fizz::Cert>
 QuicServerTransport::getPeerCertificate() const {
   const auto handshakeLayer = serverConn_->serverHandshakeLayer;
   if (handshakeLayer) {
@@ -790,7 +815,7 @@ QuicServerTransport::getPeerCertificate() const {
   return nullptr;
 }
 
-const std::shared_ptr<const folly::AsyncTransportCertificate>
+const std::shared_ptr<const fizz::Cert>
 QuicServerTransport::getSelfCertificate() const {
   const auto handshakeLayer = serverConn_->serverHandshakeLayer;
   if (handshakeLayer) {
@@ -801,8 +826,7 @@ QuicServerTransport::getSelfCertificate() const {
 
 void QuicServerTransport::onTransportKnobs(BufPtr knobBlob) {
   if (knobBlob->length() > 0) {
-    std::string serializedKnobs = std::string(
-        reinterpret_cast<const char*>(knobBlob->data()), knobBlob->length());
+    auto serializedKnobs = knobBlob->to<std::string>();
     MVVLOG(4) << "Received transport knobs: " << serializedKnobs;
     auto params = parseTransportKnobs(serializedKnobs);
     if (params.has_value()) {
@@ -843,11 +867,24 @@ void QuicServerTransport::registerAllTransportKnobParamHandlers() {
       [](QuicServerTransport& serverTransport,
          TransportKnobParam::Val val) -> quic::Expected<void, QuicError> {
         auto server_conn = serverTransport.serverConn_;
-        auto cctype =
-            static_cast<CongestionControlType>(std::get<uint64_t>(val));
+        auto* strVal = std::get_if<std::string>(&val);
+        if (!strVal) {
+          return quic::make_unexpected(QuicError(
+              TransportErrorCode::INTERNAL_ERROR,
+              "CC_ALGORITHM_KNOB: expected string value"));
+        }
+        auto maybeCctype = congestionControlStrToType(*strVal);
+        if (!maybeCctype) {
+          return quic::make_unexpected(QuicError(
+              TransportErrorCode::INTERNAL_ERROR,
+              fmt::format(
+                  "Unknown congestion control algorithm: {}", *strVal)));
+        }
+        auto cctype = *maybeCctype;
         MVVLOG(3) << "Knob param received, set congestion control type to "
                   << congestionControlTypeToString(cctype);
-        if (cctype == server_conn->congestionController->type()) {
+        if (server_conn->congestionController &&
+            cctype == server_conn->congestionController->type()) {
           return {};
         }
         serverTransport.setCongestionControl(cctype);
@@ -1033,21 +1070,6 @@ void QuicServerTransport::registerAllTransportKnobParamHandlers() {
         MVVLOG(3) << fmt::format(
             "FIXED_SHORT_HEADER_PADDING_KNOB KnobParam received, setting fixedShortHeaderPadding={}",
             val);
-        return {};
-      });
-  registerTransportKnobParamHandler(
-      static_cast<uint64_t>(TransportKnobParamId::PACER_EXPERIMENTAL),
-      [](QuicServerTransport& serverTransport,
-         TransportKnobParam::Val val) -> quic::Expected<void, QuicError> {
-        auto server_conn = serverTransport.serverConn_;
-        if (server_conn->pacer) {
-          auto enableExperimental = static_cast<bool>(std::get<uint64_t>(val));
-          server_conn->pacer->setExperimental(enableExperimental);
-          MVVLOG(3) << fmt::format(
-              "PACER_EXPERIMENTAL KnobParam received, "
-              "setting experimental={} for pacer",
-              enableExperimental);
-        }
         return {};
       });
   registerTransportKnobParamHandler(
@@ -1310,6 +1332,138 @@ void QuicServerTransport::registerAllTransportKnobParamHandlers() {
         MVVLOG(3) << "MAX_PTO KnobParam received: " << maxPTOCount;
         return {};
       });
+  registerTransportKnobParamHandler(
+      static_cast<uint64_t>(TransportKnobParamId::EGRESS_POLICER_CONFIG),
+      [](QuicServerTransport& serverTransport,
+         TransportKnobParam::Val value) -> quic::Expected<void, QuicError> {
+        const std::string* valPtr = std::get_if<std::string>(&value);
+        if (!valPtr) {
+          auto errMsg =
+              "Received invalid type for EGRESS_POLICER_CONFIG KnobParam: expected string";
+          MVVLOG(3) << errMsg;
+          return quic::make_unexpected(
+              QuicError(TransportErrorCode::INTERNAL_ERROR, errMsg));
+        }
+
+        auto serverConn = serverTransport.serverConn_;
+        uint64_t rateBytesPerSec = 0;
+        uint32_t burstMs = 0;
+        uint32_t delayMs = 0;
+        bool parseSuccess = false;
+        try {
+          parseSuccess =
+              folly::split(',', *valPtr, rateBytesPerSec, burstMs, delayMs);
+        } catch (const std::exception&) {
+          parseSuccess = false;
+        }
+
+        if (!parseSuccess) {
+          auto errMsg = fmt::format(
+              "Received invalid KnobParam for EGRESS_POLICER_CONFIG: {}",
+              *valPtr);
+          MVVLOG(3) << errMsg;
+          return quic::make_unexpected(
+              QuicError(TransportErrorCode::INTERNAL_ERROR, std::move(errMsg)));
+        }
+
+        serverConn->transportSettings.egressPolicerConfig.rateBytesPerSec =
+            rateBytesPerSec;
+        serverConn->transportSettings.egressPolicerConfig.burstMs = burstMs;
+        serverConn->transportSettings.egressPolicerConfig.delayMs = delayMs;
+
+        if (rateBytesPerSec > 0) {
+          serverConn->transportSettings.egressPolicerConfig.enabled = true;
+          double burstBytes =
+              static_cast<double>(rateBytesPerSec) * burstMs / 1000.0;
+          if (burstBytes < kDefaultMaxUDPPayload) {
+            burstBytes = kDefaultMaxUDPPayload;
+          }
+          serverConn->egressPolicer = std::make_unique<folly::TokenBucket>(
+              static_cast<double>(rateBytesPerSec), burstBytes);
+          serverConn->egressPolicerActivationTime =
+              Clock::now() + std::chrono::milliseconds(delayMs);
+        } else {
+          serverConn->transportSettings.egressPolicerConfig.enabled = false;
+          serverConn->egressPolicer.reset();
+          serverConn->egressPolicerActivationTime.reset();
+        }
+        MVVLOG(3) << fmt::format(
+            "EGRESS_POLICER_CONFIG KnobParam received, "
+            "rateBytesPerSec={}, burstMs={}, delayMs={}, raw knob={}",
+            rateBytesPerSec,
+            burstMs,
+            delayMs,
+            *valPtr);
+        return {};
+      });
+
+  registerTransportKnobParamHandler(
+      static_cast<uint64_t>(TransportKnobParamId::SCONE_KNOB),
+      [](QuicServerTransport& serverTransport,
+         TransportKnobParam::Val value) -> quic::Expected<void, QuicError> {
+        const uint64_t* valPtr = std::get_if<uint64_t>(&value);
+        if (!valPtr) {
+          return quic::make_unexpected(QuicError(
+              QuicErrorCode(TransportErrorCode::INTERNAL_ERROR),
+              "SCONE_KNOB: Expected uint64_t value"));
+        }
+        auto& conn = *serverTransport.conn_;
+        uint64_t bps = *valPtr;
+        uint8_t rateSignal = bpsToSconeRateSignal(bps);
+        if (!conn.scone) {
+          conn.scone.emplace();
+        }
+        conn.scone->negotiated = true;
+        conn.scone->configuredRateSignal = rateSignal;
+        // Reset the send timer so a SCONE packet is sent with the very next
+        // outgoing packet, reflecting the new rate signal immediately.
+        conn.scone->lastSconeSentTime.reset();
+        VLOG(3) << "SCONE_KNOB: Enabled SCONE with rate signal "
+                << static_cast<int>(rateSignal) << " from " << bps << " bps";
+        return {};
+      });
+  registerTransportKnobParamHandler(
+      static_cast<uint64_t>(TransportKnobParamId::RX_PACKETS_BEFORE_ACK),
+      [](QuicServerTransport& serverTransport,
+         TransportKnobParam::Val value) -> quic::Expected<void, QuicError> {
+        const std::string* valPtr = std::get_if<std::string>(&value);
+        if (!valPtr) {
+          auto errMsg =
+              "Received invalid type for RX_PACKETS_BEFORE_ACK KnobParam: expected string";
+          MVVLOG(3) << errMsg;
+          return quic::make_unexpected(
+              QuicError(TransportErrorCode::INTERNAL_ERROR, errMsg));
+        }
+
+        const std::string& val = *valPtr;
+        uint16_t beforeInit = 0;
+        uint16_t afterInit = 0;
+        bool parseSuccess = false;
+        try {
+          parseSuccess = folly::split(',', val, beforeInit, afterInit);
+          parseSuccess = parseSuccess && beforeInit >= 2 && afterInit >= 2;
+        } catch (std::exception&) {
+          parseSuccess = false;
+        }
+        if (parseSuccess) {
+          MVVLOG(3) << fmt::format(
+              "RX_PACKETS_BEFORE_ACK KnobParam received, "
+              "beforeInit={}, afterInit={}",
+              beforeInit,
+              afterInit);
+          auto serverConn = serverTransport.serverConn_;
+          serverConn->transportSettings.rxPacketsBeforeAckBeforeInit =
+              beforeInit;
+          serverConn->transportSettings.rxPacketsBeforeAckAfterInit = afterInit;
+        } else {
+          auto errMsg = fmt::format(
+              "Received invalid KnobParam for RX_PACKETS_BEFORE_ACK: {}", val);
+          MVVLOG(3) << errMsg;
+          return quic::make_unexpected(
+              QuicError(TransportErrorCode::INTERNAL_ERROR, std::move(errMsg)));
+        }
+        return {};
+      });
 }
 
 QuicConnectionStats QuicServerTransport::getConnectionsStats() const {
@@ -1322,9 +1476,9 @@ QuicConnectionStats QuicServerTransport::getConnectionsStats() const {
 
 CipherInfo QuicServerTransport::getOneRttCipherInfo() const {
   return {
-      *conn_->oneRttWriteCipher->getKey(),
-      *serverConn_->serverHandshakeLayer->getState().cipher(),
-      conn_->oneRttWriteHeaderCipher->getKey()->clone()};
+      .trafficKey = *conn_->oneRttWriteCipher->getKey(),
+      .cipherSuite = *serverConn_->serverHandshakeLayer->getState().cipher(),
+      .packetProtectionKey = conn_->oneRttWriteHeaderCipher->getKey()->clone()};
 }
 
 Optional<std::string> QuicServerTransport::getSni() {

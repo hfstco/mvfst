@@ -3,16 +3,72 @@ load("@fbsource//tools/build_defs:fb_native_wrapper.bzl", "fb_native")
 
 oncall("traffic_protocols")
 
+fb_native.constraint_setting(
+    name = "use_alt_crypto",
+    visibility = ["PUBLIC"],
+)
+
+fb_native.constraint_value(
+    name = "use_alt_crypto-enabled",
+    constraint_setting = ":use_alt_crypto",
+    visibility = ["PUBLIC"],
+)
+
+mvfst_cpp_library(
+    name = "enum",
+    headers = select({
+        "DEFAULT": {
+            "QuicEnum.h": "QuicEnum.h",
+        },
+        # Mobile: use plain enum class without BETTER_ENUM overhead (~6KB savings)
+        # ARVR Android uses BETTER_ENUM (needs TransportKnobs, etc.)
+        "ovr_config//os/constraints:android": select({
+            "DEFAULT": {
+                "QuicEnum.h": "facebook/QuicEnumMobile.h",
+            },
+            "ovr_config//build_mode:arvr_mode[enabled]": {
+                "QuicEnum.h": "QuicEnum.h",
+            },
+        }),
+        "ovr_config//os/constraints:iphoneos": {
+            "QuicEnum.h": "facebook/QuicEnumMobile.h",
+        },
+    }),
+    exported_deps = select({
+        "DEFAULT": [
+            "//folly/lang:assume",
+            "//quic/common/third-party:better_enums",
+        ],
+        "ovr_config//os/constraints:android": select({
+            "DEFAULT": [],
+            "ovr_config//build_mode:arvr_mode[enabled]": [
+                "//folly/lang:assume",
+                "//quic/common/third-party:better_enums",
+            ],
+        }),
+        "ovr_config//os/constraints:iphoneos": [],
+    }),
+)
+
 mvfst_cpp_library(
     name = "config",
     headers = select({
+        # @oss-only: "DEFAULT": {"mvfst-config.h": "//:mvfst-config.h"},
         "DEFAULT": select({
-            # @oss-only: "DEFAULT": {"mvfst-config.h": "//:mvfst-config.h"},
             "DEFAULT": {"mvfst-config.h": "mvfst-config.h"},  # @fb-only
             "ovr_config//os/constraints:android": {"mvfst-config.h": "facebook/mvfst-config-mobile.h"},  # @fb-only
             "ovr_config//os/constraints:iphoneos": {"mvfst-config.h": "facebook/mvfst-config-mobile.h"},  # @fb-only
-            "ovr_config//os/constraints:macos": {"mvfst-config.h": "facebook/mvfst-config-mobile.h"},  # @fb-only
         }),
+        "ovr_config//runtime/constraints:fbcode": select({
+            "DEFAULT": {"mvfst-config.h": "facebook/mvfst-config-fbcode.h"},  # @fb-only
+            "fbcode//quic:use_alt_crypto-enabled": {"mvfst-config.h": "facebook/mvfst-config-alt-crypto.h"},  # @fb-only
+            "ovr_config//build_mode:arvr_mode[enabled]": select({
+                "DEFAULT": {"mvfst-config.h": "mvfst-config.h"},  # @fb-only
+                "ovr_config//os/constraints:android": {"mvfst-config.h": "facebook/mvfst-config-mobile.h"},  # @fb-only
+                "ovr_config//os/constraints:iphoneos": {"mvfst-config.h": "facebook/mvfst-config-mobile.h"},  # @fb-only
+            }),  # @fb-only
+            "ovr_config//runtime/constraints:android-host-test": {"mvfst-config.h": "mvfst-config.h"},  # @fb-only
+        }),  # @fb-only
     }),
     exported_deps = select({
         "DEFAULT": [
@@ -23,7 +79,6 @@ mvfst_cpp_library(
         ],
         "ovr_config//os/constraints:android": [],  # @manual
         "ovr_config//os/constraints:iphoneos": [],  # @manual
-        "ovr_config//os/constraints:macos": [],  # @manual
     }),
 )
 
@@ -33,20 +88,33 @@ mvfst_cpp_library(
         "DEFAULT": ["QuicConstants.cpp"],
         "ovr_config//os/constraints:android": ["facebook/QuicConstantsMobile.cpp"],
         "ovr_config//os/constraints:iphoneos": ["facebook/QuicConstantsMobile.cpp"],
-        "ovr_config//os/constraints:macos": ["facebook/QuicConstantsMobile.cpp"],
     }),
-    headers = [
-        "QuicConstants.h",
-        "QuicTypealiases.h",
-    ],
+    headers = select({
+        "DEFAULT": {
+            "QuicConstants.h": "QuicConstants.h",
+            "QuicTypealiases.h": "QuicTypealiases.h",
+        },
+        "fbsource//tools/build_defs/config/apps/shared:constraint-value-quic-typealiases-mobile": {
+            "QuicConstants.h": "QuicConstants.h",
+            "QuicTypealiases.h": "QuicTypealiasesMobile.h",
+        },
+    }),
     deps = [
         "//folly/lang:assume",
     ],
-    exported_deps = [
-        "//folly/chrono:clock",
-        "//folly/io:iobuf",
-        "//quic/common/third-party:better_enums",
-    ],
+    exported_deps = select({
+        "DEFAULT": [
+            ":enum",
+            "//folly/chrono:clock",
+            "//folly/io:iobuf",
+        ],
+        "fbsource//tools/build_defs/config/apps/shared:constraint-value-quic-typealiases-mobile": [
+            ":enum",
+            "//folly/chrono:clock",
+            "//quic/common:quic_buffer",
+            "//quic/common:quic_iobuf_queue",
+        ],
+    }),
 )
 
 mvfst_cpp_library(
@@ -55,7 +123,6 @@ mvfst_cpp_library(
         "DEFAULT": ["QuicException.cpp"],
         "ovr_config//os/constraints:android": ["facebook/QuicExceptionMobile.cpp"],
         "ovr_config//os/constraints:iphoneos": ["facebook/QuicExceptionMobile.cpp"],
-        "ovr_config//os/constraints:macos": ["facebook/QuicExceptionMobile.cpp"],
     }),
     headers = [
         "QuicException.h",
@@ -64,17 +131,13 @@ mvfst_cpp_library(
         "DEFAULT": ["//quic/common:mvfst_logging"],
         "ovr_config//os/constraints:android": [],
         "ovr_config//os/constraints:iphoneos": [],
-        "ovr_config//os/constraints:macos": [],
-    }),
+    }) + [],
     exported_deps = [
         ":constants",
         ":tls_exception",
         "//folly:range",
         "//quic/common:optional",
         "//quic/common:variant",
-    ],
-    external_deps = [
-        "glog",
     ],
 )
 
@@ -85,7 +148,7 @@ mvfst_cpp_library(
         "DEFAULT": ["QuicTLSExceptionFizz.cpp"],
         "ovr_config//os/constraints:android": select({
             "DEFAULT": ["facebook/mbed/QuicTLSExceptionMbed.cpp"],  # @fb-only
-            "ovr_config//build_mode/constraints:arvr_mode_enabled": ["QuicTLSExceptionFizz.cpp"],
+            "ovr_config//build_mode:arvr_mode[enabled]": ["QuicTLSExceptionFizz.cpp"],
         }),
         "ovr_config//os/constraints:iphoneos": ["facebook/mbed/QuicTLSExceptionMbed.cpp"],  # @fb-only
     }),
@@ -100,7 +163,7 @@ mvfst_cpp_library(
             "DEFAULT": [
                 "fbsource//xplat/mobilenetwork:tls_common",  # @manual
             ],
-            "ovr_config//build_mode/constraints:arvr_mode_enabled": [
+            "ovr_config//build_mode:arvr_mode[enabled]": [
                 "//fizz/record:record",
             ],
         }),

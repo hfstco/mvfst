@@ -11,9 +11,11 @@
 #include <quic/codec/QuicPacketBuilder.h>
 #include <quic/common/TransportKnobs.h>
 #include <quic/fizz/handshake/FizzCryptoFactory.h>
+#include <quic/fizz/server/handshake/AppToken.h>
 #include <quic/logging/FileQLogger.h>
 #include <quic/priority/HTTPPriorityQueue.h>
 #include <quic/server/handshake/ServerHandshake.h>
+#include <quic/server/state/ServerStateMachine.h>
 #include <quic/state/QuicStreamFunctions.h>
 #include <quic/state/test/Mocks.h>
 
@@ -1694,6 +1696,9 @@ TEST_F(QuicServerTransportTest, UnboundConnection) {
   // Need to do this otherwise server transport destructor will still call
   // onConnectionUnbound
   server->setRoutingCallback(nullptr);
+
+  EXPECT_CALL(routingCallback, onConnectionUnbound(_, _, _)).Times(0);
+  server->unbindConnection();
 }
 
 TEST_F(
@@ -1763,6 +1768,9 @@ TEST_F(QuicServerTransportTest, DestroyWithoutClosingCancelByteEvents) {
   auto serverRegisterByteEvent2 = server->registerByteEventCallback(
       ByteEvent::Type::ACK, streamId, 0, &deliveryCallback);
 
+  EXPECT_TRUE(serverRegisterByteEvent1.has_value());
+  EXPECT_TRUE(serverRegisterByteEvent2.has_value());
+
   EXPECT_CALL(txCallback, onByteEventCanceled(_));
   EXPECT_CALL(deliveryCallback, onByteEventCanceled(_));
   EXPECT_CALL(readCb, readError(_, _));
@@ -1788,6 +1796,7 @@ TEST_F(QuicServerTransportTest, SetCongestionControl) {
 
 TEST_F(QuicServerTransportTest, TestServerNotDetachable) {
   EXPECT_FALSE(server->isDetachable());
+  EXPECT_EQ(server->getConn().nodeType, QuicNodeType::Server);
 }
 
 TEST_F(
@@ -2185,6 +2194,53 @@ TEST_F(QuicUnencryptedServerTransportTest, FirstPacketProcessedCallback) {
       *aead,
       *headerCipher,
       clientNextInitialPacketNum));
+}
+
+TEST_F(QuicUnencryptedServerTransportTest, InitialWithTrailingRandomPadding) {
+  // Simulate picoquic-style datagram padding: a valid Initial packet followed
+  // by garbage bytes outside the QUIC packet but inside the UDP datagram.
+  // The server must process the Initial successfully and not abandon the
+  // connection when the trailing garbage bytes fail to parse as a coalesced
+  // packet. See RFC 9000 Section 12.2.
+  auto chlo = folly::IOBuf::copyBuffer("CHLO");
+  auto nextPacketNum = clientNextInitialPacketNum++;
+  auto aead = getInitialCipher();
+  auto headerCipher = getInitialHeaderCipher();
+  ChainedByteRangeHead chloRch(chlo);
+  auto initialPacket = packetToBufCleartext(
+      createInitialCryptoPacket(
+          *clientConnectionId,
+          *initialDestinationConnectionId,
+          nextPacketNum,
+          QuicVersion::MVFST,
+          chloRch,
+          *aead,
+          0 /* largestAcked */),
+      *aead,
+      *headerCipher,
+      nextPacketNum);
+
+  // Append padding bytes after the Initial packet. Use 0xcd as the first byte
+  // (long header form bit set) to trigger the parseLongHeaderInvariant path,
+  // followed by bytes that will fail invariant parsing.
+  size_t paddingLen = 800;
+  auto padding = folly::IOBuf::create(paddingLen);
+  padding->append(paddingLen);
+  memset(padding->writableData(), 0xAA, paddingLen);
+  // Set first byte to have long header form bit (0x80) set, which triggers
+  // the "Dropping packet, failed to parse invariant" path.
+  padding->writableData()[0] = 0xcd;
+  initialPacket->appendToChain(std::move(padding));
+  initialPacket->coalesce();
+
+  // This must not throw. Before the fix, the trailing garbage bytes would cause
+  // a parse failure that triggered CONNECTION_ABANDONED because
+  // firstPacketFromPeer was never cleared after the Initial was processed.
+  EXPECT_NO_THROW(deliverData(std::move(initialPacket)));
+
+  // Verify the server processed the Initial successfully.
+  EXPECT_NE(server->getConn().readCodec, nullptr);
+  EXPECT_FALSE(server->getConn().localConnectionError.has_value());
 }
 
 TEST_F(QuicUnencryptedServerTransportTest, TestUnencryptedStream) {
@@ -2628,28 +2684,6 @@ TEST_F(
   EXPECT_EQ(server->getConn().pendingOneRttData, nullptr);
 }
 
-class QuicServerTransportSendAckOnlyInitialTest
-    : public QuicUnencryptedServerTransportTest,
-      public testing::WithParamInterface<bool> {};
-
-TEST_P(
-    QuicServerTransportSendAckOnlyInitialTest,
-    TestSkipAckOnlyCryptoInitial) {
-  auto transportSettings = server->getTransportSettings();
-  transportSettings.sendAckOnlyInitial = GetParam();
-  server->setTransportSettings(transportSettings);
-  // start at some random packet number that isn't zero
-  clientNextInitialPacketNum = folly::Random::rand32(1, 100);
-
-  // bypass doHandshake() in fakeServerHandshake by sending something other than
-  // "CHLO"
-  recvClientHello(true, QuicVersion::MVFST, "hello :)");
-
-  // we expect nothing to be written as we're skipping the initial ack-only
-  // packet
-  EXPECT_EQ(serverWrites.size(), (size_t)transportSettings.sendAckOnlyInitial);
-}
-
 TEST_F(QuicUnencryptedServerTransportTest, TestNoAckOnlyCryptoInitial) {
   recvClientHello();
 
@@ -2681,11 +2715,6 @@ TEST_F(QuicUnencryptedServerTransportTest, TestNoAckOnlyCryptoInitial) {
     }
   }
 }
-
-INSTANTIATE_TEST_SUITE_P(
-    QuicServerTransportSendAckOnlyInitialTests,
-    QuicServerTransportSendAckOnlyInitialTest,
-    Bool());
 
 TEST_F(QuicUnencryptedServerTransportTest, TestDuplicateCryptoInitialLogging) {
   auto transportSettings = server->getTransportSettings();
@@ -3314,6 +3343,142 @@ TEST_F(QuicUnencryptedServerTransportTest, TestCloseWhileAsyncPending) {
       std::runtime_error);
 }
 
+// Verify that cwnd hints encoded by maybeWriteNewSessionTicket are only
+// applied when the resuming client's address matches the most recent one.
+TEST_F(QuicUnencryptedServerTransportTest, CwndHintEncodeDecodeRoundTrip) {
+  auto& conn = server->getNonConstConn();
+  conn.transportSettings.includeCwndHintsInSessionTicket = true;
+
+  // Simulate a previous connection that validated an old source token.
+  // clientAddr is 127.0.0.1 (set in SetUp), so maybeWriteNewSessionTicket
+  // will ensure 127.0.0.1 is at the back of the source addresses.
+  // Include an old address from a different subnet to test the negative case.
+  conn.tokenSourceAddresses = {folly::IPAddress("10.0.0.5")};
+
+  // Set a non-zero SRTT so the RTT hint is included in the token.
+  // Both cwnd and rtt hints must be present for hints to be applied.
+  conn.lossState.srtt = std::chrono::microseconds(50000); // 50ms
+
+  // Capture the AppToken written by the real maybeWriteNewSessionTicket.
+  // Encode immediately since AppToken is not copyable (unique_ptr member).
+  BufPtr tokenBuf;
+  uint64_t cwndHintBytes = 0;
+  bool tokenCaptured = false;
+  EXPECT_CALL(*getFakeHandshakeLayer(), writeNewSessionTicket(_))
+      .WillOnce([&](const AppToken& appToken) {
+        // Verify the token contains a cwnd hint.
+        auto cwndResult = getIntegerParameter(
+            TransportParameterId::cwnd_hint_bytes,
+            appToken.transportParams.parameters);
+        EXPECT_FALSE(cwndResult.hasError());
+        if (!cwndResult.hasError() && cwndResult.value().has_value()) {
+          cwndHintBytes = *cwndResult.value();
+        }
+        // Verify 10.0.0.5 is in the token (needed for the negative case
+        // to be meaningful — hints must not be applied even though this
+        // address shares a /24 with the resuming peer).
+        auto it = std::find(
+            appToken.sourceAddresses.begin(),
+            appToken.sourceAddresses.end(),
+            folly::IPAddress("10.0.0.5"));
+        EXPECT_NE(it, appToken.sourceAddresses.end())
+            << "Old address should be in the token for negative case";
+        tokenBuf = encodeAppToken(appToken);
+        tokenCaptured = true;
+        return quic::Expected<void, QuicError>{};
+      });
+
+  // Complete the handshake to trigger maybeWriteNewSessionTicket.
+  setupClientReadCodec();
+  recvClientHello();
+  EXPECT_CALL(handshakeFinishedCallback, onHandshakeFinished());
+  recvClientFinished();
+  loopForWrites();
+
+  ASSERT_TRUE(tokenCaptured) << "Session ticket should have been written";
+  ASSERT_TRUE(tokenBuf) << "Token should have been encoded";
+  EXPECT_GT(cwndHintBytes, 0);
+
+  // A simple CC stub that records setResumeHints calls.
+  struct StubCC : public CongestionController {
+    void onRemoveBytesFromInflight(uint64_t) override {}
+
+    void onPacketSent(const OutstandingPacketWrapper&) override {}
+
+    void onPacketAckOrLoss(const AckEvent*, const LossEvent*) override {}
+
+    [[nodiscard]] uint64_t getWritableBytes() const override {
+      return 0;
+    }
+
+    [[nodiscard]] uint64_t getCongestionWindow() const override {
+      return 0;
+    }
+
+    [[nodiscard]] CongestionControlType type() const override {
+      return CongestionControlType::None;
+    }
+
+    void setAppIdle(bool, TimePoint) override {}
+
+    void setAppLimited() override {}
+
+    [[nodiscard]] bool isAppLimited() const override {
+      return false;
+    }
+
+    void getStats(CongestionControllerStats&) const override {}
+
+    void setResumeHints(
+        uint64_t cwnd,
+        const Optional<std::chrono::milliseconds>& rtt =
+            std::nullopt) override {
+      called = true;
+      hintCwnd = cwnd;
+      hintRtt = rtt.value_or(std::chrono::milliseconds{0});
+    }
+
+    bool called{false};
+    uint64_t hintCwnd{0};
+    std::chrono::milliseconds hintRtt{0};
+  };
+
+  // Case 1: Client resumes from same /24 as the most recent address
+  // (127.0.0.x). Hints SHOULD be applied.
+  {
+    QuicServerConnectionState nextConn(
+        FizzServerQuicHandshakeContext::Builder().build());
+    nextConn.peerAddress = folly::SocketAddress("127.0.0.2", 4433);
+    auto cc = std::make_unique<StubCC>();
+    auto* rawCC = cc.get();
+    nextConn.congestionController = std::move(cc);
+
+    Optional<BufPtr> opt = tokenBuf->clone();
+    maybeUpdateTransportFromAppToken(nextConn, opt);
+
+    EXPECT_TRUE(rawCC->called)
+        << "Hints should apply: peer is in same /24 as most recent address";
+    EXPECT_EQ(rawCC->hintCwnd, cwndHintBytes);
+  }
+
+  // Case 2: Client resumes from a different network (10.0.0.x).
+  // Hints should NOT be applied, even though 10.0.0.5 is in the token.
+  {
+    QuicServerConnectionState nextConn(
+        FizzServerQuicHandshakeContext::Builder().build());
+    nextConn.peerAddress = folly::SocketAddress("10.0.0.6", 4433);
+    auto cc = std::make_unique<StubCC>();
+    auto* rawCC = cc.get();
+    nextConn.congestionController = std::move(cc);
+
+    Optional<BufPtr> opt = tokenBuf->clone();
+    maybeUpdateTransportFromAppToken(nextConn, opt);
+
+    EXPECT_FALSE(rawCC->called)
+        << "Hints should NOT apply: peer is on a different /24 from most recent";
+  }
+}
+
 struct FizzHandshakeParam {
   FizzHandshakeParam(bool argCHLOSync, bool argCFINSync, bool argAcceptZeroRtt)
       : chloSync(argCHLOSync),
@@ -3750,6 +3915,53 @@ TEST_F(
   server->handleKnobParams({{.id = knobParamId, .val = uint64_t{1234}}});
 }
 
+TEST_F(QuicServerTransportTest, TestCCAlgorithmKnobNoneThenCubicCrash) {
+  auto ccKnobId =
+      static_cast<uint64_t>(TransportKnobParamId::CC_ALGORITHM_KNOB);
+
+  // Setting CC to None via knob is valid and nulls out the controller
+  EXPECT_CALL(*quicStats_, onTransportKnobApplied(Eq(ccKnobId))).Times(1);
+  server->handleKnobParams({{.id = ccKnobId, .val = std::string("none")}});
+  EXPECT_EQ(server->getConn().congestionController.get(), nullptr);
+
+  // A subsequent CC knob should not crash even with null controller
+  EXPECT_CALL(*quicStats_, onTransportKnobApplied(Eq(ccKnobId))).Times(1);
+  server->handleKnobParams({{.id = ccKnobId, .val = std::string("cubic")}});
+  EXPECT_NE(server->getConn().congestionController.get(), nullptr);
+}
+
+TEST_F(QuicServerTransportTest, TestCCAlgorithmKnobString) {
+  auto ccKnobId =
+      static_cast<uint64_t>(TransportKnobParamId::CC_ALGORITHM_KNOB);
+
+  // parseTransportKnobs stores CC_ALGORITHM_KNOB as std::string.
+  // Verify the handler accepts string values (the real code path).
+  // Use NewReno to ensure it actually changes from the default (Cubic).
+  EXPECT_CALL(*quicStats_, onTransportKnobApplied(Eq(ccKnobId))).Times(1);
+  server->handleKnobParams({{.id = ccKnobId, .val = std::string("newreno")}});
+  EXPECT_NE(server->getConn().congestionController.get(), nullptr);
+  EXPECT_EQ(
+      server->getConn().congestionController->type(),
+      CongestionControlType::NewReno);
+
+  // Change back to Cubic via string
+  EXPECT_CALL(*quicStats_, onTransportKnobApplied(Eq(ccKnobId))).Times(1);
+  server->handleKnobParams({{.id = ccKnobId, .val = std::string("cubic")}});
+  EXPECT_EQ(
+      server->getConn().congestionController->type(),
+      CongestionControlType::Cubic);
+}
+
+TEST_F(QuicServerTransportTest, TestCCAlgorithmKnobInvalidString) {
+  auto ccKnobId =
+      static_cast<uint64_t>(TransportKnobParamId::CC_ALGORITHM_KNOB);
+
+  // Invalid CC algorithm string should be rejected gracefully
+  EXPECT_CALL(*quicStats_, onTransportKnobError(Eq(ccKnobId))).Times(1);
+  server->handleKnobParams(
+      {{.id = ccKnobId, .val = std::string("not_a_real_cc")}});
+}
+
 TEST_F(QuicServerTransportTest, TestSkipKnobsWhenNotAdvertisingSupport) {
   auto& conn = server->getNonConstConn();
   auto& transportSettings = conn.transportSettings;
@@ -3879,25 +4091,6 @@ TEST_F(QuicServerTransportTest, TestAutotuneStreamFlowControlKnobHandler) {
             TransportKnobParamId::AUTOTUNE_RECV_STREAM_FLOW_CONTROL),
         .val = uint64_t(0)}});
   EXPECT_FALSE(transportSettings.autotuneReceiveStreamFlowControl);
-}
-
-TEST_F(QuicServerTransportTest, TestPacerExperimentalKnobHandler) {
-  auto mockPacer = std::make_unique<NiceMock<MockPacer>>();
-  auto rawPacer = mockPacer.get();
-  server->getNonConstConn().pacer = std::move(mockPacer);
-
-  EXPECT_CALL(*rawPacer, setExperimental(true)).Times(2);
-  server->handleKnobParams(
-      {{.id = static_cast<uint64_t>(TransportKnobParamId::PACER_EXPERIMENTAL),
-        .val = uint64_t{1}}});
-  server->handleKnobParams(
-      {{.id = static_cast<uint64_t>(TransportKnobParamId::PACER_EXPERIMENTAL),
-        .val = uint64_t{2}}});
-
-  EXPECT_CALL(*rawPacer, setExperimental(false)).Times(1);
-  server->handleKnobParams(
-      {{.id = static_cast<uint64_t>(TransportKnobParamId::PACER_EXPERIMENTAL),
-        .val = uint64_t{0}}});
 }
 
 TEST_F(QuicServerTransportTest, TestAckFrequencyPolicyKnobHandler) {
@@ -4432,6 +4625,100 @@ TEST_F(QuicServerTransportTest, TestSendCloseOnIdleTimeoutKnobHandler) {
   EXPECT_TRUE(transportSettings.alwaysSendConnectionCloseOnIdleTimeout);
 }
 
+TEST_F(QuicServerTransportTest, TestRxPacketsBeforeAckKnobHandler) {
+  auto& transportSettings = server->getNonConstConn().transportSettings;
+
+  // Verify defaults
+  EXPECT_EQ(
+      transportSettings.rxPacketsBeforeAckBeforeInit,
+      kDefaultRxPacketsBeforeAckBeforeInit);
+  EXPECT_EQ(
+      transportSettings.rxPacketsBeforeAckAfterInit,
+      kDefaultRxPacketsBeforeAckAfterInit);
+
+  // Test invalid: wrong type (uint64_t instead of string)
+  server->handleKnobParams(
+      {{.id =
+            static_cast<uint64_t>(TransportKnobParamId::RX_PACKETS_BEFORE_ACK),
+        .val = uint64_t{1}}});
+  EXPECT_EQ(
+      transportSettings.rxPacketsBeforeAckBeforeInit,
+      kDefaultRxPacketsBeforeAckBeforeInit);
+  EXPECT_EQ(
+      transportSettings.rxPacketsBeforeAckAfterInit,
+      kDefaultRxPacketsBeforeAckAfterInit);
+
+  // Test invalid: malformed string
+  server->handleKnobParams(
+      {{.id =
+            static_cast<uint64_t>(TransportKnobParamId::RX_PACKETS_BEFORE_ACK),
+        .val = "blah,blah"}});
+  EXPECT_EQ(
+      transportSettings.rxPacketsBeforeAckBeforeInit,
+      kDefaultRxPacketsBeforeAckBeforeInit);
+
+  // Test invalid: wrong number of fields
+  server->handleKnobParams(
+      {{.id =
+            static_cast<uint64_t>(TransportKnobParamId::RX_PACKETS_BEFORE_ACK),
+        .val = "10"}});
+  EXPECT_EQ(
+      transportSettings.rxPacketsBeforeAckBeforeInit,
+      kDefaultRxPacketsBeforeAckBeforeInit);
+
+  server->handleKnobParams(
+      {{.id =
+            static_cast<uint64_t>(TransportKnobParamId::RX_PACKETS_BEFORE_ACK),
+        .val = "10,10,10"}});
+  EXPECT_EQ(
+      transportSettings.rxPacketsBeforeAckBeforeInit,
+      kDefaultRxPacketsBeforeAckBeforeInit);
+
+  // Test invalid: zero beforeInit
+  server->handleKnobParams(
+      {{.id =
+            static_cast<uint64_t>(TransportKnobParamId::RX_PACKETS_BEFORE_ACK),
+        .val = "0,10"}});
+  EXPECT_EQ(
+      transportSettings.rxPacketsBeforeAckBeforeInit,
+      kDefaultRxPacketsBeforeAckBeforeInit);
+
+  // Test invalid: zero afterInit
+  server->handleKnobParams(
+      {{.id =
+            static_cast<uint64_t>(TransportKnobParamId::RX_PACKETS_BEFORE_ACK),
+        .val = "10,0"}});
+  EXPECT_EQ(
+      transportSettings.rxPacketsBeforeAckAfterInit,
+      kDefaultRxPacketsBeforeAckAfterInit);
+
+  // Test invalid: beforeInit=1 (must be >= 2)
+  server->handleKnobParams(
+      {{.id =
+            static_cast<uint64_t>(TransportKnobParamId::RX_PACKETS_BEFORE_ACK),
+        .val = "1,10"}});
+  EXPECT_EQ(
+      transportSettings.rxPacketsBeforeAckBeforeInit,
+      kDefaultRxPacketsBeforeAckBeforeInit);
+
+  // Test invalid: afterInit=1 (must be >= 2)
+  server->handleKnobParams(
+      {{.id =
+            static_cast<uint64_t>(TransportKnobParamId::RX_PACKETS_BEFORE_ACK),
+        .val = "10,1"}});
+  EXPECT_EQ(
+      transportSettings.rxPacketsBeforeAckAfterInit,
+      kDefaultRxPacketsBeforeAckAfterInit);
+
+  // Test valid: beforeInit=20, afterInit=30
+  server->handleKnobParams(
+      {{.id =
+            static_cast<uint64_t>(TransportKnobParamId::RX_PACKETS_BEFORE_ACK),
+        .val = "20,30"}});
+  EXPECT_EQ(transportSettings.rxPacketsBeforeAckBeforeInit, 20);
+  EXPECT_EQ(transportSettings.rxPacketsBeforeAckAfterInit, 30);
+}
+
 TEST_F(QuicServerTransportTest, SconeNegotiationServerSide) {
   // In transportSettings passed to server, set enableScone=true
   server->getNonConstConn().transportSettings.enableScone = true;
@@ -4463,7 +4750,8 @@ TEST_F(QuicServerTransportTest, SconeRateSignalFlushedOnWrite) {
   // Push value into server->getConn().scone->pendingRateSignals
   uint8_t testRate = 0x42;
   QuicVersion testVersion = QuicVersion::SCONE_VERSION_2;
-  conn.scone->pendingRateSignals.push_back({testRate, testVersion});
+  conn.scone->pendingRateSignals.push_back(
+      {.rate = testRate, .version = testVersion});
 
   // Verify rate signal is queued
   EXPECT_EQ(conn.scone->pendingRateSignals.size(), 1);
@@ -4532,6 +4820,122 @@ TEST_F(QuicServerTransportTest, SconeRateSignalProcessingE2E) {
   // This tests the server-side rate signal queuing in ServerStateMachine.cpp
   EXPECT_EQ(conn.scone->pendingRateSignals.size(), 1);
   EXPECT_EQ(conn.scone->pendingRateSignals.front().rate, testRate);
+}
+
+TEST_F(QuicServerTransportTest, SconeKnobEnablesSconeAndSetsRateSignal) {
+  auto& conn = server->getNonConstConn();
+
+  // SCONE should not be active before knob
+  EXPECT_FALSE(conn.scone.has_value());
+
+  // Send SCONE_KNOB with 1 Mbps (1000000 bps)
+  // Expected signal: 20 * log10(1000000 / 100000) = 20 * 1 = 20
+  TransportKnobParams params;
+  params.push_back(
+      {static_cast<uint64_t>(TransportKnobParamId::SCONE_KNOB),
+       uint64_t{1000000}});
+  server->handleKnobParams(params);
+
+  ASSERT_TRUE(conn.scone.has_value());
+  EXPECT_TRUE(conn.scone->negotiated);
+  EXPECT_EQ(conn.scone->configuredRateSignal, 20);
+  // Timer should be reset so a SCONE packet is sent with the next outgoing
+  // packet.
+  EXPECT_FALSE(conn.scone->lastSconeSentTime.has_value());
+}
+
+TEST_F(QuicServerTransportTest, SconeKnobResetsTimerForImmediateSend) {
+  auto& conn = server->getNonConstConn();
+
+  // Set up SCONE state as if a SCONE packet was already sent
+  conn.scone.emplace();
+  conn.scone->negotiated = true;
+  conn.scone->configuredRateSignal = 10;
+  conn.scone->lastSconeSentTime = Clock::now();
+  ASSERT_TRUE(conn.scone->lastSconeSentTime.has_value());
+
+  // Receiving a new SCONE_KNOB should reset the timer
+  TransportKnobParams params;
+  params.push_back(
+      {static_cast<uint64_t>(TransportKnobParamId::SCONE_KNOB),
+       uint64_t{10000000}}); // 10 Mbps -> signal 40
+  server->handleKnobParams(params);
+
+  ASSERT_TRUE(conn.scone.has_value());
+  EXPECT_TRUE(conn.scone->negotiated);
+  EXPECT_EQ(conn.scone->configuredRateSignal, 40);
+  // Timer must be reset so a SCONE packet goes out with the next packet
+  EXPECT_FALSE(conn.scone->lastSconeSentTime.has_value());
+}
+
+TEST_F(QuicServerTransportTest, SconeKnobRateConversion) {
+  auto& conn = server->getNonConstConn();
+
+  // Test various bps values and expected rate signals
+  struct TestCase {
+    uint64_t bps;
+    uint8_t expectedSignal;
+  };
+
+  std::vector<TestCase> testCases = {
+      {100000, 0}, // 100 Kbps -> signal 0 (minimum)
+      {1000000, 20}, // 1 Mbps -> signal 20
+      {10000000, 40}, // 10 Mbps -> signal 40
+      {100000000, 60}, // 100 Mbps -> signal 60
+      {1000000000, 80}, // 1 Gbps -> signal 80
+  };
+
+  for (const auto& tc : testCases) {
+    conn.scone.reset();
+    TransportKnobParams params;
+    params.push_back(
+        {static_cast<uint64_t>(TransportKnobParamId::SCONE_KNOB),
+         uint64_t{tc.bps}});
+    server->handleKnobParams(params);
+
+    ASSERT_TRUE(conn.scone.has_value()) << "bps=" << tc.bps;
+    EXPECT_EQ(conn.scone->configuredRateSignal, tc.expectedSignal)
+        << "bps=" << tc.bps;
+  }
+}
+
+TEST_F(QuicServerTransportTest, SconeKnobEdgeCases) {
+  auto& conn = server->getNonConstConn();
+
+  // Test below minimum: 0 bps should clamp to signal 0
+  {
+    conn.scone.reset();
+    TransportKnobParams params;
+    params.push_back(
+        {static_cast<uint64_t>(TransportKnobParamId::SCONE_KNOB), uint64_t{0}});
+    server->handleKnobParams(params);
+    ASSERT_TRUE(conn.scone.has_value());
+    EXPECT_EQ(conn.scone->configuredRateSignal, 0);
+  }
+
+  // Test below minimum: 50 Kbps should clamp to signal 0
+  {
+    conn.scone.reset();
+    TransportKnobParams params;
+    params.push_back(
+        {static_cast<uint64_t>(TransportKnobParamId::SCONE_KNOB),
+         uint64_t{50000}});
+    server->handleKnobParams(params);
+    ASSERT_TRUE(conn.scone.has_value());
+    EXPECT_EQ(conn.scone->configuredRateSignal, 0);
+  }
+
+  // Test very high value: should clamp to 126
+  {
+    conn.scone.reset();
+    TransportKnobParams params;
+    params.push_back(
+        {static_cast<uint64_t>(TransportKnobParamId::SCONE_KNOB),
+         uint64_t{500000000000ULL}}); // 500 Gbps
+    server->handleKnobParams(params);
+    ASSERT_TRUE(conn.scone.has_value());
+    EXPECT_EQ(conn.scone->configuredRateSignal, 126);
+  }
 }
 
 } // namespace quic::test

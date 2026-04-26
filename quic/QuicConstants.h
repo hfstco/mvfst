@@ -16,11 +16,11 @@
 #endif // _WIN32
 
 #include <folly/chrono/Clock.h>
-#include <folly/io/Cursor.h>
+#include <quic/QuicEnum.h>
 #include <quic/QuicTypealiases.h>
-#include <quic/common/third-party/enum.h>
 #include <sys/types.h>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -42,14 +42,8 @@ using SystemClock = folly::chrono::SystemClock;
 
 } // namespace quic::chrono
 
-namespace folly {
-class SocketAddress;
-} // namespace folly
-
 namespace quic {
 
-using AddressRange = folly::Range<folly::SocketAddress const*>;
-using Cursor = folly::io::Cursor;
 using Clock = std::chrono::steady_clock;
 using TimePoint = std::chrono::time_point<Clock>;
 using DurationRep = std::chrono::microseconds::rep;
@@ -118,9 +112,17 @@ constexpr uint64_t kDefaultQuicTransportKnobSpace = 0xfaceb001;
 // Default knob id for transport knobs (used for internal use-cases only)
 constexpr uint64_t kDefaultQuicTransportKnobId = 1;
 
-FOLLY_PUSH_WARNING
-FOLLY_CLANG_DISABLE_WARNING("-Wglobal-constructors")
-BETTER_ENUM(
+// QUIC_ENUM expands to BETTER_ENUM on server (with ._to_string() support),
+// or plain enum class on mobile (to reduce binary size by ~6KB per enum).
+// clang-format off
+#if defined(__GNUC__) || defined(__clang__)
+_Pragma("GCC diagnostic push")
+#ifdef __clang__
+    _Pragma("GCC diagnostic ignored \"-Wglobal-constructors\"")
+#endif
+#endif
+
+QUIC_ENUM(
     PacketDropReason,
     uint8_t,
     NONE,
@@ -165,9 +167,10 @@ BETTER_ENUM(
     CLIENT_SHUTDOWN,
     INVALID_SRC_PORT,
     UNKNOWN_CID_VERSION,
-    CANNOT_FORWARD_DATA)
+    CANNOT_FORWARD_DATA,
+    EGRESS_POLICER_DROP)
 
-BETTER_ENUM(
+QUIC_ENUM(
     TransportKnobParamId,
     uint64_t,
     // Any value not in the list below
@@ -187,7 +190,8 @@ BETTER_ENUM(
     STARTUP_RTT_FACTOR_KNOB = 0x1111,
     // Set pacing rtt factor used when not in startup
     DEFAULT_RTT_FACTOR_KNOB = 0x2222,
-    // Set max pacing rate in bytes per second to be used if pacing is enabled
+    // Set max pacing rate in bytes per second to be used if pacing
+    // is enabled
     MAX_PACING_RATE_KNOB = 0x4444,
     // Enable experimental pacer settings
     PACER_EXPERIMENTAL = 0x5557,
@@ -196,10 +200,10 @@ BETTER_ENUM(
     // Set fixed short header padding size
     FIXED_SHORT_HEADER_PADDING_KNOB = 0x6667,
     // Keepalive timer enabled. The value is interpreted as follows:
-    // - [1,4999] mean keep alive is enabled with the defaut interval of
-    // 0.85 * idle timeout
-    // - >= 5000 mean keep alive is enabled with the specified interval in
-    // milliseconds
+    // - [1,4999] mean keep alive is enabled with the defaut
+    // interval of 0.85 * idle timeout
+    // - >= 5000 mean keep alive is enabled with the specified
+    // interval in milliseconds
     KEEPALIVE_ENABLED = 0x7777,
     // Knob for setting max pacing rate, with sequence number
     MAX_PACING_RATE_KNOB_SEQUENCED = 0x9999,
@@ -221,17 +225,28 @@ BETTER_ENUM(
     MAX_WRITE_CONN_DATA_PKT_LIM = 0x1000C,
     // Threshold for writer to send entire stream buffer
     MIN_STREAM_BUF_THRESH = 0x1000E,
-    // Controls how much excess CWND allowed on imminent stream completion.
+    // Controls how much excess CWND allowed on imminent stream
+    // completion.
     EXCESS_CWND_PCT_FOR_IMMINENT_STREAMS = 0x1000F,
     // Controls whether the cloning scheduler should clone the same
     // packet repeatedly in the same write loop.
     ALLOW_DUPLICATE_PROBES = 0x10010,
     // Controls whether to send a ConnectionClose on idle timeout
     SEND_CLOSE_ON_IDLE_TIMEOUT = 0x10011,
-    // Controls the max number of PTOs to send before closing the connection
-    MAX_PTO = 0x10012)
+    // Controls the max number of PTOs to send before closing the
+    // connection
+    MAX_PTO = 0x10012,
+    // Egress policer config: rate_bytes_per_sec,burst_ms,delay_ms
+    EGRESS_POLICER_CONFIG = 0x20001,
+    // Enable SCONE and set the rate signal from a bps value
+    SCONE_KNOB = 0x5C0E,
+    // Controls rx packets before ack thresholds
+    // (beforeInit,afterInit)
+    RX_PACKETS_BEFORE_ACK = 0x10013)
 
-FOLLY_POP_WARNING
+#if defined(__GNUC__) || defined(__clang__)
+_Pragma("GCC diagnostic pop")
+#endif
 
 enum class FrameType : uint64_t {
   PADDING = 0x00,
@@ -242,8 +257,8 @@ enum class FrameType : uint64_t {
   STOP_SENDING = 0x05,
   CRYPTO_FRAME = 0x06, // librtmp has a #define CRYPTO
   NEW_TOKEN = 0x07,
-  // STREAM frame can have values from 0x08 to 0x0f which indicate which fields
-  // are present in the frame.
+  // STREAM frame can have values from 0x08 to 0x0f which
+  // indicate which fields are present in the frame.
   STREAM = 0x08,
   STREAM_FIN = 0x09,
   STREAM_LEN = 0x0a,
@@ -265,7 +280,8 @@ enum class FrameType : uint64_t {
   PATH_CHALLENGE = 0x1A,
   PATH_RESPONSE = 0x1B,
   CONNECTION_CLOSE = 0x1C,
-  // CONNECTION_CLOSE_APP_ERR frametype is use to indicate application errors
+  // CONNECTION_CLOSE_APP_ERR frametype is use to indicate
+  // application errors
   CONNECTION_CLOSE_APP_ERR = 0x1D,
   HANDSHAKE_DONE = 0x1E,
   RST_STREAM_AT = 0x24,
@@ -281,6 +297,8 @@ enum class FrameType : uint64_t {
 inline constexpr uint16_t toFrameError(FrameType frame) {
   return 0x0100 | static_cast<uint8_t>(frame);
 }
+
+// clang-format on
 
 enum class ExtendedAckFeatureMask : uint8_t {
   // These should use mutually exclusive bits.
@@ -378,9 +396,10 @@ enum class LocalErrorCode : uint64_t {
   MIGRATION_FAILED = 0x40000022,
 };
 
-enum class QuicNodeType : bool {
-  Client,
-  Server,
+// value maps to lsb of stream id as per rfc9000
+enum class QuicNodeType : uint8_t {
+  Client = 0,
+  Server = 1,
 };
 
 enum class QuicVersion : uint32_t {
@@ -390,12 +409,12 @@ enum class QuicVersion : uint32_t {
   // broken.
   MVFST = 0xfaceb002,
   QUIC_V1 = 0x00000001,
-  // QUIC_V1_ALIAS is used to default to BBRv2 instead of BBRv1 in
-  // QuicServerWorker.cpp
+  // QUIC_V1_ALIAS is is used to enable careful resume for bbr2modular.
   QUIC_V1_ALIAS = 0xfaceb003,
+  // QUIC_V1_ALIAS2 is used to enable sending the cwnd hint in the session
+  // ticket.
   QUIC_V1_ALIAS2 = 0xfaceb004,
-  // MVFST_EXPERIMENTAL is used to default to BBRv2 instead of BBRv1 in
-  // QuicServerWorker.cpp
+  // MVFST_EXPERIMENTAL is used to enable careful resume for bbr2modular
   MVFST_EXPERIMENTAL = 0xfaceb00e, // Experimental alias for MVFST
   MVFST_ALIAS = 0xfaceb010,
   MVFST_INVALID = 0xfaceb00f,
@@ -431,7 +450,7 @@ constexpr uint32_t kDefaultQuicMaxBatchSize = 16;
 // Maximum allowed buffering for crypto stream data before terminating the
 // connection.
 constexpr uint64_t kDefaultMaxCryptoStreamBufferSize =
-    static_cast<const uint64_t>(256 * 1024); // 256kB
+    static_cast<uint64_t>(256 * 1024); // 256kB
 constexpr uint32_t kQuicMaxBatchSizeLimit = 64;
 
 // rfc6298:
@@ -480,9 +499,8 @@ constexpr DurationRep kDefaultWriteLimitRttFraction = 25;
 constexpr std::string_view kCongestionControlCubicStr = "cubic";
 constexpr std::string_view kCongestionControlBbrStr = "bbr";
 constexpr std::string_view kCongestionControlBbr2Str = "bbr2";
-constexpr std::string_view kCongestionControlBbrTestingStr = "bbr_testing";
+constexpr std::string_view kCongestionControlBbr2ModularStr = "bbr2modular";
 constexpr std::string_view kCongestionControlCopaStr = "copa";
-constexpr std::string_view kCongestionControlCopa2Str = "copa2";
 constexpr std::string_view kCongestionControlNewRenoStr = "newreno";
 constexpr std::string_view kCongestionControlStaticCwndStr = "staticcwnd";
 constexpr std::string_view kCongestionControlCustomStr = "custom";
@@ -493,10 +511,9 @@ enum class CongestionControlType : uint8_t {
   Cubic,
   NewReno,
   Copa,
-  Copa2,
   BBR,
   BBR2,
-  BBRTesting,
+  BBR2Modular,
   StaticCwnd,
   Custom,
   None,
@@ -550,6 +567,14 @@ constexpr float kDefaultLastMaxReductionFactor = 0.85f;
 // Factor to control TCP estimate cwnd increase after Ack.
 constexpr float kCubicTCPFriendlyEstimateIncreaseFactor =
     3 * (1 - kDefaultCubicReductionFactor) / (1 + kDefaultCubicReductionFactor);
+
+/* BBR2 */
+// Gain override validation bounds. Gains are bandwidth/cwnd multipliers;
+// anything below 0.01 (1%) would effectively zero out pacing or cwnd.
+// 10x is ~3.5x above the highest built-in gain (kStartupPacingGain = 2.89),
+// generous for tuning experiments while preventing unreasonable values.
+constexpr float kMinGainOverride = 0.01f;
+constexpr float kMaxGainOverride = 10.0f;
 
 /* Flow Control */
 // Default flow control window for HTTP/2 + 1K for headers
@@ -619,6 +644,12 @@ constexpr size_t kMinInitialPacketSize = 1200;
 // Default maximum PTOs that will happen before tearing down the connection
 constexpr uint16_t kDefaultMaxNumPTO = 7;
 
+// Default number of consecutive PTOs before firing onPathDegrading
+constexpr uint16_t kDefaultNumPtosForPathDegrading = 4;
+
+// Default number of consecutive PTOs before firing onBlackholeDetected
+constexpr uint16_t kDefaultNumPtosForBlackhole = 6;
+
 // Maximum early data size that we need to negotiate in TLS
 constexpr uint32_t kRequiredMaxEarlyDataSize = 0xffffffff;
 
@@ -661,10 +692,6 @@ constexpr std::chrono::seconds kTimeToRetainOldPaths =
 // the grace period expires, the transport will drop the probed path state if
 // it's not the current path.
 constexpr uint16_t kProbedPathGracePeriodInSRTT = 3;
-
-// The number of SRTTs the client will continue reading from the old socket
-// after migration.
-constexpr uint16_t kClientTimeToKeepOldPathAfterMigration = 2;
 
 // Maximum number of consecutive migration failures (path validation failures
 // on the current path) before closing the connection.
@@ -717,7 +744,7 @@ constexpr uint32_t kDefaultDatagramFlowId = 0;
 
 // Minimum interval between new session tickets sent by the server in
 // milliseconds
-constexpr std::chrono::milliseconds kMinIntervalBetweenSessionTickets = 100ms;
+constexpr std::chrono::milliseconds kMinIntervalBetweenSessionTickets = 1000ms;
 
 // Number of packets to write with the current cipher before initiating a key
 // update. This is a conservative number below the confidentiality limit (2^23)
@@ -770,7 +797,6 @@ enum class WriteDataReason {
   PATH_VALIDATION,
   PING,
   DATAGRAM,
-  BUFFERED_WRITE,
 };
 
 enum class NoWriteReason {
@@ -840,6 +866,24 @@ constexpr uint16_t kSkipOneInNPacketSequenceNumber = 1000;
 constexpr uint16_t kDistanceToClearSkippedPacketNumber = 1000;
 
 constexpr uint8_t kSconeNoAdvice = 0x7F;
+
+// SCONE flow indication bytes appended to client datagrams before server
+// response (draft-ietf-scone-protocol Section 6.1).
+constexpr uint8_t kSconeFlowIndicatorByte1 = 0xc8;
+constexpr uint8_t kSconeFlowIndicatorByte2 = 0x13;
+constexpr uint64_t kSconeFlowIndicatorSize = 2;
+
+// Convert a bits-per-second rate to the nearest SCONE rate signal (0-126).
+// Formula: rate_bps = 100000 * 10^(n/20), so n = 20 * log10(rate_bps / 100000)
+inline uint8_t bpsToSconeRateSignal(uint64_t bps) {
+  constexpr uint64_t kSconeMinRateBps = 100000; // 100 Kbps
+  if (bps <= kSconeMinRateBps) {
+    return 0;
+  }
+  double n = 20.0 * std::log10(static_cast<double>(bps) / 100000.0);
+  int rounded = static_cast<int>(std::round(n));
+  return static_cast<uint8_t>(std::clamp(rounded, 0, 126));
+}
 } // namespace quic
 
 // Restore Windows NO_ERROR macro if it was previously defined

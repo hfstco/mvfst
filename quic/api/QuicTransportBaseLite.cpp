@@ -14,11 +14,13 @@
 #include <quic/congestion_control/PacerFactory.h>
 #include <quic/flowcontrol/QuicFlowController.h>
 #include <quic/logging/QLoggerMacros.h>
+#include <quic/logging/oops_logger/OopsFields.h>
 #include <quic/loss/QuicLossFunctions.h>
 #include <quic/observer/SocketObserverMacros.h>
 #include <quic/state/QuicPacingFunctions.h>
 #include <quic/state/QuicStreamFunctions.h>
 #include <quic/state/stream/StreamSendHandlers.h>
+#include <cmath>
 
 #include <folly/ScopeGuard.h>
 
@@ -292,6 +294,15 @@ void QuicTransportBaseLite::onNetworkData(
     }
   };
   try {
+    for (const auto& pp : conn_->packetProcessors) {
+      pp->preread();
+    }
+    SCOPE_EXIT {
+      for (const auto& pp : conn_->packetProcessors) {
+        pp->postread();
+      }
+    };
+
     conn_->lossState.totalBytesRecvd += networkData.getTotalData();
     auto originalAckVersion = currentAckStateVersion(*conn_);
 
@@ -329,6 +340,9 @@ void QuicTransportBaseLite::onNetworkData(
 
     auto packets = std::move(networkData).movePackets();
     for (auto& packet : packets) {
+      for (const auto& pp : conn_->packetProcessors) {
+        pp->onPacketRead(packet);
+      }
       auto res = onReadData(localAddress, std::move(packet), peerAddress);
       if (!res.has_value()) {
         MVVLOG(4) << __func__ << " " << res.error().message << " " << *this;
@@ -459,19 +473,12 @@ QuicTransportBaseLite::createUnidirectionalStream(bool /*replaySafe*/) {
 }
 
 uint64_t QuicTransportBaseLite::getNumOpenableBidirectionalStreams() const {
-  return conn_->streamManager->openableLocalBidirectionalStreams();
+  return good() ? conn_->streamManager->openableLocalBidirectionalStreams() : 0;
 }
 
 uint64_t QuicTransportBaseLite::getNumOpenableUnidirectionalStreams() const {
-  return conn_->streamManager->openableLocalUnidirectionalStreams();
-}
-
-bool QuicTransportBaseLite::isUnidirectionalStream(StreamId stream) noexcept {
-  return quic::isUnidirectionalStream(stream);
-}
-
-bool QuicTransportBaseLite::isBidirectionalStream(StreamId stream) noexcept {
-  return quic::isBidirectionalStream(stream);
+  return good() ? conn_->streamManager->openableLocalUnidirectionalStreams()
+                : 0;
 }
 
 QuicSocketLite::WriteResult QuicTransportBaseLite::writeChain(
@@ -549,13 +556,6 @@ QuicSocketLite::WriteResult QuicTransportBaseLite::writeChain(
   return {};
 }
 
-Optional<LocalErrorCode> QuicTransportBaseLite::shutdownWrite(StreamId id) {
-  if (isReceivingStream(conn_->nodeType, id)) {
-    return LocalErrorCode::INVALID_OPERATION;
-  }
-  return std::nullopt;
-}
-
 quic::Expected<void, LocalErrorCode>
 QuicTransportBaseLite::registerDeliveryCallback(
     StreamId id,
@@ -577,18 +577,7 @@ QuicTransportBaseLite::notifyPendingWriteOnConnection(
   // the connection while we are still scheduled, the write callback will get
   // an error synchronously.
   connWriteCallback_ = wcb;
-  runOnEvbAsync([](auto self) {
-    if (!self->connWriteCallback_) {
-      // The connection was probably closed.
-      return;
-    }
-    auto connWritableBytes = self->maxWritableOnConn();
-    if (connWritableBytes != 0) {
-      auto connWriteCallback = self->connWriteCallback_;
-      self->connWriteCallback_ = nullptr;
-      connWriteCallback->onConnectionWriteReady(connWritableBytes);
-    }
-  });
+  runOnEvbAsyncOp({.type = AsyncOpType::ConnectionWriteReady});
   return {};
 }
 
@@ -671,32 +660,7 @@ QuicTransportBaseLite::notifyPendingWriteOnStream(
       return quic::make_unexpected(LocalErrorCode::CALLBACK_ALREADY_INSTALLED);
     }
   }
-  runOnEvbAsync([id](auto self) {
-    auto wcbIt = self->pendingWriteCallbacks_.find(id);
-    if (wcbIt == self->pendingWriteCallbacks_.end()) {
-      // the connection was probably closed.
-      return;
-    }
-    auto writeCallback = wcbIt->second;
-    auto* stream = self->conn_->streamManager->getStreamIfExists(id);
-    if (!stream) {
-      self->pendingWriteCallbacks_.erase(wcbIt);
-      writeCallback->onStreamWriteError(
-          id, QuicError(LocalErrorCode::STREAM_NOT_EXISTS));
-      return;
-    }
-    if (!stream->writable()) {
-      self->pendingWriteCallbacks_.erase(wcbIt);
-      writeCallback->onStreamWriteError(
-          id, QuicError(LocalErrorCode::STREAM_NOT_EXISTS));
-      return;
-    }
-    auto maxCanWrite = self->maxWritableOnStream(*stream);
-    if (maxCanWrite != 0) {
-      self->pendingWriteCallbacks_.erase(wcbIt);
-      writeCallback->onStreamWriteReady(id, maxCanWrite);
-    }
-  });
+  runOnEvbAsyncOp({.type = AsyncOpType::StreamWriteReady, .streamId = id});
   return {};
 }
 
@@ -773,37 +737,12 @@ QuicTransportBaseLite::registerByteEventCallback(
       break;
   }
   if (maxOffsetReady.has_value() && (offset <= *maxOffsetReady)) {
-    runOnEvbAsync([id, cb, offset, type](auto selfObj) {
-      if (selfObj->closeState_ != CloseState::OPEN) {
-        // Close will error out all byte event callbacks.
-        return;
-      }
-
-      auto& byteEventMapL = selfObj->getByteEventMap(type);
-      auto streamByteEventCbIt = byteEventMapL.find(id);
-      if (streamByteEventCbIt == byteEventMapL.end()) {
-        return;
-      }
-
-      // This is scheduled to run in the future (during the next iteration of
-      // the event loop). It is possible that the ByteEventDetail list gets
-      // mutated between the time it was scheduled to now when we are ready to
-      // run it. Look at the current outstanding ByteEvents for this stream ID
-      // and confirm that our ByteEvent's offset and recipient callback are
-      // still present.
-      auto pos = std::find_if(
-          streamByteEventCbIt->second.begin(),
-          streamByteEventCbIt->second.end(),
-          [offset, cb](const ByteEventDetail& p) {
-            return ((p.offset == offset) && (p.callback == cb));
-          });
-      // if our byteEvent is not present, it must have been delivered already.
-      if (pos == streamByteEventCbIt->second.end()) {
-        return;
-      }
-      streamByteEventCbIt->second.erase(pos);
-
-      cb->onByteEvent(ByteEvent{id, offset, type});
+    runOnEvbAsyncOp({
+        .type = AsyncOpType::ByteEventReady,
+        .streamId = id,
+        .offset = offset,
+        .byteEventType = type,
+        .callback = cb,
     });
   }
   return {};
@@ -835,7 +774,7 @@ void QuicTransportBaseLite::setConnectionCallback(
     folly::MaybeManagedPtr<ConnectionCallback> callback) {
   connCallback_ = callback;
   if (connCallback_) {
-    runOnEvbAsync([](auto self) { self->processCallbacksAfterNetworkData(); });
+    runOnEvbAsyncOp({.type = AsyncOpType::ProcessCallbacksAfterNetworkData});
   }
 }
 
@@ -867,6 +806,62 @@ quic::Expected<void, LocalErrorCode> QuicTransportBaseLite::setReadCallback(
     return quic::make_unexpected(LocalErrorCode::STREAM_NOT_EXISTS);
   }
   return setReadCallbackInternal(id, cb, err);
+}
+
+quic::Expected<void, LocalErrorCode>
+QuicTransportBaseLite::setStopSendingCallback(
+    StreamId id,
+    StopSendingCallback* ss) noexcept {
+  if (isReceivingStream(conn_->nodeType, id)) {
+    return quic::make_unexpected(LocalErrorCode::INVALID_OPERATION);
+  }
+  if (ss != nullptr && closeState_ != CloseState::OPEN) {
+    return quic::make_unexpected(LocalErrorCode::CONNECTION_CLOSED);
+  }
+  if (!conn_->streamManager->streamExists(id)) {
+    return quic::make_unexpected(LocalErrorCode::STREAM_NOT_EXISTS);
+  }
+  if (ss) {
+    stopSendingCallbacks_[id] = ss;
+  } else {
+    stopSendingCallbacks_.erase(id);
+  }
+  return {};
+}
+
+quic::Expected<void, LocalErrorCode> QuicTransportBaseLite::pauseRead(
+    StreamId id) {
+  MVVLOG(4) << __func__ << " " << *this << " stream=" << id;
+  return pauseOrResumeRead(id, false);
+}
+
+quic::Expected<void, LocalErrorCode> QuicTransportBaseLite::resumeRead(
+    StreamId id) {
+  MVVLOG(4) << __func__ << " " << *this << " stream=" << id;
+  return pauseOrResumeRead(id, true);
+}
+
+quic::Expected<void, LocalErrorCode> QuicTransportBaseLite::pauseOrResumeRead(
+    StreamId id,
+    bool resume) {
+  if (isSendingStream(conn_->nodeType, id)) {
+    return quic::make_unexpected(LocalErrorCode::INVALID_OPERATION);
+  }
+  if (closeState_ != CloseState::OPEN) {
+    return quic::make_unexpected(LocalErrorCode::CONNECTION_CLOSED);
+  }
+  if (!conn_->streamManager->streamExists(id)) {
+    return quic::make_unexpected(LocalErrorCode::STREAM_NOT_EXISTS);
+  }
+  auto readCb = readCallbacks_.find(id);
+  if (readCb == readCallbacks_.end()) {
+    return quic::make_unexpected(LocalErrorCode::APP_ERROR);
+  }
+  if (readCb->second.resumed != resume) {
+    readCb->second.resumed = resume;
+    updateReadLooper();
+  }
+  return {};
 }
 
 quic::Expected<std::pair<BufPtr, bool>, LocalErrorCode>
@@ -944,6 +939,11 @@ void QuicTransportBaseLite::setQLogger(std::shared_ptr<QLogger> qLogger) {
       }
     }
   }
+}
+
+void QuicTransportBaseLite::setOopsLogger(
+    std::shared_ptr<proto_oops::OopsLogger> oopsLogger) {
+  conn_->oopsLogger = std::move(oopsLogger);
 }
 
 const std::shared_ptr<QLogger> QuicTransportBaseLite::getQLogger() const {
@@ -1104,19 +1104,111 @@ QuicTransportBaseLite::getStreamFlowControl(StreamId id) const {
       stream->flowControlState.advertisedMaxOffset);
 }
 
-void QuicTransportBaseLite::runOnEvbAsync(
-    std::function<void(std::shared_ptr<QuicTransportBaseLite>)> func) {
+void QuicTransportBaseLite::runOnEvbAsyncOp(AsyncOpData data) {
   auto evb = getEventBase();
   evb->runInLoop(
-      [self = sharedGuard(), func = std::move(func), evb]() mutable {
+      [self = sharedGuard(), data, evb]() mutable {
         if (self->getEventBase() != evb) {
           // The eventbase changed between scheduling the loop and invoking
           // the callback, ignore this
           return;
         }
-        func(std::move(self));
+        self->dispatchAsyncOp(data);
       },
       true);
+}
+
+void QuicTransportBaseLite::dispatchAsyncOp(AsyncOpData data) {
+  switch (data.type) {
+    case AsyncOpType::ProcessCallbacksAfterNetworkData:
+      processCallbacksAfterNetworkData();
+      break;
+    case AsyncOpType::ConnectionWriteReady: {
+      if (!connWriteCallback_) {
+        // The connection was probably closed.
+        return;
+      }
+      auto connWritableBytes = maxWritableOnConn();
+      if (connWritableBytes != 0) {
+        auto connWriteCallback = connWriteCallback_;
+        connWriteCallback_ = nullptr;
+        connWriteCallback->onConnectionWriteReady(connWritableBytes);
+      }
+      break;
+    }
+    case AsyncOpType::StreamWriteReady: {
+      auto id = data.streamId;
+      auto wcbIt = pendingWriteCallbacks_.find(id);
+      if (wcbIt == pendingWriteCallbacks_.end()) {
+        // the connection was probably closed.
+        return;
+      }
+      auto writeCallback = wcbIt->second;
+      auto* stream = conn_->streamManager->getStreamIfExists(id);
+      if (!stream) {
+        pendingWriteCallbacks_.erase(wcbIt);
+        writeCallback->onStreamWriteError(
+            id, QuicError(LocalErrorCode::STREAM_NOT_EXISTS));
+        return;
+      }
+      if (!stream->writable()) {
+        pendingWriteCallbacks_.erase(wcbIt);
+        writeCallback->onStreamWriteError(
+            id, QuicError(LocalErrorCode::STREAM_NOT_EXISTS));
+        return;
+      }
+      auto maxCanWrite = maxWritableOnStream(*stream);
+      if (maxCanWrite != 0) {
+        pendingWriteCallbacks_.erase(wcbIt);
+        writeCallback->onStreamWriteReady(id, maxCanWrite);
+      }
+      break;
+    }
+    case AsyncOpType::ByteEventReady: {
+      if (closeState_ != CloseState::OPEN) {
+        // Close will error out all byte event callbacks.
+        return;
+      }
+
+      auto id = data.streamId;
+      auto offset = data.offset;
+      auto type = data.byteEventType;
+      auto cb = data.callback;
+
+      auto& byteEventMapL = getByteEventMap(type);
+      auto streamByteEventCbIt = byteEventMapL.find(id);
+      if (streamByteEventCbIt == byteEventMapL.end()) {
+        return;
+      }
+
+      // This is scheduled to run in the future (during the next iteration of
+      // the event loop). It is possible that the ByteEventDetail list gets
+      // mutated between the time it was scheduled to now when we are ready to
+      // run it. Look at the current outstanding ByteEvents for this stream ID
+      // and confirm that our ByteEvent's offset and recipient callback are
+      // still present.
+      auto pos = std::find_if(
+          streamByteEventCbIt->second.begin(),
+          streamByteEventCbIt->second.end(),
+          [offset, cb](const ByteEventDetail& p) {
+            return ((p.offset == offset) && (p.callback == cb));
+          });
+      // if our byteEvent is not present, it must have been delivered already.
+      if (pos == streamByteEventCbIt->second.end()) {
+        return;
+      }
+      streamByteEventCbIt->second.erase(pos);
+
+      cb->onByteEvent(ByteEvent{id, offset, type});
+      break;
+    }
+    case AsyncOpType::TransportReady:
+    case AsyncOpType::MarkZeroRttPacketsLost:
+    case AsyncOpType::AsyncClose:
+    case AsyncOpType::RemoveNonCurrentPathClient:
+      // Handled by derived class override
+      break;
+  }
 }
 
 void QuicTransportBaseLite::updateWriteLooper(bool thisIteration) {
@@ -1199,10 +1291,7 @@ void QuicTransportBaseLite::maybeStopWriteLooperAndArmSocketWritableEvent() {
       !socket_->isWritableCallbackSet()) {
     // Check if all data has been written and we're not limited by flow
     // control/congestion control.
-    auto writeReason = shouldWriteData(*conn_);
-    bool haveBufferToRetry = writeReason == WriteDataReason::BUFFERED_WRITE;
-    bool haveNewDataToWrite =
-        (writeReason != WriteDataReason::NO_WRITE) && !haveBufferToRetry;
+    bool haveDataToWrite = shouldWriteData(*conn_) != WriteDataReason::NO_WRITE;
     bool haveCongestionControlWindow = true;
     if (conn_->congestionController) {
       haveCongestionControlWindow =
@@ -1211,7 +1300,7 @@ void QuicTransportBaseLite::maybeStopWriteLooperAndArmSocketWritableEvent() {
     bool haveFlowControlWindow = getSendConnFlowControlBytesAPI(*conn_) > 0;
     bool connHasWriteWindow =
         haveCongestionControlWindow && haveFlowControlWindow;
-    if (haveBufferToRetry || (haveNewDataToWrite && connHasWriteWindow)) {
+    if (haveDataToWrite && connHasWriteWindow) {
       // Re-arm the write event and stop the write
       // looper.
       auto resumeResult = socket_->resumeWrite(this);
@@ -1381,10 +1470,6 @@ quic::Expected<void, QuicError> QuicTransportBaseLite::writeSocketData() {
       }
     };
 
-    if (conn_->scone && conn_->scone->negotiated) {
-      conn_->scone->sentThisLoop = false;
-    }
-
     // if we're starting to write from app limited, notify observers
     if (conn_->appLimitedTracker.isAppLimited() &&
         conn_->congestionController) {
@@ -1531,7 +1616,9 @@ void QuicTransportBaseLite::closeImpl(
             conn_->connectionTime);
   }
 
-  [[maybe_unused]] auto tlsSummary = conn_->handshakeLayer->getTLSSummary();
+  [[maybe_unused]] auto tlsSummary = conn_->handshakeLayer
+      ? conn_->handshakeLayer->getTLSSummary()
+      : Handshake::TLSSummary{};
   QLOG(
       *conn_,
       addTransportSummary,
@@ -1627,6 +1714,7 @@ void QuicTransportBaseLite::closeImpl(
   MVVLOG(10) << "Stopping read looper due to immediate close " << *this;
   readLooper_->stop();
   writeLooper_->stop();
+  writeLooper_->setPacingTimer(nullptr);
   cleanupPeekPingDatagramResources();
 
   // Drop any alternate paths
@@ -1708,6 +1796,19 @@ LocalErrorCode QuicTransportBaseLite::handleExceptionAndClose(
               << " " << *this;
   } else {
     MVVLOG(4) << contextMsg << " " << ex.what() << " " << *this;
+  }
+
+  // Log to Protocol OOPS if configured
+  if (conn_->oopsLogger) {
+    auto builder =
+        proto_oops::OopsFieldsBuilder()
+            .setComponent("quic")
+            .setErrorMessage(std::string(contextMsg) + ": " + ex.what())
+            .setExceptionType(typeid(ex).name());
+    if (streamId.has_value()) {
+      builder.setStreamId(*streamId);
+    }
+    conn_->oopsLogger->log(builder.build());
   }
 
   exceptionCloseWhat_ = ex.what();
@@ -2111,10 +2212,18 @@ void QuicTransportBaseLite::handleStreamFlowControlUpdatedCallbacks(
 void QuicTransportBaseLite::handleStreamStopSendingCallbacks() {
   const auto stopSendingStreamsCopy =
       conn_->streamManager->consumeStopSending();
-  for (const auto& itr : stopSendingStreamsCopy) {
-    connCallback_->onStopSending(itr.first, itr.second);
+  for (auto [id, ec] : stopSendingStreamsCopy) {
+    connCallback_->onStopSending(id, ec);
     if (closeState_ != CloseState::OPEN) {
       return;
+    }
+    auto it = stopSendingCallbacks_.find(id);
+    if (it != stopSendingCallbacks_.end()) {
+      it->second->onStopSending(id, ec);
+      stopSendingCallbacks_.erase(it);
+      if (closeState_ != CloseState::OPEN) {
+        return;
+      }
     }
   }
 }
@@ -2180,8 +2289,7 @@ QuicTransportBaseLite::handleInitialWriteDataCommon(
   if ((initialCryptoStream.retransmissionBuffer.size() &&
        conn_->outstandings.packetCount[PacketNumberSpace::Initial] &&
        numProbePackets) ||
-      initialScheduler.hasData() || toWriteInitialAcks(*conn_) ||
-      hasBufferedDataToWrite(*conn_)) {
+      initialScheduler.hasData() || toWriteInitialAcks(*conn_)) {
     MVCHECK(conn_->initialHeaderCipher);
     return writeCryptoAndAckDataToSocket(
         *socket_,
@@ -2212,8 +2320,7 @@ QuicTransportBaseLite::handleHandshakeWriteDataCommon(
       conn_->pendingEvents.numProbePackets[PacketNumberSpace::Handshake];
   if ((conn_->outstandings.packetCount[PacketNumberSpace::Handshake] &&
        handshakeCryptoStream.retransmissionBuffer.size() && numProbePackets) ||
-      handshakeScheduler.hasData() || toWriteHandshakeAcks(*conn_) ||
-      hasBufferedDataToWrite(*conn_)) {
+      handshakeScheduler.hasData() || toWriteHandshakeAcks(*conn_)) {
     MVCHECK(conn_->handshakeWriteHeaderCipher);
     return writeCryptoAndAckDataToSocket(
         *socket_,
@@ -2310,6 +2417,21 @@ void QuicTransportBaseLite::lossTimeoutExpired() noexcept {
       return;
     }
 
+    // Fire path degradation / blackhole callbacks via pending events.
+    // These are set by onPTOAlarm when ptoCount crosses thresholds.
+    if (conn_->pendingEvents.notifyPathDegrading) {
+      conn_->pendingEvents.notifyPathDegrading = false;
+      if (connCallback_) {
+        connCallback_->onPathDegrading();
+      }
+    }
+    if (conn_->pendingEvents.notifyBlackholeDetected) {
+      conn_->pendingEvents.notifyBlackholeDetected = false;
+      if (connCallback_) {
+        connCallback_->onBlackholeDetected();
+      }
+    }
+
     pacedWriteDataToSocket();
   } catch (const std::exception& ex) {
     handleExceptionAndClose(ex, "lossTimeoutExpired() error");
@@ -2337,9 +2459,20 @@ void QuicTransportBaseLite::idleTimeoutExpired(bool drain) noexcept {
       quic::QuicError(
           QuicErrorCode(localError),
           fmt::format(
-              "{}: {} seconds", toString(localError), idleTimeoutCount / 1000)),
+              "{}: {} seconds timeout",
+              toString(localError),
+              idleTimeoutCount / 1000)),
       drain /* drainConnection */,
       sendCloseImmediately);
+}
+
+void QuicTransportBaseLite::sendPing(
+    std::chrono::milliseconds /* pingTimeout */) {
+  if (closeState_ == CloseState::CLOSED) {
+    return;
+  }
+  conn_->pendingEvents.sendPing = true;
+  updateWriteLooper(true);
 }
 
 void QuicTransportBaseLite::keepaliveTimeoutExpired() noexcept {
@@ -2472,6 +2605,8 @@ void QuicTransportBaseLite::cancelAllAppCallbacks(
 
   // Cancel peek/ping/datagram callbacks (virtual method overridden in Base)
   cancelPeekPingDatagramCallbacks(err);
+
+  stopSendingCallbacks_.clear();
 }
 
 void QuicTransportBaseLite::scheduleTimeout(
@@ -2537,9 +2672,8 @@ void QuicTransportBaseLite::cancelByteEventCallbacks(
   }
 }
 
-StreamInitiator QuicTransportBaseLite::getStreamInitiator(
-    StreamId stream) noexcept {
-  return quic::getStreamInitiator(conn_->nodeType, stream);
+QuicNodeType QuicTransportBaseLite::getNodeType() const noexcept {
+  return conn_->nodeType;
 }
 
 QuicConnectionStats QuicTransportBaseLite::getConnectionsStats() const {
@@ -2583,6 +2717,19 @@ QuicConnectionStats QuicTransportBaseLite::getConnectionsStats() const {
     connStats.version = static_cast<uint32_t>(*conn_->version);
   }
   return connStats;
+}
+
+Optional<QuicSocketLite::SconeRateInfo>
+QuicTransportBaseLite::consumePendingSconeRate() {
+  if (!conn_->scone || !conn_->scone->pendingReceivedSignal) {
+    return std::nullopt;
+  }
+  auto signal = conn_->scone->pendingReceivedSignal.value();
+  conn_->scone->pendingReceivedSignal.reset();
+  // Convert SCONE logarithmic rate (0-127) to bps: 100_000 * 10^(rate/20)
+  auto bps = static_cast<uint64_t>(
+      100000.0 * std::pow(10.0, static_cast<double>(signal.rate) / 20.0));
+  return SconeRateInfo{.bps = bps, .receivedTime = signal.receivedTime};
 }
 
 const TransportSettings& QuicTransportBaseLite::getTransportSettings() const {
@@ -2650,7 +2797,7 @@ void QuicTransportBaseLite::invokeReadDataAndCallbacks(
     }
   }
 
-  if (self->conn_->scone && self->connCallback_) {
+  if (self->conn_->scone) {
     while (!self->conn_->scone->pendingRateSignals.empty()) {
       auto rateSignal = self->conn_->scone->pendingRateSignals.front();
       self->conn_->scone->pendingRateSignals.pop_front();
@@ -2662,8 +2809,17 @@ void QuicTransportBaseLite::invokeReadDataAndCallbacks(
             fmt::format("scone_rate_signal:{}", rateSignal.rate));
       }
 
-      self->connCallback_->onSconeRateSignal(
-          rateSignal.rate, rateSignal.version);
+      // Store as edge-triggered pending signal for consumePendingSconeRate().
+      // If multiple signals arrive in one loop, the latest one wins.
+      self->conn_->scone->pendingReceivedSignal = {
+          .rate = rateSignal.rate,
+          .version = rateSignal.version,
+          .receivedTime = Clock::now()};
+
+      if (self->connCallback_) {
+        self->connCallback_->onSconeRateSignal(
+            rateSignal.rate, rateSignal.version);
+      }
     }
   }
 
@@ -2806,10 +2962,7 @@ void QuicTransportBaseLite::notifyAppRateLimited() {
 
 void QuicTransportBaseLite::onTransportKnobs(BufPtr knobBlob) {
   // Not yet implemented,
-  MVVLOG(4) << "Received transport knobs: "
-            << std::string(
-                   reinterpret_cast<const char*>(knobBlob->data()),
-                   knobBlob->length());
+  MVVLOG(4) << "Received transport knobs: " << knobBlob->toString();
 }
 
 void QuicTransportBaseLite::processCallbacksAfterWriteData() {
@@ -2958,16 +3111,18 @@ void QuicTransportBaseLite::setTransportSettings(
         (conn_->transportSettings.defaultCongestionController ==
              CongestionControlType::BBR ||
          conn_->transportSettings.defaultCongestionController ==
-             CongestionControlType::BBRTesting ||
+             CongestionControlType::BBR2 ||
          conn_->transportSettings.defaultCongestionController ==
-             CongestionControlType::BBR2);
+             CongestionControlType::BBR2Modular);
     auto minCwnd =
         usingBbr ? kMinCwndInMssForBbr : conn_->transportSettings.minCwndInMss;
     conn_->pacer = createPacer(*conn_, minCwnd);
-    if (conn_->pacer) {
-      conn_->pacer->setExperimental(conn_->transportSettings.experimentalPacer);
+    // Only set canBePaced during initial setup. After handshake,
+    // updatePacingOnKeyEstablished() already set canBePaced = true, and we
+    // shouldn't reset it when updating transport settings.
+    if (!conn_->transportParametersEncoded) {
+      conn_->canBePaced = conn_->transportSettings.pacingEnabledFirstFlight;
     }
-    conn_->canBePaced = conn_->transportSettings.pacingEnabledFirstFlight;
   }
   setCongestionControl(conn_->transportSettings.defaultCongestionController);
   if (conn_->transportSettings.datagramConfig.enabled) {
@@ -3046,33 +3201,11 @@ void QuicTransportBaseLite::validateCongestionAndPacing(
     CongestionControlType& type) {
   // Fallback to Cubic if Pacing isn't enabled with BBR together
   if ((type == CongestionControlType::BBR ||
-       type == CongestionControlType::BBRTesting ||
-       type == CongestionControlType::BBR2) &&
+       type == CongestionControlType::BBR2 ||
+       type == CongestionControlType::BBR2Modular) &&
       !conn_->transportSettings.pacingEnabled) {
     MVLOG_ERROR << "Unpaced BBR isn't supported";
     type = CongestionControlType::Cubic;
-  }
-
-  if (type == CongestionControlType::BBR2 ||
-      type == CongestionControlType::BBRTesting) {
-    // We need to have the pacer rate be as accurate as possible for BBR2 and
-    // BBRTesting.
-    // The current BBR behavior is dependent on the existing pacing
-    // behavior so the override is only for BBR2/BBRTesting.
-    // TODO: This should be removed once the pacer changes are adopted as
-    // the defaults or the pacer is fixed in another way.
-    conn_->transportSettings.experimentalPacer = true;
-    conn_->transportSettings.defaultRttFactor = {1, 1};
-    if (type == CongestionControlType::BBRTesting) {
-      // Force-disable startup pace scaling only for BBRTesting
-      conn_->transportSettings.startupRttFactor = {1, 1};
-    }
-    if (conn_->pacer) {
-      conn_->pacer->setExperimental(conn_->transportSettings.experimentalPacer);
-      conn_->pacer->setRttFactor(
-          conn_->transportSettings.defaultRttFactor.first,
-          conn_->transportSettings.defaultRttFactor.second);
-    }
   }
 }
 
@@ -3402,11 +3535,15 @@ void QuicTransportBaseLite::updateCongestionControlSettings(
   conn_->transportSettings.limitedCwndInMss =
       transportSettings.limitedCwndInMss;
   conn_->transportSettings.pacingEnabled = transportSettings.pacingEnabled;
+  conn_->transportSettings.pacingEnabledFirstFlight =
+      transportSettings.pacingEnabledFirstFlight;
   conn_->transportSettings.pacingTickInterval =
       transportSettings.pacingTickInterval;
   conn_->transportSettings.pacingTimerResolution =
       transportSettings.pacingTimerResolution;
   conn_->transportSettings.minBurstPackets = transportSettings.minBurstPackets;
+  conn_->transportSettings.writeConnectionDataPacketsLimit =
+      transportSettings.writeConnectionDataPacketsLimit;
   conn_->transportSettings.copaDeltaParam = transportSettings.copaDeltaParam;
   conn_->transportSettings.copaUseRttStanding =
       transportSettings.copaUseRttStanding;

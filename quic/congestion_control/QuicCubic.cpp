@@ -49,6 +49,12 @@ Cubic::Cubic(
       std::nullopt,
       std::nullopt,
       conn_.lossState.ptoCount);
+  QLOG(
+      conn_,
+      addCongestionStateUpdate,
+      std::nullopt,
+      cubicStateToString(state_).str(),
+      kCubicInit);
 }
 
 CubicStates Cubic::state() const noexcept {
@@ -126,6 +132,11 @@ void Cubic::onPacketLoss(const LossEvent& loss) {
   MVDCHECK(
       loss.largestLostPacketNum.has_value() &&
       loss.largestLostSentTime.has_value());
+  if (!loss.largestLostPacketNum.has_value() ||
+      !loss.largestLostSentTime.has_value()) {
+    // TODO(Sandarsh) add protocol oops handling
+    return;
+  }
   onRemoveBytesFromInflight(loss.lostBytes);
   // If the loss occurred past the endOfRecovery then we need to move the
   // endOfRecovery back and invoke the state machine, otherwise ignore the loss
@@ -169,6 +180,12 @@ void Cubic::onPacketLoss(const LossEvent& loss) {
         std::nullopt,
         std::nullopt,
         conn_.lossState.ptoCount);
+    QLOG(
+        conn_,
+        addCongestionStateUpdate,
+        std::nullopt,
+        cubicStateToString(state_).str(),
+        kCubicSkipLoss);
   }
 
   if (loss.persistentCongestion) {
@@ -196,6 +213,12 @@ void Cubic::onRemoveBytesFromInflight(uint64_t /* bytes */) {
       std::nullopt,
       std::nullopt,
       conn_.lossState.ptoCount);
+  QLOG(
+      conn_,
+      addCongestionStateUpdate,
+      std::nullopt,
+      cubicStateToString(state_).str(),
+      kRemoveInflight);
 }
 
 void Cubic::setAppIdle(bool idle, TimePoint eventTime) noexcept {
@@ -275,7 +298,7 @@ int64_t Cubic::calculateCubicCwndDelta(TimePoint ackTime) noexcept {
   auto timeElapsed = folly::chrono::ceil<std::chrono::milliseconds>(
       ackTime - *steadyState_.lastReductionTime);
   int64_t delta = 0;
-  double timeElapsedCount = static_cast<double>(timeElapsed.count());
+  auto timeElapsedCount = static_cast<double>(timeElapsed.count());
   if (std::pow((timeElapsedCount - steadyState_.timeToOrigin), 3) >
       std::numeric_limits<double>::max()) {
     // (timeElapsed - timeToOrigin) ^ 3 will overflow/underflow, cut delta
@@ -311,6 +334,12 @@ int64_t Cubic::calculateCubicCwndDelta(TimePoint ackTime) noexcept {
       std::nullopt,
       std::nullopt,
       conn_.lossState.ptoCount);
+  QLOG(
+      conn_,
+      addCongestionStateUpdate,
+      std::nullopt,
+      cubicStateToString(state_).str(),
+      kCubicSteadyCwnd);
   return delta;
 }
 
@@ -397,6 +426,12 @@ void Cubic::onPacketAcked(const AckEvent& ack) {
         std::nullopt,
         std::nullopt,
         conn_.lossState.ptoCount);
+    QLOG(
+        conn_,
+        addCongestionStateUpdate,
+        std::nullopt,
+        cubicStateToString(state_).str(),
+        kCubicSkipAck);
     return;
   }
   switch (state_) {
@@ -435,6 +470,12 @@ void Cubic::onPacketAcked(const AckEvent& ack) {
         std::nullopt,
         std::nullopt,
         conn_.lossState.ptoCount);
+    QLOG(
+        conn_,
+        addCongestionStateUpdate,
+        std::nullopt,
+        cubicStateToString(state_).str(),
+        kCwndNoChange);
   }
   QLOG(
       conn_,
@@ -452,6 +493,12 @@ void Cubic::onPacketAcked(const AckEvent& ack) {
       std::nullopt,
       std::nullopt,
       conn_.lossState.ptoCount);
+  QLOG(
+      conn_,
+      addCongestionStateUpdate,
+      std::nullopt,
+      cubicStateToString(state_).str(),
+      kCongestionPacketAck);
 }
 
 void Cubic::startHystartRttRound(TimePoint time) noexcept {
@@ -660,6 +707,12 @@ void Cubic::onPacketAckedInSteady(const AckEvent& ack) {
         std::nullopt,
         std::nullopt,
         conn_.lossState.ptoCount);
+    QLOG(
+        conn_,
+        addCongestionStateUpdate,
+        std::nullopt,
+        cubicStateToString(state_).str(),
+        kAckInQuiescence);
     return;
   }
 
@@ -701,6 +754,12 @@ void Cubic::onPacketAckedInSteady(const AckEvent& ack) {
         std::nullopt,
         std::nullopt,
         conn_.lossState.ptoCount);
+    QLOG(
+        conn_,
+        addCongestionStateUpdate,
+        std::nullopt,
+        cubicStateToString(state_).str(),
+        kResetTimeToOrigin);
     steadyState_.timeToOrigin = 0.0;
     steadyState_.lastMaxCwndBytes = cwndBytes_;
     steadyState_.originPoint = cwndBytes_;
@@ -730,6 +789,12 @@ void Cubic::onPacketAckedInSteady(const AckEvent& ack) {
         std::nullopt,
         std::nullopt,
         conn_.lossState.ptoCount);
+    QLOG(
+        conn_,
+        addCongestionStateUpdate,
+        std::nullopt,
+        cubicStateToString(state_).str(),
+        kResetLastReductionTime);
   }
   if (carefulResume_.state() != CarefulResume::States::Unvalidated &&
       carefulResume_.state() != CarefulResume::States::SafeRetreat) {
@@ -749,46 +814,50 @@ void Cubic::onPacketAckedInSteady(const AckEvent& ack) {
       MVVLOG(10) << "Cubic steady state calculates a smaller cwnd than last round"
                << ", new cnwd = " << newCwnd
                << ", current cwnd = " << cwndBytes_;
-    } else {
-      cwndBytes_ = newCwnd;
-    }
-
-    // Reno cwnd estimation for TCP friendly.
-    if (steadyState_.tcpFriendly && ack.ackedBytes) {
-      /* If tcpFriendly is false, we don't keep track of estRenoCwnd. Right now we
-         don't provide an API to change tcpFriendly in the middle of a connection.
-         If you change that and start to provide an API to mutate tcpFriendly, you
-         should calculate estRenoCwnd even when tcpFriendly is false. */
-      steadyState_.estRenoCwnd += steadyState_.tcpEstimationIncreaseFactor *
-          ack.ackedBytes * conn_.udpSendPacketLen / steadyState_.estRenoCwnd;
-      steadyState_.estRenoCwnd = boundedCwnd(
-          steadyState_.estRenoCwnd,
-          conn_.udpSendPacketLen,
-          conn_.transportSettings.maxCwndInMss,
-          conn_.transportSettings.minCwndInMss);
-      cwndBytes_ = std::max(cwndBytes_, steadyState_.estRenoCwnd);
-      QLOG(
-          conn_,
-          addMetricUpdate,
-          conn_.lossState.lrtt,
-          conn_.lossState.mrtt,
-          conn_.lossState.srtt,
-          conn_.lossState.maybeLrttAckDelay.value_or(0us),
-          conn_.lossState.rttvar,
-          getCongestionWindow(),
-          conn_.lossState.inflightBytes,
-          ssthresh_ == std::numeric_limits<uint64_t>::max()
-              ? std::nullopt
-              : Optional<uint64_t>(ssthresh_),
-          std::nullopt,
-          std::nullopt,
-          conn_.lossState.ptoCount);
-    }
+  } else {
+    cwndBytes_ = newCwnd;
+  }
+  // Reno cwnd estimation for TCP friendly.
+  if (steadyState_.tcpFriendly && ack.ackedBytes) {
+    /* If tcpFriendly is false, we don't keep track of estRenoCwnd. Right now we
+       don't provide an API to change tcpFriendly in the middle of a connection.
+       If you change that and start to provide an API to mutate tcpFriendly, you
+       should calculate estRenoCwnd even when tcpFriendly is false. */
+    steadyState_.estRenoCwnd += steadyState_.tcpEstimationIncreaseFactor *
+        ack.ackedBytes * conn_.udpSendPacketLen / steadyState_.estRenoCwnd;
+    steadyState_.estRenoCwnd = boundedCwnd(
+        steadyState_.estRenoCwnd,
+        conn_.udpSendPacketLen,
+        conn_.transportSettings.maxCwndInMss,
+        conn_.transportSettings.minCwndInMss);
+    cwndBytes_ = std::max(cwndBytes_, steadyState_.estRenoCwnd);
+    QLOG(
+        conn_,
+        addMetricUpdate,
+        conn_.lossState.lrtt,
+        conn_.lossState.mrtt,
+        conn_.lossState.srtt,
+        conn_.lossState.maybeLrttAckDelay.value_or(0us),
+        conn_.lossState.rttvar,
+        getCongestionWindow(),
+        conn_.lossState.inflightBytes,
+        ssthresh_ == std::numeric_limits<uint64_t>::max()
+            ? std::nullopt
+            : Optional<uint64_t>(ssthresh_),
+        std::nullopt,
+        std::nullopt,
+        conn_.lossState.ptoCount);
+    QLOG(
+        conn_,
+        addCongestionStateUpdate,
+        std::nullopt,
+        cubicStateToString(state_).str(),
+        kRenoCwndEstimation);
   }
 }
 
 void Cubic::onPacketAckedInRecovery(const AckEvent& ack) {
-  //MVCHECK_EQ(cwndBytes_, ssthresh_);
+  MVCHECK_EQ(cwndBytes_, ssthresh_);
   if (isRecovered(ack.largestNewlyAckedPacketSentTime)) {
     state_ = CubicStates::Steady;
 
@@ -801,6 +870,11 @@ void Cubic::onPacketAckedInRecovery(const AckEvent& ack) {
     // should have happened, and set values to them.
     MVDCHECK(steadyState_.lastMaxCwndBytes.has_value());
     MVDCHECK(steadyState_.lastReductionTime.has_value());
+    if (!steadyState_.lastMaxCwndBytes.has_value() ||
+        !steadyState_.lastReductionTime.has_value()) {
+      // TODO(Sandarsh) add protocol oops handling
+      return;
+    }
     updateTimeToOrigin();
     if (carefulResume_.state() != CarefulResume::States::Unvalidated &&
       carefulResume_.state() != CarefulResume::States::SafeRetreat) {

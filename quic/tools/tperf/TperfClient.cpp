@@ -51,7 +51,8 @@ TPerfClient::TPerfClient(
       useL4sEcn_(useL4sEcn),
       readEcn_(readEcn),
       dscp_(dscp) {
-  fizz::CryptoUtils::init();
+  fizz::Error err;
+  FIZZ_THROW_ON_ERROR(fizz::CryptoUtils::init(err), err);
   fEvb_.setName("tperf_client");
 }
 
@@ -193,8 +194,7 @@ void TPerfClient::start() {
   settings.maxRecvBatchSize = 64;
   settings.numGROBuffers_ = 64;
   settings.defaultCongestionController = congestionControlType_;
-  if (congestionControlType_ == quic::CongestionControlType::BBR ||
-      congestionControlType_ == CongestionControlType::BBRTesting) {
+  if (congestionControlType_ == quic::CongestionControlType::BBR) {
     settings.pacingEnabled = true;
     settings.pacingTickInterval = 200us;
     settings.writeLimitRttFraction = 0;
@@ -226,7 +226,6 @@ void TPerfClient::start() {
     settings.enableEcnOnEgress = true;
     settings.useL4sEcn = true;
     settings.minBurstPackets = 1;
-    settings.experimentalPacer = true;
     settings.ccaConfig.onlyGrowCwndWhenLimited = true;
     settings.ccaConfig.leaveHeadroomForCwndLimited = true;
   }

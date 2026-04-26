@@ -8,6 +8,7 @@
 #include <quic/common/MvfstLogging.h>
 #include <quic/common/QuicBuffer.h>
 
+#include <algorithm>
 #include <utility>
 
 namespace quic {
@@ -352,12 +353,20 @@ bool QuicBuffer::empty() const noexcept {
 
 void QuicBuffer::trimStart(std::size_t amount) noexcept {
   MVDCHECK_LE(amount, length_);
+  if (amount > length_) {
+    // TODO(sandarsh) add protocol oops
+    amount = length_;
+  }
   data_ += amount;
   length_ -= amount;
 }
 
 void QuicBuffer::trimEnd(std::size_t amount) noexcept {
   MVDCHECK_LE(amount, length_);
+  if (amount > length_) {
+    // TODO(sandarsh) add protocol oops
+    amount = length_;
+  }
   length_ -= amount;
 }
 

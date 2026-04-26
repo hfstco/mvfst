@@ -53,6 +53,12 @@ void Copa::onRemoveBytesFromInflight(uint64_t /* bytes */) {
       std::nullopt,
       std::nullopt,
       conn_.lossState.ptoCount);
+  QLOG(
+      conn_,
+      addCongestionStateUpdate,
+      std::nullopt,
+      isSlowStart_ ? "SlowStart" : "SteadyState",
+      kRemoveInflight);
 }
 
 void Copa::onPacketSent(const OutstandingPacketWrapper& packet) {
@@ -77,6 +83,12 @@ void Copa::onPacketSent(const OutstandingPacketWrapper& packet) {
       std::nullopt,
       std::nullopt,
       conn_.lossState.ptoCount);
+  QLOG(
+      conn_,
+      addCongestionStateUpdate,
+      std::nullopt,
+      isSlowStart_ ? "SlowStart" : "SteadyState",
+      kCongestionPacketSent);
 }
 
 /**
@@ -207,6 +219,12 @@ void Copa::onPacketAcked(const AckEvent& ack) {
       std::nullopt,
       std::nullopt,
       conn_.lossState.ptoCount);
+  QLOG(
+      conn_,
+      addCongestionStateUpdate,
+      std::nullopt,
+      isSlowStart_ ? "SlowStart" : "SteadyState",
+      kCongestionPacketAck);
 
   if (rttStandingMicroSec < rttMin.count()) {
     MVVLOG(3) << __func__
@@ -335,6 +353,12 @@ void Copa::onPacketLoss(const LossEvent& loss) {
       std::nullopt,
       std::nullopt,
       conn_.lossState.ptoCount);
+  QLOG(
+      conn_,
+      addCongestionStateUpdate,
+      std::nullopt,
+      isSlowStart_ ? "SlowStart" : "SteadyState",
+      kCongestionPacketLoss);
   MVDCHECK(loss.largestLostPacketNum.has_value());
   if (loss.persistentCongestion) {
     // TODO See if we should go to slowStart here
@@ -355,6 +379,12 @@ void Copa::onPacketLoss(const LossEvent& loss) {
         std::nullopt,
         std::nullopt,
         conn_.lossState.ptoCount);
+    QLOG(
+        conn_,
+        addCongestionStateUpdate,
+        std::nullopt,
+        isSlowStart_ ? "SlowStart" : "SteadyState",
+        kPersistentCongestion);
     cwndBytes_ = conn_.transportSettings.minCwndInMss * conn_.udpSendPacketLen;
     if (conn_.pacer) {
       conn_.pacer->refreshPacingRate(cwndBytes_ * 2, conn_.lossState.srtt);

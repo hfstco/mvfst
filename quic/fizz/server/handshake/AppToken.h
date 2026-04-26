@@ -26,22 +26,31 @@ namespace fizz::detail {
 template <>
 struct Reader<folly::IPAddress> {
   template <class T>
-  size_t read(folly::IPAddress& ipAddress, folly::io::Cursor& cursor) {
+  Status read(
+      size_t& ret,
+      Error& /* err */,
+      folly::IPAddress& ipAddress,
+      folly::io::Cursor& cursor) {
     std::unique_ptr<folly::IOBuf> sourceAddressBuf;
     size_t len = readBuf<uint8_t>(sourceAddressBuf, cursor);
     ipAddress = folly::IPAddress::fromBinary(sourceAddressBuf->coalesce());
-    return len;
+    ret = len;
+    return Status::Success;
   }
 };
 
 template <>
 struct Writer<folly::IPAddress> {
   template <class T>
-  void write(const folly::IPAddress& ipAddress, folly::io::Appender& out) {
+  Status write(
+      Error& err,
+      const folly::IPAddress& ipAddress,
+      folly::io::Appender& out) {
     MVDCHECK(!ipAddress.empty());
     auto buf =
         folly::IOBuf::wrapBuffer(ipAddress.bytes(), ipAddress.byteCount());
-    writeBuf<uint8_t>(buf, out);
+    FIZZ_RETURN_ON_ERROR(writeBuf<uint8_t>(err, buf, out));
+    return Status::Success;
   }
 };
 

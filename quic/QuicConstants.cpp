@@ -20,12 +20,10 @@ std::string congestionControlTypeToString(CongestionControlType type) {
       return std::string(kCongestionControlBbrStr);
     case CongestionControlType::BBR2:
       return std::string(kCongestionControlBbr2Str);
-    case CongestionControlType::BBRTesting:
-      return std::string(kCongestionControlBbrTestingStr);
+    case CongestionControlType::BBR2Modular:
+      return std::string(kCongestionControlBbr2ModularStr);
     case CongestionControlType::Copa:
       return std::string(kCongestionControlCopaStr);
-    case CongestionControlType::Copa2:
-      return std::string(kCongestionControlCopa2Str);
     case CongestionControlType::NewReno:
       return std::string(kCongestionControlNewRenoStr);
     case CongestionControlType::StaticCwnd:
@@ -47,14 +45,12 @@ std::optional<CongestionControlType> congestionControlStrToType(
     return quic::CongestionControlType::Cubic;
   } else if (str == kCongestionControlBbr2Str) {
     return quic::CongestionControlType::BBR2;
+  } else if (str == kCongestionControlBbr2ModularStr) {
+    return quic::CongestionControlType::BBR2Modular;
   } else if (str == kCongestionControlBbrStr) {
     return quic::CongestionControlType::BBR;
-  } else if (str == kCongestionControlBbrTestingStr) {
-    return quic::CongestionControlType::BBRTesting;
   } else if (str == kCongestionControlCopaStr) {
     return quic::CongestionControlType::Copa;
-  } else if (str == kCongestionControlCopa2Str) {
-    return quic::CongestionControlType::Copa2;
   } else if (str == kCongestionControlNewRenoStr) {
     return quic::CongestionControlType::NewReno;
   } else if (str == kCongestionControlStaticCwndStr) {
@@ -133,8 +129,6 @@ std::string writeDataReasonString(WriteDataReason reason) {
       return "Datagram";
     case WriteDataReason::NO_WRITE:
       return "NoWrite";
-    case WriteDataReason::BUFFERED_WRITE:
-      return "BufferedWrite";
   }
   folly::assume_unreachable();
 }

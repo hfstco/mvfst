@@ -81,6 +81,8 @@ class QuicTransportStatsCallback {
 
   virtual void onPacketForwarded() = 0;
 
+  virtual void onPacketDroppedByEgressPolicer() = 0;
+
   virtual void onForwardedPacketReceived() = 0;
 
   virtual void onForwardedPacketProcessed() = 0;
@@ -140,6 +142,8 @@ class QuicTransportStatsCallback {
   virtual void onBandwidthSample(uint64_t) = 0;
 
   virtual void onCwndHintBytesSample(uint64_t cwndHintBytes) = 0;
+
+  virtual void onCongestionControllerResumed() = 0;
 
   virtual void onNewCongestionController(CongestionControlType type) = 0;
 

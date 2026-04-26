@@ -145,6 +145,10 @@ class QuicServerTransport
   virtual void setShouldRegisterKnobParamHandlerFn(
       ShouldRegisterKnobParamHandlerFn fn);
 
+  using QuicExperimentHandlerFn =
+      std::function<void(QuicConnectionStateBase&, uint16_t)>;
+  void setQuicExperimentHandlerFn(QuicExperimentHandlerFn fn);
+
   void verifiedClientAddress();
 
   // From QuicTransportBase
@@ -167,11 +171,9 @@ class QuicServerTransport
 
   virtual void setBufAccessor(BufAccessor* bufAccessor);
 
-  const std::shared_ptr<const folly::AsyncTransportCertificate>
-  getPeerCertificate() const override;
+  const std::shared_ptr<const fizz::Cert> getPeerCertificate() const override;
 
-  const std::shared_ptr<const folly::AsyncTransportCertificate>
-  getSelfCertificate() const override;
+  const std::shared_ptr<const fizz::Cert> getSelfCertificate() const override;
 
   virtual CipherInfo getOneRttCipherInfo() const;
 
@@ -286,6 +288,8 @@ class QuicServerTransport
           TransportKnobParam::Val)>>
       transportKnobParamHandlers_;
   ShouldRegisterKnobParamHandlerFn shouldRegisterKnobParamHandlerFn_;
+  QuicExperimentHandlerFn quicExperimentHandlerFn_;
+  bool quicExperimentApplied_{false};
   mutable std::optional<QuicEventBaseAsFollyExecutor> eventBaseAsFollyExecutor_;
 
   // Container of observers for the socket / transport.

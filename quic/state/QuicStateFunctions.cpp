@@ -125,7 +125,7 @@ void updateAckSendStateOnRecvPacket(
   bool exceedsReorderThreshold =
       distanceFromExpectedPacketNum > ackState.reorderThreshold;
   if (pktHasRetransmittableData) {
-    bool skipCryptoAck = !conn.transportSettings.sendAckOnlyInitial &&
+    bool skipCryptoAck =
         conn.nodeType == QuicNodeType::Server && initPktNumSpace;
 
     if ((pktHasCryptoData && !skipCryptoAck) || exceedsReorderThreshold ||
@@ -433,12 +433,21 @@ Expected<uint64_t, IntervalSetError> addPacketToAckState(
   ackState.lastRecvdPacketInfo = {packetNum, udpPacket.timings};
 
   if (packetNum >= expectedNextPacket) {
-    if (ackState.recvdPacketInfos.size() ==
-        conn.transportSettings.maxReceiveTimestampsPerAckStored) {
-      ackState.recvdPacketInfos.pop_front();
+    // Ensure timestamp monotonicity: only add if receive time is >= last
+    // entry's time. Network reordering can cause packets with higher packet
+    // numbers to have earlier receive times.
+    bool shouldAdd = ackState.recvdPacketInfos.empty() ||
+        udpPacket.timings.receiveTimePoint >=
+            ackState.recvdPacketInfos.back().timings.receiveTimePoint;
+
+    if (shouldAdd) {
+      if (ackState.recvdPacketInfos.size() ==
+          conn.transportSettings.maxReceiveTimestampsPerAckStored) {
+        ackState.recvdPacketInfos.pop_front();
+      }
+      ackState.recvdPacketInfos.emplace_back(
+          WriteAckFrameState::ReceivedPacket{packetNum, udpPacket.timings});
     }
-    ackState.recvdPacketInfos.emplace_back(
-        WriteAckFrameState::ReceivedPacket{packetNum, udpPacket.timings});
   }
 
   auto ecnValue = udpPacket.tosValue & 0b11;
