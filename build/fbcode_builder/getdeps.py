@@ -445,19 +445,23 @@ class InstallSysDepsCmd(ProjectCmdBase):
                 all_packages[k] = merged
 
         cmd_argss = []
+        # Containers (e.g. manylinux) run as root and don't ship sudo. Only
+        # prepend "sudo" if it's actually on PATH; otherwise invoke the
+        # package manager directly.
+        sudo_cmd = ["sudo"] if shutil.which("sudo") else []
         if manager == "rpm":
             packages = sorted(set(all_packages["rpm"]))
             if packages:
                 cmd_argss.append(
-                    ["sudo", "dnf", "install", "-y", "--skip-broken"] + packages
+                    sudo_cmd + ["dnf", "install", "-y", "--skip-broken"] + packages
                 )
         elif manager == "deb":
             packages = sorted(set(all_packages["deb"]))
             if packages:
                 cmd_argss.append(
-                    [
-                        "sudo",
-                        "--preserve-env=http_proxy",
+                    sudo_cmd
+                    + (["--preserve-env=http_proxy"] if sudo_cmd else [])
+                    + [
                         "apt-get",
                         "install",
                         "-y",
@@ -1011,15 +1015,6 @@ class EnvCmd(ProjectCmdBase):
 class GenerateGitHubActionsCmd(ProjectCmdBase):
     RUN_ON_ALL = """ [push, pull_request]"""
 
-    WORKFLOW_DISPATCH_TMATE = """
-  workflow_dispatch:
-    inputs:
-      tmate_enabled:
-        description: 'Start a tmate SSH session on failure'
-        required: false
-        default: false
-        type: boolean"""
-
     def run_project_cmd(self, args, loader, manifest):
         platforms = [
             HostType("linux", "ubuntu", "24"),
@@ -1034,35 +1029,24 @@ class GenerateGitHubActionsCmd(ProjectCmdBase):
 
     def get_run_on(self, args):
         if args.run_on_all_branches:
-            return (
-                """
-  push:
-  pull_request:"""
-                + self.WORKFLOW_DISPATCH_TMATE
-            )
+            return self.RUN_ON_ALL
         if args.cron:
             if args.cron == "never":
                 return " {}"
             elif args.cron == "workflow_dispatch":
-                return self.WORKFLOW_DISPATCH_TMATE
+                return "\n  workflow_dispatch"
             else:
-                return (
-                    f"""
+                return f"""
   schedule:
     - cron: '{args.cron}'"""
-                    + self.WORKFLOW_DISPATCH_TMATE
-                )
 
-        return (
-            f"""
+        return f"""
   push:
     branches:
     - {args.main_branch}
   pull_request:
     branches:
     - {args.main_branch}"""
-            + self.WORKFLOW_DISPATCH_TMATE
-        )
 
     # TODO: Break up complex function
     def write_job_for_platform(self, platform, args):  # noqa: C901
@@ -1179,9 +1163,17 @@ jobs:
             out.write("  build:\n")
             out.write("    runs-on: %s\n" % runs_on)
             out.write(f"    timeout-minutes: {timeout_minutes}\n")
+            env_vars = []
+            if build_opts.is_darwin():
+                env_vars.append(
+                    "      DEVELOPER_DIR: /Applications/Xcode_16.2.app/Contents/Developer\n"
+                )
             if use_sccache:
+                env_vars.append('      SCCACHE_GHA_ENABLED: "on"\n')
+            if env_vars:
                 out.write("    env:\n")
-                out.write('      SCCACHE_GHA_ENABLED: "on"\n')
+                for line in env_vars:
+                    out.write(line)
             out.write("    steps:\n")
 
             if build_opts.is_linux():
@@ -1236,7 +1228,9 @@ jobs:
 
             out.write("    - uses: actions/checkout@v6\n")
 
-            extra_cmake_defines = {}
+            extra_cmake_defines = (
+                json.loads(args.extra_cmake_defines) if args.extra_cmake_defines else {}
+            )
             if use_sccache:
                 out.write("    - name: Set up sccache\n")
                 out.write("      uses: mozilla-actions/sccache-action@v0.0.9\n")
@@ -1244,12 +1238,20 @@ jobs:
                 out.write('        version: "v0.14.0"\n')
                 extra_cmake_defines["CMAKE_CXX_COMPILER_LAUNCHER"] = "sccache"
 
-            if extra_cmake_defines:
-                extra_cmake_arg = (
-                    " --extra-cmake-defines '" + json.dumps(extra_cmake_defines) + "'"
-                )
-            else:
-                extra_cmake_arg = ""
+            per_package_defines = _parse_per_package_defines(
+                getattr(args, "package_extra_cmake_defines", []) or []
+            )
+
+            def cmake_arg_for(name):
+                merged = dict(extra_cmake_defines)
+                merged.update(per_package_defines.get(name, {}))
+                if merged:
+                    return (
+                        " --extra-cmake-defines '"
+                        + json.dumps(merged, separators=(",", ":"))
+                        + "'"
+                    )
+                return ""
 
             build_type_arg = ""
             if override_build_type:
@@ -1388,7 +1390,7 @@ jobs:
                             f"      if: ${{{{ steps.paths.outputs.{m.name}_SOURCE }}}}\n"
                         )
                 out.write(
-                    f"      run: {getdepscmd}{allow_sys_arg} build {build_type_arg}{src_dir_arg}{free_up_disk}--no-tests {m.name}{extra_cmake_arg}\n"
+                    f"      run: {getdepscmd}{allow_sys_arg} build {build_type_arg}{src_dir_arg}{free_up_disk}--no-tests {m.name}{cmake_arg_for(m.name)}\n"
                 )
 
                 if args.use_build_cache and not src_dir_arg:
@@ -1429,7 +1431,7 @@ jobs:
                 no_deps_arg = "--no-deps "
 
             out.write(
-                f"      run: {getdepscmd}{allow_sys_arg} build {build_type_arg}{tests_arg}{no_deps_arg}--src-dir=. {manifest.name}{project_prefix}{extra_cmake_arg}\n"
+                f"      run: {getdepscmd}{allow_sys_arg} build {build_type_arg}{tests_arg}{no_deps_arg}--src-dir=. {manifest.name}{project_prefix}{cmake_arg_for(manifest.name)}\n"
             )
 
             if use_sccache:
@@ -1479,12 +1481,6 @@ jobs:
             out.write(
                 "      run: gh cache list --repo ${{ github.repository }} --sort size_in_bytes --order desc --limit 30\n"
             )
-
-            out.write("    - name: Setup tmate session\n")
-            out.write(
-                "      if: failure() && github.event_name == 'workflow_dispatch' && inputs.tmate_enabled\n"
-            )
-            out.write("      uses: mxschmitt/action-tmate@v3\n")
 
     def setup_project_cmd_parser(self, parser):
         parser.add_argument(
@@ -1561,6 +1557,45 @@ jobs:
             dest="use_build_cache",
             help="Do not attempt to use the build cache.",
         )
+        parser.add_argument(
+            "--package-extra-cmake-defines",
+            action="append",
+            default=[],
+            metavar="PACKAGE=JSON",
+            help=(
+                "Add cmake defines that apply only to the named package's "
+                "build step in the generated workflow. Example: "
+                "--package-extra-cmake-defines "
+                '\'fbthrift={"THRIFT_SERIALIZATION_ONLY":"ON"}\'. May be '
+                "passed multiple times."
+            ),
+        )
+
+
+def _parse_per_package_defines(values):
+    """Parse a list of `package=json` strings into a dict of dicts."""
+    result = {}
+    for entry in values or []:
+        if "=" not in entry:
+            raise SystemExit(
+                f"--package-extra-cmake-defines value {entry!r} must be of the "
+                "form PACKAGE=JSON"
+            )
+        package, raw = entry.split("=", 1)
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise SystemExit(
+                f"--package-extra-cmake-defines for {package!r} is not valid "
+                f"JSON: {e}"
+            )
+        if not isinstance(parsed, dict):
+            raise SystemExit(
+                f"--package-extra-cmake-defines for {package!r} must be a JSON "
+                "object"
+            )
+        result.setdefault(package, {}).update(parsed)
+    return result
 
 
 def get_arg_var_name(args):

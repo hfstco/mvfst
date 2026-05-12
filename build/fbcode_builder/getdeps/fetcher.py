@@ -254,8 +254,16 @@ class SystemPackageFetcher:
 
     def hash(self) -> str:
         if self.packages_are_installed():
-            # pyrefly: ignore [bad-argument-type]
-            return hashlib.sha256(self.installed).hexdigest()
+            # SystemPackageFetcher stashes the package-manager query output
+            # (bytes including versions) in self.installed so upgrades change
+            # the hash. PreinstalledNopFetcher just sets self.installed=True
+            # and has no .packages, so fall back to an empty package list.
+            if isinstance(self.installed, (bytes, bytearray)):
+                payload = bytes(self.installed)
+            else:
+                packages = getattr(self, "packages", None) or []
+                payload = ",".join(sorted(packages)).encode("utf-8")
+            return hashlib.sha256(payload).hexdigest()
         else:
             return "0" * 40
 
@@ -585,7 +593,8 @@ class ShipitPathMap:
                     if target_name:
                         full_file_list.add(target_name)
                         if copy_if_different(full_name, target_name):
-                            filter_strip_marker(target_name, self.strip_marker)
+                            if not os.path.islink(full_name):
+                                filter_strip_marker(target_name, self.strip_marker)
                             change_status.record_change(target_name)
                             if update_count < 10:
                                 print("Updated %s -> %s" % (full_name, target_name))
