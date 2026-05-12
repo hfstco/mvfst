@@ -805,62 +805,65 @@ void Cubic::onPacketAckedInSteady(const AckEvent& ack) {
         kResetLastReductionTime);
   }
   if (carefulResume_.state() != CarefulResume::States::Unvalidated &&
-      carefulResume_.state() != CarefulResume::States::SafeRetreat) {
-    uint64_t newCwnd = calculateCubicCwnd(calculateCubicCwndDelta(ack.ackTime));
-    if (conn_.transportSettings.ccaConfig.additiveIncreaseAfterHystart &&
-        newCwnd < ssthresh_) {
-      auto delta = ack.ackedBytes / 10;
-      if (newCwnd < cwndBytes_ + delta) {
-        newCwnd = boundedCwnd(
-            cwndBytes_ + delta,
-            conn_.udpSendPacketLen,
-            conn_.transportSettings.maxCwndInMss,
-            conn_.transportSettings.minCwndInMss);
+      carefulResume_.state() != CarefulResume::States::SafeRetreat)
+  {
+      uint64_t newCwnd = calculateCubicCwnd(calculateCubicCwndDelta(ack.ackTime));
+      if (conn_.transportSettings.ccaConfig.additiveIncreaseAfterHystart &&
+          newCwnd < ssthresh_) {
+          auto delta = ack.ackedBytes / 10;
+          if (newCwnd < cwndBytes_ + delta) {
+              newCwnd = boundedCwnd(
+                  cwndBytes_ + delta,
+                  conn_.udpSendPacketLen,
+                  conn_.transportSettings.maxCwndInMss,
+                  conn_.transportSettings.minCwndInMss);
+          }
+          }
+      if (newCwnd < cwndBytes_) {
+          MVVLOG(10) << "Cubic steady state calculates a smaller cwnd than last round"
+                   << ", new cnwd = " << newCwnd
+                   << ", current cwnd = " << cwndBytes_;
+
+      } else {
+          cwndBytes_ = newCwnd;
       }
-    }
-    if (newCwnd < cwndBytes_) {
-      MVVLOG(10) << "Cubic steady state calculates a smaller cwnd than last round"
-               << ", new cnwd = " << newCwnd
-               << ", current cwnd = " << cwndBytes_;
-  } else {
-    cwndBytes_ = newCwnd;
-  }
-  // Reno cwnd estimation for TCP friendly.
-  if (steadyState_.tcpFriendly && ack.ackedBytes) {
-    /* If tcpFriendly is false, we don't keep track of estRenoCwnd. Right now we
-       don't provide an API to change tcpFriendly in the middle of a connection.
-       If you change that and start to provide an API to mutate tcpFriendly, you
-       should calculate estRenoCwnd even when tcpFriendly is false. */
-    steadyState_.estRenoCwnd += steadyState_.tcpEstimationIncreaseFactor *
-        ack.ackedBytes * conn_.udpSendPacketLen / steadyState_.estRenoCwnd;
-    steadyState_.estRenoCwnd = boundedCwnd(
-        steadyState_.estRenoCwnd,
-        conn_.udpSendPacketLen,
-        conn_.transportSettings.maxCwndInMss,
-        conn_.transportSettings.minCwndInMss);
-    cwndBytes_ = std::max(cwndBytes_, steadyState_.estRenoCwnd);
-    QLOG(
-        conn_,
-        addMetricUpdate,
-        conn_.lossState.lrtt,
-        conn_.lossState.mrtt,
-        conn_.lossState.srtt,
-        conn_.lossState.maybeLrttAckDelay.value_or(0us),
-        conn_.lossState.rttvar,
-        getCongestionWindow(),
-        conn_.lossState.inflightBytes,
-        ssthresh_ == std::numeric_limits<uint64_t>::max()
-            ? std::nullopt
-            : Optional<uint64_t>(ssthresh_),
-        std::nullopt,
-        std::nullopt,
-        conn_.lossState.ptoCount);
-    QLOG(
-        conn_,
-        addCongestionStateUpdate,
-        std::nullopt,
-        cubicStateToString(state_).str(),
-        kRenoCwndEstimation);
+      // Reno cwnd estimation for TCP friendly.
+      if (steadyState_.tcpFriendly && ack.ackedBytes) {
+          /* If tcpFriendly is false, we don't keep track of estRenoCwnd. Right now we
+             don't provide an API to change tcpFriendly in the middle of a connection.
+             If you change that and start to provide an API to mutate tcpFriendly, you
+             should calculate estRenoCwnd even when tcpFriendly is false. */
+          steadyState_.estRenoCwnd += steadyState_.tcpEstimationIncreaseFactor *
+              ack.ackedBytes * conn_.udpSendPacketLen / steadyState_.estRenoCwnd;
+          steadyState_.estRenoCwnd = boundedCwnd(
+              steadyState_.estRenoCwnd,
+              conn_.udpSendPacketLen,
+              conn_.transportSettings.maxCwndInMss,
+              conn_.transportSettings.minCwndInMss);
+          cwndBytes_ = std::max(cwndBytes_, steadyState_.estRenoCwnd);
+          QLOG(
+              conn_,
+              addMetricUpdate,
+              conn_.lossState.lrtt,
+              conn_.lossState.mrtt,
+              conn_.lossState.srtt,
+              conn_.lossState.maybeLrttAckDelay.value_or(0us),
+              conn_.lossState.rttvar,
+              getCongestionWindow(),
+              conn_.lossState.inflightBytes,
+              ssthresh_ == std::numeric_limits<uint64_t>::max()
+                  ? std::nullopt
+                  : Optional<uint64_t>(ssthresh_),
+              std::nullopt,
+              std::nullopt,
+              conn_.lossState.ptoCount);
+          QLOG(
+              conn_,
+              addCongestionStateUpdate,
+              std::nullopt,
+              cubicStateToString(state_).str(),
+              kRenoCwndEstimation);
+      }
   }
 }
 

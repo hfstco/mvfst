@@ -77,19 +77,19 @@ class QLogger {
       uint64_t bytesInFlight,
       uint64_t currentCwnd,
       std::string congestionEvent,
-      std::string state = "",
-      std::string recoveryState = "") = 0;
+      std::string state,
+      std::string recoveryState) = 0;
   virtual void addCarefulResumePhaseUpdated(
       std::string oldPhase,
       std::string newPhase,
-      uint64_t pipesize,
-      uint64_t firstUnvalidatedPacket,
-      uint64_t lastUnvalidatedPacket,
-      uint64_t congestionWindow,
-      uint64_t ssthresh,
-      uint64_t savedCongestionWindow,
+      uint32_t pipesize,
+      uint32_t firstUnvalidatedPacket,
+      uint32_t lastUnvalidatedPacket,
+      uint32_t congestionWindow,
+      uint32_t ssthresh,
+      uint32_t savedCongestionWindow,
       uint64_t savedRtt,
-      std::string trigger = "") = 0;
+      std::string trigger) = 0;
   virtual void addBandwidthEstUpdate(
       uint64_t bytes,
       std::chrono::microseconds interval) = 0;

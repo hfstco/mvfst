@@ -78,12 +78,12 @@ class FileQLogger : public BaseQLogger {
   void addCarefulResumePhaseUpdated(
       std::string oldPhase,
       std::string newPhase,
-      uint64_t pipesize,
-      uint64_t firstUnvalidatedPacket,
-      uint64_t lastUnvalidatedPacket,
-      uint64_t congestionWindow,
-      uint64_t ssthresh,
-      uint64_t savedCongestionWindow,
+      uint32_t pipesize,
+      uint32_t firstUnvalidatedPacket,
+      uint32_t lastUnvalidatedPacket,
+      uint32_t congestionWindow,
+      uint32_t ssthresh,
+      uint32_t savedCongestionWindow,
       uint64_t savedRtt,
       std::string trigger) override;
   void addPacingMetricUpdate(
@@ -128,7 +128,7 @@ class FileQLogger : public BaseQLogger {
       Optional<std::string> oldState,
       std::string newState,
       Optional<std::string> trigger,
-      Optional<uint64_t> resumption = std::nullopt) override;
+      Optional<uint64_t> resumption) override;
   void addStreamStateUpdate(
       StreamId id,
       std::string update,
