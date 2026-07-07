@@ -30,6 +30,7 @@ class TPerfClient : public quic::QuicSocket::ConnectionSetupCallback,
       bool autotuneWindow,
       bool gso,
       quic::CongestionControlType congestionControlType,
+      bool disableHystart,
       uint32_t maxReceivePacketSize,
       bool useInplaceWrite,
       std::string knobsStr,
@@ -86,6 +87,7 @@ class TPerfClient : public quic::QuicSocket::ConnectionSetupCallback,
   bool autotuneWindow_{false};
   bool gso_;
   quic::CongestionControlType congestionControlType_;
+  bool disableHystart_{false};
   uint32_t maxReceivePacketSize_;
   bool useInplaceWrite_{false};
   std::string knobsStr_;

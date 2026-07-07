@@ -26,6 +26,7 @@ TPerfClient::TPerfClient(
     bool autotuneWindow,
     bool gso,
     quic::CongestionControlType congestionControlType,
+    bool disableHystart,
     uint32_t maxReceivePacketSize,
     bool useInplaceWrite,
     std::string knobsStr,
@@ -46,6 +47,7 @@ TPerfClient::TPerfClient(
       autotuneWindow_(autotuneWindow),
       gso_(gso),
       congestionControlType_(congestionControlType),
+      disableHystart_(disableHystart),
       maxReceivePacketSize_(maxReceivePacketSize),
       useInplaceWrite_(useInplaceWrite),
       knobsStr_(knobsStr),
@@ -200,6 +202,7 @@ void TPerfClient::start() {
   settings.maxRecvBatchSize = 64;
   settings.numGROBuffers_ = 64;
   settings.defaultCongestionController = congestionControlType_;
+  settings.ccaConfig.disableHystart = disableHystart_;
   if (congestionControlType_ == quic::CongestionControlType::BBR) {
     settings.pacingEnabled = true;
     settings.pacingTickInterval = 200us;
