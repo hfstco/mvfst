@@ -31,6 +31,9 @@ target_link_libraries(
   Folly::folly
   fizz::fizz
   mvfst_test_utils
+  mvfst_client_client
+  mvfst_congestion_control_static_cwnd_congestion_controller
+  mvfst_logging_file_qlogger
   ${GFLAGS_LIBRARIES}
   ${LIBGMOCK_LIBRARIES}
 )
