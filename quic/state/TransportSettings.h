@@ -44,10 +44,10 @@ struct CongestionControlConfig {
   bool additiveIncreaseAfterHystart{false};
 
   // Used by: Cubic
-  // If true, disables HyStart's slow start exit-point detection (both the
-  // ack-train and delay-increase heuristics). Slow start then only exits
-  // when cwnd reaches ssthresh or on loss.
-  bool disableHystart{false};
+  // HyStart slow start exit-point detection (the ack-train and
+  // delay-increase heuristics). When false, slow start only exits when
+  // cwnd reaches ssthresh or on loss.
+  bool hystartEnabled{true};
 
   // Used by: Cubic
   // Whether to clamp the cwnd growth when the connection is not cwnd limited.

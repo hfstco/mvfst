@@ -116,10 +116,10 @@ DEFINE_uint32(
     "Controls how many packet receive timestamps the peer should send "
     "(applies to both legacy and draft-02 advertisements).");
 DEFINE_bool(
-    disable_hystart,
-    false,
-    "Disable HyStart slow start exit-point detection in Cubic; slow start "
-    "then only exits when cwnd reaches ssthresh or on loss.");
+    hystart,
+    true,
+    "Enable HyStart slow start exit-point detection in Cubic. When false, "
+    "slow start only exits when cwnd reaches ssthresh or on loss.");
 DEFINE_bool(use_l4s_ecn, false, "Whether to use L4S for ECN marking");
 DEFINE_bool(
     read_ecn,
@@ -259,7 +259,7 @@ int main(int argc, char* argv[]) {
         FLAGS_block_size,
         FLAGS_writes_per_loop,
         flagsToCongestionControlType(FLAGS_congestion),
-        FLAGS_disable_hystart,
+        FLAGS_hystart,
         FLAGS_gso,
         FLAGS_max_cwnd_mss,
         FLAGS_pacing,
@@ -318,7 +318,7 @@ int main(int argc, char* argv[]) {
         FLAGS_autotune_window,
         FLAGS_gso,
         flagsToCongestionControlType(FLAGS_congestion),
-        FLAGS_disable_hystart,
+        FLAGS_hystart,
         FLAGS_max_receive_packet_size,
         FLAGS_use_inplace_write,
         FLAGS_transport_knob_params,

@@ -76,7 +76,7 @@ quic::CongestionControlConfig parseCongestionControlConfig(
       {"probeRttDisabledIfAppLimited", ccaConfig.probeRttDisabledIfAppLimited},
       {"drainToTarget", ccaConfig.drainToTarget},
       {"additiveIncreaseAfterHystart", ccaConfig.additiveIncreaseAfterHystart},
-      {"disableHystart", ccaConfig.disableHystart},
+      {"hystartEnabled", ccaConfig.hystartEnabled},
       {"onlyGrowCwndWhenLimited", ccaConfig.onlyGrowCwndWhenLimited},
       {"leaveHeadroomForCwndLimited", ccaConfig.leaveHeadroomForCwndLimited},
       {"ignoreInflightHi", ccaConfig.ignoreInflightLongTerm},

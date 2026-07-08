@@ -602,7 +602,7 @@ void Cubic::onPacketAckedInHystart(const AckEvent& ack) {
   }
 
   MVDCHECK_LE(cwndBytes_, ssthresh_);
-  if (conn_.transportSettings.ccaConfig.disableHystart) {
+  if (!conn_.transportSettings.ccaConfig.hystartEnabled) {
     return;
   }
   if (hystartState_.found != Cubic::HystartFound::No) {
