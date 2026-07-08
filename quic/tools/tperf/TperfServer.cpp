@@ -984,7 +984,7 @@ TPerfServer::TPerfServer(
     uint64_t blockSize,
     uint64_t writesPerLoop,
     quic::CongestionControlType congestionControlType,
-    bool disableHystart,
+    bool hystart,
     bool gso,
     uint32_t maxCwndInMss,
     bool pacing,
@@ -1046,7 +1046,7 @@ TPerfServer::TPerfServer(
   settings.maxCwndInMss = maxCwndInMss;
   settings.writeConnectionDataPacketsLimit = writesPerLoop;
   settings.defaultCongestionController = congestionControlType;
-  settings.ccaConfig.disableHystart = disableHystart;
+  settings.ccaConfig.hystartEnabled = hystart;
   settings.pacingEnabled = pacing;
   if (pacing) {
     settings.pacingTickInterval = 200us;
