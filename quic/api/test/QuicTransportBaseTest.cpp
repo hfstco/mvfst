@@ -1969,6 +1969,39 @@ TEST_F(QuicTransportImplTestBase, CloseStreamAfterReadFin) {
   transport.reset();
 }
 
+TEST_F(
+    QuicTransportImplTestBase,
+    CheckForClosedStreamReentrantCloseInOnStreamPreReaped) {
+  auto stream = transport->createBidirectionalStream().value();
+  NiceMock<MockReadCallback> readCb;
+  ASSERT_FALSE(transport->setReadCallback(stream, &readCb).hasError());
+  transport->addDataToStream(
+      stream,
+      StreamBuffer(folly::IOBuf::copyBuffer("actual stream data"), 0, true));
+
+  // Reading the FIN marks the read callback as having delivered the EOM, so
+  // checkForClosedStream takes its reap path while still holding a valid
+  // iterator into readCallbacks_ (the vulnerable readCbIt).
+  auto readData = transport->read(stream, 100);
+  ASSERT_TRUE(readData.has_value());
+  ASSERT_TRUE(readData->second);
+
+  auto* streamState = transport->getStream(stream);
+  ASSERT_NE(streamState, nullptr);
+  streamState->sendState = StreamSendState::Closed;
+  streamState->recvState = StreamRecvState::Closed;
+  transport->transportConn->streamManager->addClosed(stream);
+
+  EXPECT_CALL(connCallback, onStreamPreReaped(stream)).WillOnce([&](StreamId) {
+    transport->close(std::nullopt);
+  });
+
+  transport->invokeReadDataAndCallbacks();
+
+  EXPECT_TRUE(transport->isClosed());
+  transport.reset();
+}
+
 TEST_F(QuicTransportImplTestBase, CloseTransportCleansupOutstandingCounters) {
   transport->transportConn->outstandings
       .packetCount[PacketNumberSpace::Handshake] = 200;
@@ -4978,6 +5011,33 @@ TEST_F(QuicTransportImplTestBase, StopSendingCallback) {
   EXPECT_FALSE(res.hasError());
 
   EXPECT_CALL(ssCb, onStopSending(id, 0));
+  transport->getConnectionState().streamManager->addStopSending(
+      id, /*error=*/0);
+  transport->invokeProcessCallbacksAfterNetworkData();
+}
+
+TEST_F(QuicTransportImplTestBase, StopSendingCallbackReentrantRegistration) {
+  auto id = transport->createBidirectionalStream().value();
+
+  std::vector<StreamId> reentrantIds;
+  reentrantIds.reserve(64);
+  for (int i = 0; i < 64; ++i) {
+    reentrantIds.push_back(transport->createBidirectionalStream().value());
+  }
+
+  NiceMock<MockStopSendingCallback> reentrantCb;
+  NiceMock<MockStopSendingCallback> ssCb;
+  ON_CALL(ssCb, onStopSending(id, 0))
+      .WillByDefault([&](StreamId, ApplicationErrorCode) {
+        for (auto rid : reentrantIds) {
+          ASSERT_FALSE(
+              transport->setStopSendingCallback(rid, &reentrantCb).hasError());
+        }
+      });
+
+  EXPECT_FALSE(transport->setStopSendingCallback(id, &ssCb).hasError());
+
+  EXPECT_CALL(ssCb, onStopSending(id, 0)).Times(1);
   transport->getConnectionState().streamManager->addStopSending(
       id, /*error=*/0);
   transport->invokeProcessCallbacksAfterNetworkData();

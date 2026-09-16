@@ -30,6 +30,7 @@
 #include <quic/server/handshake/ServerHandshake.h>
 #include <quic/state/StateData.h>
 
+#include <algorithm>
 #include <memory>
 
 using namespace std;
@@ -916,5 +917,70 @@ TEST_F(ServerHandshakeZeroRttTest, TestRejectZeroRttInvalidToken) {
   clientServerRound();
   EXPECT_EQ(handshake->getPhase(), ServerHandshake::Phase::Established);
   expectOneRttCipher(true);
+}
+
+namespace {
+size_t countPskKe(const std::vector<fizz::PskKeyExchangeMode>& modes) {
+  return std::ranges::count(modes, fizz::PskKeyExchangeMode::psk_ke);
+}
+} // namespace
+
+// The priming context overrides the base PSK-mode policy to prefer pure PSK
+// (psk_ke) with an ECDHE-PSK fallback, even when the base context is restricted
+// to psk_dhe_ke only, without mutating the base context that non-priming (e.g.
+// MVFST/QUIC_V1) connections use.
+TEST(
+    FizzServerQuicHandshakeContextPrimingTest,
+    OverridesModesWhenBaseRestricted) {
+  auto serverCtx = quic::test::createServerCtx();
+  serverCtx->setSupportedPskModes({fizz::PskKeyExchangeMode::psk_dhe_ke});
+  auto ctx = FizzServerQuicHandshakeContext::Builder()
+                 .setFizzServerContext(serverCtx)
+                 .build();
+
+  EXPECT_THAT(
+      ctx->getPrimingContext()->getSupportedPskModes(),
+      ElementsAre(
+          fizz::PskKeyExchangeMode::psk_ke,
+          fizz::PskKeyExchangeMode::psk_dhe_ke));
+
+  // The base context (used by non-priming versions) is left untouched.
+  EXPECT_THAT(
+      ctx->getContext()->getSupportedPskModes(),
+      ElementsAre(fizz::PskKeyExchangeMode::psk_dhe_ke));
+}
+
+// The override replaces the base modes wholesale: the priming context always
+// prefers psk_ke first regardless of the base's mode set or preference order.
+TEST(
+    FizzServerQuicHandshakeContextPrimingTest,
+    OverridesModesRegardlessOfBaseOrder) {
+  auto serverCtx = quic::test::createServerCtx();
+  serverCtx->setSupportedPskModes(
+      {fizz::PskKeyExchangeMode::psk_dhe_ke, fizz::PskKeyExchangeMode::psk_ke});
+  auto ctx = FizzServerQuicHandshakeContext::Builder()
+                 .setFizzServerContext(serverCtx)
+                 .build();
+
+  EXPECT_THAT(
+      ctx->getPrimingContext()->getSupportedPskModes(),
+      ElementsAre(
+          fizz::PskKeyExchangeMode::psk_ke,
+          fizz::PskKeyExchangeMode::psk_dhe_ke));
+}
+
+// The priming context is cached: repeated calls return the same instance and do
+// not accumulate duplicate psk_ke entries.
+TEST(FizzServerQuicHandshakeContextPrimingTest, IsCachedAndIdempotent) {
+  auto serverCtx = quic::test::createServerCtx();
+  serverCtx->setSupportedPskModes({fizz::PskKeyExchangeMode::psk_dhe_ke});
+  auto ctx = FizzServerQuicHandshakeContext::Builder()
+                 .setFizzServerContext(serverCtx)
+                 .build();
+
+  auto first = ctx->getPrimingContext();
+  auto second = ctx->getPrimingContext();
+  EXPECT_EQ(first.get(), second.get());
+  EXPECT_EQ(countPskKe(second->getSupportedPskModes()), 1);
 }
 } // namespace quic::test

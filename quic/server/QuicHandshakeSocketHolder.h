@@ -23,6 +23,13 @@ class QuicHandshakeSocketHolder
     virtual void onConnectionSetupError(
         std::shared_ptr<quic::QuicSocket> quicSocket,
         quic::QuicError code) = 0;
+
+    // Returns true if the callback replaced this holder as the connection setup
+    // callback and took responsibility for later setup events.
+    virtual bool onQuicWriteCipherAvailable(
+        std::shared_ptr<quic::QuicSocket> /*quicSocket*/) {
+      return false;
+    }
   };
 
   static QuicServerTransport::Ptr makeServerTransport(
@@ -49,6 +56,12 @@ class QuicHandshakeSocketHolder
       callback_->onConnectionSetupError(std::move(quicSocket_), code);
     }
     delete this;
+  }
+
+  void onWriteCipherAvailable() noexcept override {
+    if (callback_ && callback_->onQuicWriteCipherAvailable(quicSocket_)) {
+      delete this;
+    }
   }
 
   void onReplaySafe() noexcept override {
