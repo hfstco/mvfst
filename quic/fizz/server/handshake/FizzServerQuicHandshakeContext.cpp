@@ -73,6 +73,10 @@ FizzServerQuicHandshakeContext::getPrimingContext() const {
         tolerance,
         replayCache);
 
+    primingContext->setSupportedPskModes(
+        {fizz::PskKeyExchangeMode::psk_ke,
+         fizz::PskKeyExchangeMode::psk_dhe_ke});
+
     primingContext_ = std::move(primingContext);
   }
 

@@ -503,15 +503,16 @@ folly::dynamic FileQLogger::toDynamicBase() const {
   auto vpInfo = createVantagePoint(vantagePoint, "");
   trace["vantage_point"] = vpInfo.toDynamic();
 
-  trace["event_schemas"] =
-      folly::dynamic::array(kQLogEventSchemaURI, kQLogMvfstEventSchemaURI);
+  auto eventSchemas = folly::dynamic::array(kQLogEventSchemaURI);
+  if (protocolType == kHTTP3ProtocolType) {
+    eventSchemas.push_back(kQLogHTTP3EventSchemaURI);
+  }
+  eventSchemas.push_back(kQLogMvfstEventSchemaURI);
+  trace["event_schemas"] = std::move(eventSchemas);
 
   folly::dynamic commonFieldsDyn = folly::dynamic::object();
   commonFieldsDyn["odcid"] = dcid.has_value() ? dcid.value().hex() : "";
 
-  if (!protocolType.empty()) {
-    commonFieldsDyn["protocol_type"] = protocolType;
-  }
   folly::dynamic refTime = folly::dynamic::object();
   refTime["clock_type"] = kQLogClockTypeMonotonic;
   refTime["epoch"] = "unknown";
@@ -542,7 +543,7 @@ folly::dynamic FileQLogger::generateSummary(
   // if there is <= 1 event, max_duration is 0
   // otherwise, it is the (time of the last event - time of the  first event)
   summaryObj["max_duration"] =
-      (numEvents <= 1) ? 0 : (endTime - startTime).count();
+      (numEvents <= 1) ? 0.0 : (endTime - startTime).count() / 1000.0;
   summaryObj["total_event_count"] = numEvents;
   return summaryObj;
 }

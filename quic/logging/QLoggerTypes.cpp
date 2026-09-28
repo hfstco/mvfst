@@ -7,12 +7,46 @@
 
 #include <quic/logging/QLoggerTypes.h>
 
+#include <folly/lang/Bits.h>
 #include <quic/QuicException.h>
+#include <quic/common/StringUtils.h>
 #include <quic/logging/QLoggerConstants.h>
 
 #include <utility>
 
 namespace quic {
+
+namespace {
+
+double microsecondsToMilliseconds(std::chrono::microseconds duration) {
+  return duration.count() / 1000.0;
+}
+
+double microsecondsToMilliseconds(uint64_t microseconds) {
+  return static_cast<double>(microseconds) / 1000.0;
+}
+
+folly::dynamic microsecondDeltasToMilliseconds(
+    const std::vector<uint64_t>& deltas) {
+  folly::dynamic out = folly::dynamic::array();
+  for (auto delta : deltas) {
+    out.push_back(microsecondsToMilliseconds(delta));
+  }
+  return out;
+}
+
+std::string toHexString(const uint8_t* data, size_t size) {
+  return hexlify(std::string(reinterpret_cast<const char*>(data), size));
+}
+
+std::string pathDataToHexString(uint64_t pathData) {
+  const auto bigEndianPathData = folly::Endian::big(pathData);
+  return toHexString(
+      reinterpret_cast<const uint8_t*>(&bigEndianPathData),
+      sizeof(bigEndianPathData));
+}
+
+} // namespace
 
 folly::dynamic PaddingFrameLog::toDynamic() const {
   folly::dynamic d = folly::dynamic::object();
@@ -32,10 +66,11 @@ folly::dynamic RstStreamFrameLog::toDynamic() const {
   d["frame_type"] = toQlogString(
       reliableOffset ? FrameType::RST_STREAM_AT : FrameType::RST_STREAM);
   d["stream_id"] = streamId;
+  d["error"] = "unknown";
   d["error_code"] = errorCode;
-  d["offset"] = offset;
+  d["final_size"] = offset;
   if (reliableOffset) {
-    d["reliable_offset"] = reliableOffset.value();
+    d["reliable_size"] = reliableOffset.value();
   }
   return d;
 }
@@ -77,7 +112,7 @@ folly::dynamic MaxStreamDataFrameLog::toDynamic() const {
   folly::dynamic d = folly::dynamic::object();
   d["frame_type"] = toQlogString(FrameType::MAX_STREAM_DATA);
   d["stream_id"] = streamId;
-  d["maximum_data"] = maximumData;
+  d["maximum"] = maximumData;
   return d;
 }
 
@@ -85,8 +120,9 @@ folly::dynamic MaxStreamsFrameLog::toDynamic() const {
   folly::dynamic d = folly::dynamic::object();
   FrameType type = isForBidirectional ? FrameType::MAX_STREAMS_BIDI
                                       : FrameType::MAX_STREAMS_UNI;
-  d["frame_type"] = toString(type);
-  d["max_streams"] = maxStreams;
+  d["frame_type"] = toQlogString(type);
+  d["stream_type"] = isForBidirectional ? "bidirectional" : "unidirectional";
+  d["maximum"] = maxStreams;
   return d;
 }
 
@@ -94,8 +130,9 @@ folly::dynamic StreamsBlockedFrameLog::toDynamic() const {
   folly::dynamic d = folly::dynamic::object();
   FrameType type = isForBidirectional ? FrameType::STREAMS_BLOCKED_BIDI
                                       : FrameType::STREAMS_BLOCKED_UNI;
-  d["frame_type"] = toString(type);
-  d["stream_limit"] = streamLimit;
+  d["frame_type"] = toQlogString(type);
+  d["stream_type"] = isForBidirectional ? "bidirectional" : "unidirectional";
+  d["limit"] = streamLimit;
   return d;
 }
 
@@ -108,7 +145,7 @@ folly::dynamic PingFrameLog::toDynamic() const {
 folly::dynamic DataBlockedFrameLog::toDynamic() const {
   folly::dynamic d = folly::dynamic::object();
   d["frame_type"] = toQlogString(FrameType::DATA_BLOCKED);
-  d["data_limit"] = dataLimit;
+  d["limit"] = dataLimit;
   return d;
 }
 
@@ -117,7 +154,9 @@ folly::dynamic KnobFrameLog::toDynamic() const {
   d["frame_type"] = toQlogString(FrameType::KNOB);
   d["knob_space"] = knobSpace;
   d["knob_id"] = knobId;
-  d["knob_blob_len"] = knobBlobLen;
+  folly::dynamic raw = folly::dynamic::object();
+  raw["payload_length"] = knobBlobLen;
+  d["raw"] = std::move(raw);
   return d;
 }
 
@@ -126,7 +165,7 @@ folly::dynamic AckFrequencyFrameLog::toDynamic() const {
   d["frame_type"] = toQlogString(FrameType::ACK_FREQUENCY);
   d["sequence_number"] = sequenceNumber;
   d["packet_tolerance"] = packetTolerance;
-  d["update_max_ack_delay"] = updateMaxAckDelay;
+  d["update_max_ack_delay"] = microsecondsToMilliseconds(updateMaxAckDelay);
   d["reorder_threshold"] = reorderThreshold;
   return d;
 }
@@ -141,7 +180,7 @@ folly::dynamic StreamDataBlockedFrameLog::toDynamic() const {
   folly::dynamic d = folly::dynamic::object();
   d["frame_type"] = toQlogString(FrameType::STREAM_DATA_BLOCKED);
   d["stream_id"] = streamId;
-  d["data_limit"] = dataLimit;
+  d["limit"] = dataLimit;
   return d;
 }
 
@@ -183,6 +222,7 @@ folly::dynamic StopSendingFrameLog::toDynamic() const {
   folly::dynamic d = folly::dynamic::object();
   d["frame_type"] = toQlogString(FrameType::STOP_SENDING);
   d["stream_id"] = streamId;
+  d["error"] = "unknown";
   d["error_code"] = errorCode;
   return d;
 }
@@ -190,35 +230,29 @@ folly::dynamic StopSendingFrameLog::toDynamic() const {
 folly::dynamic PathChallengeFrameLog::toDynamic() const {
   folly::dynamic d = folly::dynamic::object();
   d["frame_type"] = toQlogString(FrameType::PATH_CHALLENGE);
-  d["path_data"] = pathData;
+  d["data"] = pathDataToHexString(pathData);
   return d;
 }
 
 folly::dynamic PathResponseFrameLog::toDynamic() const {
   folly::dynamic d = folly::dynamic::object();
   d["frame_type"] = toQlogString(FrameType::PATH_RESPONSE);
-  d["path_data"] = pathData;
+  d["data"] = pathDataToHexString(pathData);
   return d;
 }
 
 folly::dynamic NewConnectionIdFrameLog::toDynamic() const {
   folly::dynamic d = folly::dynamic::object();
   d["frame_type"] = toQlogString(FrameType::NEW_CONNECTION_ID);
-  d["sequence"] = sequence;
-
-  folly::dynamic dToken = folly::dynamic::array();
-  for (const auto& a : token) {
-    dToken.push_back(a);
-  }
-
-  d["token"] = dToken;
+  d["sequence_number"] = sequence;
+  d["token"] = toHexString(token.data(), token.size());
   return d;
 }
 
 folly::dynamic RetireConnectionIdFrameLog::toDynamic() const {
   folly::dynamic d = folly::dynamic::object();
   d["frame_type"] = toQlogString(FrameType::RETIRE_CONNECTION_ID);
-  d["sequence"] = sequence;
+  d["sequence_number"] = sequence;
   return d;
 }
 
@@ -233,7 +267,7 @@ folly::dynamic legacyTimestampRangesToDynamic(
     folly::dynamic obj = folly::dynamic::object();
     obj["gap"] = r.gap;
     obj["timestamp_delta_count"] = r.timestamp_delta_count;
-    obj["deltas"] = folly::dynamic::array(r.deltas.begin(), r.deltas.end());
+    obj["deltas"] = microsecondDeltasToMilliseconds(r.deltas);
     out.push_back(std::move(obj));
   }
   return out;
@@ -248,7 +282,7 @@ folly::dynamic draft02TimestampRangesToDynamic(
     folly::dynamic obj = folly::dynamic::object();
     obj["delta_largest_acknowledged"] = r.deltaLargestAcknowledged;
     obj["timestamp_delta_count"] = r.timestamp_delta_count;
-    obj["deltas"] = folly::dynamic::array(r.deltas.begin(), r.deltas.end());
+    obj["deltas"] = microsecondDeltasToMilliseconds(r.deltas);
     out.push_back(std::move(obj));
   }
   return out;
@@ -286,7 +320,7 @@ folly::dynamic ReadAckFrameLog::toDynamic() const {
       frameType == FrameType::ACK_RECEIVE_TIMESTAMPS) {
     if (maybeLatestRecvdPacketTime.has_value()) {
       d["latest_recvd_packet_time"] =
-          maybeLatestRecvdPacketTime.value().count();
+          microsecondsToMilliseconds(maybeLatestRecvdPacketTime.value());
     }
     if (maybeLatestRecvdPacketNum.has_value()) {
       d["latest_recvd_packet_num"] = maybeLatestRecvdPacketNum.value();
@@ -297,7 +331,7 @@ folly::dynamic ReadAckFrameLog::toDynamic() const {
     d["draft02_timestamp_ranges"] =
         draft02TimestampRangesToDynamic(draft02RecvdPacketsTimestampRanges);
   }
-  d["ack_delay"] = ackDelay.count();
+  d["ack_delay"] = microsecondsToMilliseconds(ackDelay);
 
   return d;
 }
@@ -320,7 +354,7 @@ folly::dynamic WriteAckFrameLog::toDynamic() const {
       frameType == FrameType::ACK_RECEIVE_TIMESTAMPS) {
     if (maybeLatestRecvdPacketTime.has_value()) {
       d["latest_recvd_packet_time"] =
-          maybeLatestRecvdPacketTime.value().count();
+          microsecondsToMilliseconds(maybeLatestRecvdPacketTime.value());
     }
     if (maybeLatestRecvdPacketNum.has_value()) {
       d["latest_recvd_packet_num"] = maybeLatestRecvdPacketNum.value();
@@ -331,7 +365,7 @@ folly::dynamic WriteAckFrameLog::toDynamic() const {
     d["draft02_timestamp_ranges"] =
         draft02TimestampRangesToDynamic(draft02RecvdPacketsTimestampRanges);
   }
-  d["ack_delay"] = ackDelay.count();
+  d["ack_delay"] = microsecondsToMilliseconds(ackDelay);
   return d;
 }
 
@@ -426,18 +460,19 @@ folly::dynamic QLogRetryEvent::toDynamic() const {
   folly::dynamic data = folly::dynamic::object();
   folly::dynamic header = folly::dynamic::object();
 
-  // Add packet size to header per test expectations
-  if (packetSize > 0) {
-    header["packet_size"] = packetSize;
-  }
+  header["packet_type"] = packetType;
 
   data["header"] = std::move(header);
 
-  // packet_type is at data level, not in header
-  data["packet_type"] = packetType;
-
-  if (tokenSize > 0) {
-    data["token_size"] = tokenSize;
+  if (packetSize > 0 || tokenSize > 0) {
+    folly::dynamic raw = folly::dynamic::object();
+    if (packetSize > 0) {
+      raw["length"] = packetSize;
+    }
+    if (tokenSize > 0) {
+      raw["payload_length"] = tokenSize;
+    }
+    data["raw"] = std::move(raw);
   }
 
   event["data"] = std::move(data);
@@ -683,7 +718,7 @@ folly::dynamic QLogBandwidthEstUpdateEvent::toDynamic() const {
 
   folly::dynamic data = folly::dynamic::object();
   data["bandwidth_bytes"] = bytes;
-  data["bandwidth_interval"] = interval.count();
+  data["bandwidth_interval"] = microsecondsToMilliseconds(interval);
 
   event["data"] = std::move(data);
   return event;
@@ -706,7 +741,7 @@ folly::dynamic QLogPacingMetricUpdateEvent::toDynamic() const {
 
   folly::dynamic data = folly::dynamic::object();
   data["pacing_burst_size"] = pacingBurstSize;
-  data["pacing_interval"] = pacingInterval.count();
+  data["pacing_interval"] = microsecondsToMilliseconds(pacingInterval);
 
   event["data"] = std::move(data);
   return event;
@@ -781,8 +816,14 @@ folly::dynamic QLogPacketDropEvent::toDynamic() const {
   event["name"] = toQlogEventName(eventType);
 
   folly::dynamic data = folly::dynamic::object();
-  data["packet_size"] = packetSize;
-  data["drop_reason"] = dropReason;
+  if (packetSize > 0) {
+    folly::dynamic raw = folly::dynamic::object();
+    raw["length"] = packetSize;
+    data["raw"] = std::move(raw);
+  }
+  folly::dynamic details = folly::dynamic::object();
+  details["drop_reason"] = dropReason;
+  data["details"] = std::move(details);
 
   event["data"] = std::move(data);
   return event;
@@ -803,7 +844,11 @@ folly::dynamic QLogDatagramReceivedEvent::toDynamic() const {
   event["name"] = toQlogEventName(eventType);
 
   folly::dynamic data = folly::dynamic::object();
-  data["data_len"] = dataLen;
+  if (dataLen > 0) {
+    folly::dynamic raw = folly::dynamic::object();
+    raw["length"] = dataLen;
+    data["raw"] = std::move(raw);
+  }
 
   event["data"] = std::move(data);
   return event;
@@ -904,7 +949,11 @@ folly::dynamic QLogPacketBufferedEvent::toDynamic() const {
 
   folly::dynamic data = folly::dynamic::object();
   data["protection_type"] = toString(protectionType);
-  data["packet_size"] = packetSize;
+  if (packetSize > 0) {
+    folly::dynamic raw = folly::dynamic::object();
+    raw["length"] = packetSize;
+    data["raw"] = std::move(raw);
+  }
 
   event["data"] = std::move(data);
   return event;
@@ -969,16 +1018,16 @@ folly::dynamic QLogMetricUpdateEvent::toDynamic() const {
 
   folly::dynamic data = folly::dynamic::object();
 
-  data["latest_rtt"] = static_cast<float>(latestRtt.count()) / 1000.0f;
-  data["min_rtt"] = static_cast<float>(mrtt.count()) / 1000.0f;
-  data["smoothed_rtt"] = static_cast<float>(srtt.count()) / 1000.0f;
+  data["latest_rtt"] = microsecondsToMilliseconds(latestRtt);
+  data["min_rtt"] = microsecondsToMilliseconds(mrtt);
+  data["smoothed_rtt"] = microsecondsToMilliseconds(srtt);
 
   if (ackDelay.count() > 0) {
-    data["ack_delay"] = static_cast<float>(ackDelay.count()) / 1000.0f;
+    data["ack_delay"] = microsecondsToMilliseconds(ackDelay);
   }
 
   if (rttVar.has_value()) {
-    data["rtt_variance"] = static_cast<float>(rttVar->count()) / 1000.0f;
+    data["rtt_variance"] = microsecondsToMilliseconds(*rttVar);
   }
 
   if (congestionWindow.has_value()) {
@@ -1091,9 +1140,9 @@ folly::dynamic QLogPathValidationEvent::toDynamic() const {
   folly::dynamic data = folly::dynamic::object();
   data["success"] = success_;
   if (vantagePoint_ == VantagePoint::Client) {
-    data["vantagePoint"] = "client";
+    data["vantage_point"] = "client";
   } else {
-    data["vantagePoint"] = "server";
+    data["vantage_point"] = "server";
   }
 
   event["data"] = std::move(data);
@@ -1180,9 +1229,11 @@ folly::dynamic QLogNetworkPathModelUpdateEvent::toDynamic() const {
   data["inflight_hi"] = inflightHi_;
   data["inflight_lo"] = inflightLo_;
   data["bandwidth_hi_bytes"] = bandwidthHiBytes_;
-  data["bandwidth_hi_interval"] = bandwidthHiInterval_.count();
+  data["bandwidth_hi_interval"] =
+      microsecondsToMilliseconds(bandwidthHiInterval_);
   data["bandwidth_lo_bytes"] = bandwidthLoBytes_;
-  data["bandwidth_lo_interval"] = bandwidthLoInterval_.count();
+  data["bandwidth_lo_interval"] =
+      microsecondsToMilliseconds(bandwidthLoInterval_);
 
   event["data"] = std::move(data);
   return event;

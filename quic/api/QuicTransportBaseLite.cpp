@@ -1424,6 +1424,11 @@ void QuicTransportBaseLite::checkForClosedStream() {
     if (connCallback_) {
       connCallback_->onStreamPreReaped(*itr);
     }
+    // onStreamPreReaped may synchronously close() the transport, which frees
+    // readCallbacks_ and tears down stream state; bail before reusing readCbIt.
+    if (closeState_ == CloseState::CLOSED) {
+      return;
+    }
     auto result = conn_->streamManager->removeClosedStream(*itr);
     if (!result.has_value()) {
       exceptionCloseWhat_ = result.error().message;
@@ -1533,7 +1538,17 @@ quic::Expected<void, QuicError> QuicTransportBaseLite::writeSocketData() {
     }
     if (conn_->transportSettings.isPriming && conn_->primingData.size() > 0) {
       auto primingData = std::move(conn_->primingData);
-      connSetupCallback_->onPrimingDataAvailable(std::move(primingData));
+      // Priming sends a single flight and never receives ACKs to open the
+      // window. Unsent request stream or crypto data, or a stream blocked by
+      // flow control, indicates that the priming request did not fit in the
+      // first flight.
+      const auto pendingWriteReason = hasNonAckDataToWrite(*conn_);
+      const bool truncated =
+          pendingWriteReason == WriteDataReason::CRYPTO_STREAM ||
+          pendingWriteReason == WriteDataReason::STREAM ||
+          pendingWriteReason == WriteDataReason::BLOCKED;
+      connSetupCallback_->onPrimingDataAvailable(
+          std::move(primingData), truncated);
     }
     if (closeState_ != CloseState::CLOSED) {
       if (conn_->pendingEvents.closeTransport == true) {
@@ -2297,8 +2312,12 @@ void QuicTransportBaseLite::handleStreamStopSendingCallbacks() {
     }
     auto it = stopSendingCallbacks_.find(id);
     if (it != stopSendingCallbacks_.end()) {
-      it->second->onStopSending(id, ec);
+      // onStopSending() may re-enter setStopSendingCallback() and insert into
+      // stopSendingCallbacks_, rehashing the map and invalidating it. Erase
+      // before invoking the callback so it is never reused across it.
+      auto cb = it->second;
       stopSendingCallbacks_.erase(it);
+      cb->onStopSending(id, ec);
       if (closeState_ != CloseState::OPEN) {
         return;
       }
@@ -2317,14 +2336,23 @@ void QuicTransportBaseLite::handleConnWritable() {
       connWriteCallback->onConnectionWriteReady(maxConnWrite);
     }
 
-    // If the connection flow control is unblocked, we might be unblocked
-    // on the streams now.
-    auto writeCallbackIt = pendingWriteCallbacks_.begin();
+    // If the connection flow control is unblocked, we might be unblocked on
+    // the streams now. Snapshot the ids first: onStreamWriteReady() may
+    // re-enter notifyPendingWriteOnStream() and insert into
+    // pendingWriteCallbacks_, rehashing the map and invalidating any iterator
+    // held across the callback.
+    std::vector<StreamId> pendingWriteStreamIds;
+    pendingWriteStreamIds.reserve(pendingWriteCallbacks_.size());
+    for (const auto& pendingWriteCallback : pendingWriteCallbacks_) {
+      pendingWriteStreamIds.push_back(pendingWriteCallback.first);
+    }
 
-    while (writeCallbackIt != pendingWriteCallbacks_.end()) {
-      auto streamId = writeCallbackIt->first;
+    for (auto streamId : pendingWriteStreamIds) {
+      auto writeCallbackIt = pendingWriteCallbacks_.find(streamId);
+      if (writeCallbackIt == pendingWriteCallbacks_.end()) {
+        continue;
+      }
       auto wcb = writeCallbackIt->second;
-      ++writeCallbackIt;
       auto stream = MVCHECK_NOTNULL(
           conn_->streamManager->getStream(streamId).value_or(nullptr));
       if (!stream->writable()) {

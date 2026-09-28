@@ -6,6 +6,7 @@
  */
 
 #include <gtest/gtest.h>
+#include <quic/api/test/ApiMocks.h>
 #include <quic/api/test/Mocks.h>
 #include <quic/client/QuicClientTransport.h>
 #include <quic/client/test/Mocks.h>
@@ -118,7 +119,9 @@ TEST_F(QuicClientTransportLiteTest, TestPriming) {
   ASSERT_FALSE(
       quicClient_->writeChain(streamId, folly::IOBuf::copyBuffer("test"), false)
           .hasError());
-  EXPECT_CALL(mockConnectionSetupCallback_, onPrimingDataAvailable(_));
+  EXPECT_CALL(
+      mockConnectionSetupCallback_,
+      onPrimingDataAvailable(_, false /* truncated */));
   evb_.loopOnce(EVLOOP_NONBLOCK);
 }
 
@@ -580,6 +583,17 @@ TEST_F(
     QuicClientTransportLiteTest,
     DISABLED_RejectsDraft02FrameWhenLocalMaxIsZero) {
   GTEST_SKIP() << "blocked on Task #21 (move gate to dispatch boundary)";
+}
+
+TEST_F(QuicClientTransportLiteTest, HostsObserverContainer) {
+  EXPECT_EQ(quicClient_->numObservers(), 0);
+  EXPECT_TRUE(quicClient_->getConn()->observerContainer.expired());
+  MockObserver obs;
+  EXPECT_TRUE(quicClient_->addObserver(&obs));
+  EXPECT_EQ(quicClient_->numObservers(), 1);
+  EXPECT_FALSE(quicClient_->getConn()->observerContainer.expired());
+  EXPECT_TRUE(quicClient_->removeObserver(&obs));
+  EXPECT_EQ(quicClient_->numObservers(), 0);
 }
 
 } // namespace quic::test
