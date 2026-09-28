@@ -15,8 +15,10 @@
 #include <quic/logging/oops_logger/OopsLogger.h>
 #include <quic/state/ConnectionOopsFields.h>
 #include <quic/state/QuicStateFunctions.h>
+#include <quic/state/QuicTransportStatsCallback.h>
 
 #include <folly/Chrono.h>
+#include <folly/Conv.h>
 
 namespace quic {
 
@@ -74,6 +76,7 @@ void Cubic::handoff(
     uint64_t newCwnd,
     uint64_t newSsthresh,
     TimePoint lastReductionTime) noexcept {
+  crSetPhase(CarefulResumePhase::Normal);
   cwndBytes_ = newCwnd;
   ssthresh_ = newSsthresh;
   if (cwndBytes_ >= ssthresh_) {
@@ -95,6 +98,7 @@ uint64_t Cubic::getCongestionWindow() const noexcept {
  * we decide to just ignore app limited state right now.
  */
 void Cubic::onPersistentCongestion() {
+  crSetPhase(CarefulResumePhase::Normal);
   auto minCwnd = conn_.transportSettings.minCwndInMss * conn_.udpSendPacketLen;
   ssthresh_ = std::max(cwndBytes_ / 2, minCwnd);
   cwndBytes_ = minCwnd;
@@ -117,12 +121,28 @@ void Cubic::onPersistentCongestion() {
       kPersistentCongestion);
 }
 
-void Cubic::onPacketSent(const OutstandingPacketWrapper& /* packet */) {
+void Cubic::onPacketSent(const OutstandingPacketWrapper& packet) {
   if (conn_.transportSettings.ccaConfig.leaveHeadroomForCwndLimited) {
     // Consider cwndBlocked if inflight bytes >= 0.5 * cwnd
     isCwndBlocked_ = conn_.lossState.inflightBytes >= (cwndBytes_ >> 1);
   } else {
     isCwndBlocked_ = conn_.lossState.inflightBytes >= cwndBytes_;
+  }
+  if (crPhase_ == CarefulResumePhase::Unvalidated ||
+      crPhase_ == CarefulResumePhase::Validating) {
+    crLastSentTime_ = packet.metadata.time;
+  }
+  if (crPhase_ == CarefulResumePhase::Unvalidated) {
+    crLastUnvalidatedSentTime_ = packet.metadata.time;
+    // Validating is entered once the jump cwnd is used up (less than one
+    // packet left) or one RTT has elapsed in Unvalidated.
+    bool cwndFull =
+        conn_.lossState.inflightBytes + conn_.udpSendPacketLen > cwndBytes_;
+    bool rttElapsed = crUnvalidatedStart_.has_value() &&
+        packet.metadata.time - *crUnvalidatedStart_ >= conn_.lossState.srtt;
+    if (cwndFull || rttElapsed) {
+      crExitUnvalidated();
+    }
   }
 }
 
@@ -141,6 +161,30 @@ void Cubic::onPacketLoss(const LossEvent& loss) {
         "invariant_violation: Cubic loss event missing largest lost packet "
         "metadata");
     return;
+  }
+  switch (crPhase_) {
+    case CarefulResumePhase::Reconnaissance:
+      // Congestion before the jump: saved parameters are not used.
+      crSetPhase(CarefulResumePhase::Normal);
+      break;
+    case CarefulResumePhase::Unvalidated:
+    case CarefulResumePhase::Validating:
+      onRemoveBytesFromInflight(loss.lostBytes);
+      crEnterSafeRetreat(loss.lossTime);
+      if (loss.persistentCongestion) {
+        onPersistentCongestion();
+      }
+      return;
+    case CarefulResumePhase::SafeRetreat:
+      // cwnd was already reduced on entry and must not change until all
+      // unvalidated packets are acknowledged.
+      onRemoveBytesFromInflight(loss.lostBytes);
+      if (loss.persistentCongestion) {
+        onPersistentCongestion();
+      }
+      return;
+    case CarefulResumePhase::Normal:
+      break;
   }
   onRemoveBytesFromInflight(loss.lostBytes);
   // If the loss occurred past the endOfRecovery then we need to move the
@@ -406,6 +450,13 @@ void Cubic::onPacketAckOrLoss(
 }
 
 void Cubic::onPacketAcked(const AckEvent& ack) {
+  if (crPhase_ != CarefulResumePhase::Normal && crOnPacketAcked(ack)) {
+    if (conn_.pacer) {
+      conn_.pacer->refreshPacingRate(
+          cwndBytes_ * pacingGain(), conn_.lossState.srtt);
+    }
+    return;
+  }
   auto currentCwnd = cwndBytes_;
   if (recoveryState_.endOfRecovery.has_value() &&
       *recoveryState_.endOfRecovery >= ack.largestNewlyAckedPacketSentTime) {
@@ -443,6 +494,9 @@ void Cubic::onPacketAcked(const AckEvent& ack) {
     case CubicStates::FastRecovery:
       onPacketAckedInRecovery(ack);
       break;
+  }
+  if (crPhase_ == CarefulResumePhase::Reconnaissance) {
+    crMaybeEnterUnvalidated(ack.ackTime);
   }
   if (conn_.pacer) {
     conn_.pacer->refreshPacingRate(
@@ -520,6 +574,9 @@ float Cubic::pacingGain() const noexcept {
   double pacingGain = 1.0f;
   if (conn_.ecnState == ECNState::AttemptingL4S ||
       conn_.ecnState == ECNState::ValidatedL4S) {
+    return pacingGain;
+  } else if (crPhase_ == CarefulResumePhase::Unvalidated) {
+    // Pace the jump cwnd over the current RTT.
     return pacingGain;
   } else if (state_ == CubicStates::Hystart) {
     pacingGain = kCubicHystartPacingGain;
@@ -914,6 +971,204 @@ void Cubic::getStats(CongestionControllerStats& stats) const {
             steadyState_.lastReductionTime.value().time_since_epoch())
             .count();
   }
+}
+
+void Cubic::setResumeHints(
+    uint64_t cwndHintBytes,
+    const Optional<std::chrono::milliseconds>& rttHint) {
+  if (crHintsSet_) {
+    return;
+  }
+  crHintsSet_ = true;
+  // A saved RTT is required to validate the path in Reconnaissance.
+  if (!conn_.transportSettings.useCwndHintsInSessionTicket ||
+      !rttHint.has_value() || state_ != CubicStates::Hystart ||
+      recoveryState_.endOfRecovery.has_value()) {
+    return;
+  }
+  crSavedCwndBytes_ = cwndHintBytes;
+  crSavedRtt_ = *rttHint;
+  crSetPhase(CarefulResumePhase::Reconnaissance);
+}
+
+uint64_t Cubic::crInitCwndBytes() const noexcept {
+  return conn_.transportSettings.initCwndInMss * conn_.udpSendPacketLen;
+}
+
+void Cubic::crSetPhase(CarefulResumePhase phase) {
+  if (crPhase_ == phase) {
+    return;
+  }
+  MVVLOG(10) << "Cubic careful resume: " << carefulResumePhaseToString(crPhase_)
+             << " -> " << carefulResumePhaseToString(phase)
+             << ", cwnd=" << cwndBytes_ << ", pipeSize=" << crPipeSize_;
+  crPhase_ = phase;
+  QLOG(
+      conn_,
+      addCongestionStateUpdate,
+      std::nullopt,
+      cubicStateToString(state_).str(),
+      folly::to<std::string>(
+          "careful_resume_", carefulResumePhaseToString(phase)),
+      phase == CarefulResumePhase::Unvalidated
+          ? Optional<uint64_t>(crSavedCwndBytes_)
+          : std::nullopt);
+}
+
+bool Cubic::crOnPacketAcked(const AckEvent& ack) {
+  bool congestion = ack.ecnCECount > lastCECount_;
+  bool acksLast = [&](const Optional<TimePoint>& last) {
+    return !last.has_value() || ack.largestNewlyAckedPacketSentTime >= *last;
+  }(crPhase_ == CarefulResumePhase::SafeRetreat ? crLastSentTime_
+                                                : crLastUnvalidatedSentTime_);
+  switch (crPhase_) {
+    case CarefulResumePhase::Normal:
+      return false;
+    case CarefulResumePhase::Reconnaissance:
+      if (congestion) {
+        crSetPhase(CarefulResumePhase::Normal);
+        return false;
+      }
+      crReconAckedBytes_ += ack.ackedBytes;
+      return false;
+    case CarefulResumePhase::Unvalidated:
+      if (congestion) {
+        lastCECount_ = ack.ecnCECount;
+        crEnterSafeRetreat(ack.ackTime);
+        return true;
+      }
+      // cwnd is held at the jump value; acks only grow the PipeSize.
+      crPipeSize_ += ack.ackedBytes;
+      if ((crUnvalidatedStart_.has_value() &&
+           ack.largestNewlyAckedPacketSentTime >= *crUnvalidatedStart_) ||
+          (crUnvalidatedStart_.has_value() &&
+           ack.ackTime - *crUnvalidatedStart_ >= conn_.lossState.srtt)) {
+        crExitUnvalidated();
+      }
+      return true;
+    case CarefulResumePhase::Validating:
+      if (congestion) {
+        lastCECount_ = ack.ecnCECount;
+        crEnterSafeRetreat(ack.ackTime);
+        return true;
+      }
+      crPipeSize_ += ack.ackedBytes;
+      if (acksLast) {
+        crSetPhase(CarefulResumePhase::Normal);
+      }
+      // Normal slow start growth continues in Validating.
+      return false;
+    case CarefulResumePhase::SafeRetreat:
+      lastCECount_ = std::max(lastCECount_, ack.ecnCECount);
+      crPipeSize_ += ack.ackedBytes;
+      if (acksLast) {
+        crExitSafeRetreat();
+      }
+      return true;
+  }
+  folly::assume_unreachable();
+}
+
+void Cubic::crMaybeEnterUnvalidated(TimePoint now) {
+  if (state_ != CubicStates::Hystart) {
+    // Slow start already ended; the saved parameters are not needed.
+    crSetPhase(CarefulResumePhase::Normal);
+    return;
+  }
+  // Wait until the initial window is acknowledged, an RTT sample exists and
+  // the sender is cwnd limited (a rate-limited sender stays in
+  // Reconnaissance).
+  if (crReconAckedBytes_ < crInitCwndBytes() ||
+      !conn_.lossState.maybeLrtt.has_value() || !isCwndBlocked_) {
+    return;
+  }
+  if (conn_.lossState.mrtt <= crSavedRtt_ / 2) {
+    // Path RTT changed too much for the saved cwnd to be valid.
+    crSetPhase(CarefulResumePhase::Normal);
+    return;
+  }
+  uint64_t jumpCwnd = std::min(
+      crSavedCwndBytes_ / 2,
+      conn_.transportSettings.maxCwndInMss * conn_.udpSendPacketLen);
+  if (jumpCwnd <= cwndBytes_) {
+    crSetPhase(CarefulResumePhase::Normal);
+    return;
+  }
+  crPipeSize_ = conn_.lossState.inflightBytes;
+  cwndBytes_ = jumpCwnd;
+  crUnvalidatedStart_ = now;
+  crSetPhase(CarefulResumePhase::Unvalidated);
+  QUIC_STATS(conn_.statsCallback, onCongestionControllerResumed);
+}
+
+void Cubic::crExitUnvalidated() {
+  auto flightSize = conn_.lossState.inflightBytes;
+  if (flightSize < crInitCwndBytes() || flightSize <= crPipeSize_) {
+    // Rate limited: the jump was not used. Reset cwnd to the used capacity.
+    cwndBytes_ = boundedCwnd(
+        std::max(crPipeSize_, crInitCwndBytes()),
+        conn_.udpSendPacketLen,
+        conn_.transportSettings.maxCwndInMss,
+        conn_.transportSettings.minCwndInMss);
+    crSetPhase(CarefulResumePhase::Normal);
+    return;
+  }
+  cwndBytes_ = flightSize;
+  crSetPhase(CarefulResumePhase::Validating);
+}
+
+void Cubic::crEnterSafeRetreat(TimePoint lossTime) {
+  auto minCwnd = conn_.transportSettings.minCwndInMss * conn_.udpSendPacketLen;
+  cwndBytes_ = std::max(crPipeSize_ / 2, minCwnd);
+  ssthresh_ = cwndBytes_;
+  steadyState_.lastMaxCwndBytes = cwndBytes_;
+  steadyState_.lastReductionTime = lossTime;
+  if (steadyState_.tcpFriendly) {
+    steadyState_.estRenoCwnd = cwndBytes_;
+  }
+  recoveryState_.endOfRecovery = Clock::now();
+  hystartState_.inRttRound = false;
+  state_ = CubicStates::FastRecovery;
+  crSetPhase(CarefulResumePhase::SafeRetreat);
+  if (conn_.pacer) {
+    conn_.pacer->refreshPacingRate(
+        cwndBytes_ * pacingGain(), conn_.lossState.srtt);
+  }
+}
+
+void Cubic::crExitSafeRetreat() {
+  auto minCwnd = conn_.transportSettings.minCwndInMss * conn_.udpSendPacketLen;
+  // ssthresh is at most PipeSize * Beta, using Cubic's beta.
+  ssthresh_ = std::max(
+      static_cast<uint64_t>(crPipeSize_ * steadyState_.reductionFactor),
+      minCwnd);
+  steadyState_.lastMaxCwndBytes.reset();
+  steadyState_.lastReductionTime.reset();
+  if (cwndBytes_ < ssthresh_) {
+    state_ = CubicStates::Hystart;
+    hystartState_.inRttRound = false;
+    hystartState_.found = HystartFound::No;
+    hystartState_.currSampledRtt.reset();
+  } else {
+    state_ = CubicStates::Steady;
+  }
+  crSetPhase(CarefulResumePhase::Normal);
+}
+
+folly::StringPiece carefulResumePhaseToString(CarefulResumePhase phase) {
+  switch (phase) {
+    case CarefulResumePhase::Normal:
+      return "normal";
+    case CarefulResumePhase::Reconnaissance:
+      return "reconnaissance";
+    case CarefulResumePhase::Unvalidated:
+      return "unvalidated";
+    case CarefulResumePhase::Validating:
+      return "validating";
+    case CarefulResumePhase::SafeRetreat:
+      return "safe_retreat";
+  }
+  folly::assume_unreachable();
 }
 
 folly::StringPiece cubicStateToString(CubicStates state) {
