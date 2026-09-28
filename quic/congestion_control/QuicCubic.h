@@ -24,6 +24,15 @@ enum class CubicStates : uint8_t {
   FastRecovery,
 };
 
+// Careful Resume phases (draft-ietf-tsvwg-careful-resume).
+enum class CarefulResumePhase : uint8_t {
+  Normal,
+  Reconnaissance,
+  Unvalidated,
+  Validating,
+  SafeRetreat,
+};
+
 /**
  *
  *  |--------|                              |-----|
@@ -111,6 +120,15 @@ class Cubic : public CongestionController {
         experimental;
   }
 
+  void setResumeHints(
+      uint64_t cwndHintBytes,
+      const Optional<std::chrono::milliseconds>& rttHint =
+          std::nullopt) override;
+
+  [[nodiscard]] CarefulResumePhase carefulResumePhase() const noexcept {
+    return crPhase_;
+  }
+
  protected:
   CubicStates state_{CubicStates::Hystart};
 
@@ -137,6 +155,16 @@ class Cubic : public CongestionController {
   uint64_t calculateCubicCwnd(int64_t delta) noexcept;
 
   bool isRecovered(TimePoint packetSentTime) noexcept;
+
+  // Careful Resume. Returns true if the ack was fully handled by CR and the
+  // normal Cubic state machine must not grow cwnd for it.
+  bool crOnPacketAcked(const AckEvent& ack);
+  void crMaybeEnterUnvalidated(TimePoint now);
+  void crExitUnvalidated();
+  void crEnterSafeRetreat(TimePoint lossTime);
+  void crExitSafeRetreat();
+  void crSetPhase(CarefulResumePhase phase);
+  [[nodiscard]] uint64_t crInitCwndBytes() const noexcept;
 
   QuicConnectionStateBase& conn_;
   uint64_t cwndBytes_;
@@ -203,8 +231,26 @@ class Cubic : public CongestionController {
 
   TimePoint l4sCwndReducedTimestamp_;
   uint64_t lastCECount_{0};
+
+  // Careful Resume state
+  CarefulResumePhase crPhase_{CarefulResumePhase::Normal};
+  bool crHintsSet_{false};
+  uint64_t crSavedCwndBytes_{0};
+  std::chrono::microseconds crSavedRtt_{0};
+  // Bytes acked while in Reconnaissance (to confirm the IW was delivered)
+  uint64_t crReconAckedBytes_{0};
+  // Validated capacity measured from acked data
+  uint64_t crPipeSize_{0};
+  // Time the Unvalidated phase was entered. Packets sent at or after this are
+  // unvalidated.
+  Optional<TimePoint> crUnvalidatedStart_;
+  // Sent time of the last packet sent in the Unvalidated phase.
+  Optional<TimePoint> crLastUnvalidatedSentTime_;
+  // Sent time of the last packet sent in the Unvalidated or Validating phase.
+  Optional<TimePoint> crLastSentTime_;
 };
 
 folly::StringPiece cubicStateToString(CubicStates state);
+folly::StringPiece carefulResumePhaseToString(CarefulResumePhase phase);
 
 } // namespace quic

@@ -16,6 +16,7 @@ quic_add_test(TARGET CongestionControllerTests
   Bbr2Test.cpp
   CongestionControlFunctionsTest.cpp
   CopaTest.cpp
+  CubicCarefulResumeTest.cpp
   CubicHystartTest.cpp
   CubicRecoveryTest.cpp
   CubicStateTest.cpp
