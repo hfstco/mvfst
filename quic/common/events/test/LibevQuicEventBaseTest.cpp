@@ -12,7 +12,7 @@
 
 using namespace ::testing;
 
-struct EvLoop : public quic::LibevQuicEventBase::EvLoopWeak {
+struct EvLoop : public quic::LibevQuicEventBase::EvLoopHolder {
   EvLoop() : evLoop_(ev_loop_new(0)) {}
 
   ~EvLoop() override {
@@ -61,4 +61,22 @@ TEST(LibevQuicEventBaseTest, TestDestroyEvbWithPendingFunctionLoopCallback) {
   // The function callback wrapper should not leak.
   qEvb->runInLoop([&] { FAIL() << "This should not be called"; });
   qEvb.reset();
+}
+
+TEST(
+    LibevQuicEventBaseTest,
+    PrepareCallbackBeforeSharedOwnershipDoesNotBreakEventBase) {
+  auto loop = std::make_unique<EvLoop>();
+  auto* evLoop = loop->get();
+  auto unownedEvb = std::make_unique<quic::LibevQuicEventBase>(std::move(loop));
+
+  unownedEvb->setLoopCallbackPriority(0);
+  ev_run(evLoop, EVRUN_NOWAIT);
+
+  auto qEvb = std::shared_ptr<quic::LibevQuicEventBase>(std::move(unownedEvb));
+  bool callbackRan = false;
+  qEvb->runInLoop([&] { callbackRan = true; });
+  qEvb->loop();
+
+  EXPECT_TRUE(callbackRan);
 }

@@ -82,14 +82,9 @@ Optional<TransportKnobParams> parseTransportKnobs(
       }
       switch (*knobId) {
         case TransportKnobParamId::FORCIBLY_SET_UDP_PAYLOAD_SIZE:
-        case TransportKnobParamId::CC_EXPERIMENTAL:
         case TransportKnobParamId::MAX_PACING_RATE_KNOB:
-        case TransportKnobParamId::PACER_EXPERIMENTAL:
-        case TransportKnobParamId::SHORT_HEADER_PADDING_KNOB:
-        case TransportKnobParamId::FIXED_SHORT_HEADER_PADDING_KNOB:
         case TransportKnobParamId::KEEPALIVE_ENABLED:
         case TransportKnobParamId::PACING_TIMER_TICK:
-        case TransportKnobParamId::DEFAULT_STREAM_PRIORITY:
         case TransportKnobParamId::CONNECTION_MIGRATION:
         case TransportKnobParamId::KEY_UPDATE_INTERVAL:
         case TransportKnobParamId::AUTOTUNE_RECV_STREAM_FLOW_CONTROL:
@@ -99,7 +94,8 @@ Optional<TransportKnobParams> parseTransportKnobs(
         case TransportKnobParamId::EXCESS_CWND_PCT_FOR_IMMINENT_STREAMS:
         case TransportKnobParamId::SEND_CLOSE_ON_IDLE_TIMEOUT:
         case TransportKnobParamId::MAX_PTO:
-        case TransportKnobParamId::SCONE_KNOB: {
+        case TransportKnobParamId::SCONE_KNOB:
+        case TransportKnobParamId::ADAPTIVE_LOSS_REORDERING_THRESHOLDS: {
           // uint64_t knobs
           auto parsed = parseAsUint64(val);
           if (!parsed) {
@@ -121,9 +117,7 @@ Optional<TransportKnobParams> parseTransportKnobs(
         }
         case TransportKnobParamId::CC_ALGORITHM_KNOB:
         case TransportKnobParamId::MAX_PACING_RATE_KNOB_SEQUENCED:
-        case TransportKnobParamId::ACK_FREQUENCY_POLICY:
         case TransportKnobParamId::CC_CONFIG:
-        case TransportKnobParamId::EGRESS_POLICER_CONFIG:
         case TransportKnobParamId::RX_PACKETS_BEFORE_ACK: {
           // string knobs
           if (val.type() != folly::dynamic::Type::STRING) {

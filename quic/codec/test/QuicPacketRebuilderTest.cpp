@@ -5,6 +5,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include <chrono>
+#include <string>
+
 #include <folly/portability/GTest.h>
 
 #include <quic/codec/QuicPacketBuilder.h>
@@ -18,6 +21,7 @@
 #include <quic/state/stream/StreamSendHandlers.h>
 
 using namespace testing;
+using namespace std::chrono_literals;
 
 namespace quic::test {
 
@@ -36,6 +40,38 @@ OutstandingPacketWrapper makeDummyOutstandingPacket(
       0 /* writeCount */,
       OutstandingPacketMetadata::DetailsPerStream());
   return packet;
+}
+
+PacketBuilderInterface::Packet buildSingleStreamPacket(
+    StreamId streamId,
+    uint64_t offset,
+    folly::StringPiece data,
+    bool fin,
+    bool addTrailingPing = false,
+    uint32_t packetCapacity = kDefaultUDPSendPacketLen) {
+  RegularQuicPacketBuilder builder(
+      packetCapacity,
+      ShortHeader(ProtectionType::KeyPhaseZero, getTestConnectionId(), 0),
+      0);
+  CHECK(!builder.encodePacketHeader().hasError());
+  auto headerResult = writeStreamFrameHeader(
+      builder,
+      streamId,
+      offset,
+      data.size(),
+      data.size(),
+      fin,
+      data.empty() ? Optional<bool>(false) : Optional<bool>(!addTrailingPing));
+  CHECK(!headerResult.hasError());
+  CHECK(headerResult.value().has_value());
+  CHECK_EQ(*headerResult.value(), data.size());
+  if (!data.empty()) {
+    builder.push(reinterpret_cast<const uint8_t*>(data.data()), data.size());
+  }
+  if (addTrailingPing) {
+    CHECK(writeFrame(PingFrame{}, builder).has_value());
+  }
+  return std::move(builder).buildPacket();
 }
 
 class QuicPacketRebuilderTest : public Test {};
@@ -577,6 +613,265 @@ TEST_F(QuicPacketRebuilderTest, PurePingWillRebuild) {
   EXPECT_EQ(1, conn.outstandings.numClonedPackets());
 }
 
+TEST_F(QuicPacketRebuilderTest, TimestampFrameIsDroppedDuringRebuild) {
+  ShortHeader originalHeader(
+      ProtectionType::KeyPhaseZero, getTestConnectionId(), 0);
+  RegularQuicPacketBuilder originalBuilder(
+      kDefaultUDPSendPacketLen, std::move(originalHeader), 0);
+  ASSERT_FALSE(originalBuilder.encodePacketHeader().hasError());
+  ASSERT_FALSE(writeFrame(PingFrame(), originalBuilder).hasError());
+  ASSERT_FALSE(writeFrame(TimestampFrame(1234), originalBuilder).hasError());
+  auto originalPacket = std::move(originalBuilder).buildPacket();
+  auto outstandingPacket =
+      makeDummyOutstandingPacket(originalPacket.packet, 50);
+
+  QuicServerConnectionState conn(
+      FizzServerQuicHandshakeContext::Builder().build());
+  ShortHeader rebuiltHeader(
+      ProtectionType::KeyPhaseZero, getTestConnectionId(), 1);
+  RegularQuicPacketBuilder rebuiltBuilder(
+      kDefaultUDPSendPacketLen, std::move(rebuiltHeader), 0);
+  ASSERT_FALSE(rebuiltBuilder.encodePacketHeader().hasError());
+  PacketRebuilder rebuilder(rebuiltBuilder, conn);
+
+  auto rebuildResult = rebuilder.rebuildFromPacket(outstandingPacket);
+  ASSERT_FALSE(rebuildResult.hasError());
+  ASSERT_TRUE(rebuildResult.value().has_value());
+  auto rebuiltPacket = std::move(rebuiltBuilder).buildPacket();
+  ASSERT_EQ(rebuiltPacket.packet.frames.size(), 1);
+  EXPECT_NE(rebuiltPacket.packet.frames.front().asPingFrame(), nullptr);
+}
+
+struct TimestampRebuildPolicyCase {
+  const char* name;
+  TimestampFrameWriteMode writeMode;
+  bool originalHasTimestamp;
+  bool fillPacket;
+  bool expectFreshTimestamp;
+};
+
+class TimestampRebuildPolicyTest
+    : public QuicPacketRebuilderTest,
+      public WithParamInterface<TimestampRebuildPolicyCase> {};
+
+TEST_P(TimestampRebuildPolicyTest, PreservesRebuiltStreamBeforeFreshTimestamp) {
+  const auto& testCase = GetParam();
+  constexpr uint64_t kOriginalTimestamp = 1;
+  constexpr uint64_t kPacketCapacity = 128;
+
+  QuicServerConnectionState conn(
+      FizzServerQuicHandshakeContext::Builder().build());
+  ASSERT_NE(conn.streamManager, nullptr);
+  if (conn.streamManager == nullptr) {
+    return;
+  }
+  auto& streamManager = *conn.streamManager;
+  ASSERT_FALSE(streamManager.setMaxLocalBidirectionalStreams(1).hasError());
+  auto* stream = streamManager.createNextBidirectionalStream().value();
+  ASSERT_NE(stream, nullptr);
+  if (stream == nullptr) {
+    return;
+  }
+
+  RegularQuicPacketBuilder originalBuilder(
+      kPacketCapacity,
+      ShortHeader(ProtectionType::KeyPhaseZero, getTestConnectionId(), 0),
+      0);
+  ASSERT_FALSE(originalBuilder.encodePacketHeader().hasError());
+
+  PacketBuilderInterface* streamBuilder = &originalBuilder;
+  Optional<PacketBuilderWrapper> timestampReservation;
+  if (testCase.fillPacket && testCase.originalHasTimestamp) {
+    auto timestampSize =
+        getTimestampFrameEncodedSize(TimestampFrame(kOriginalTimestamp));
+    ASSERT_FALSE(timestampSize.hasError());
+    ASSERT_GE(originalBuilder.remainingSpaceInPkt(), timestampSize.value());
+    timestampReservation.emplace(
+        originalBuilder,
+        originalBuilder.remainingSpaceInPkt() - timestampSize.value());
+    streamBuilder = &*timestampReservation;
+  }
+
+  const uint64_t requestedDataLength =
+      testCase.fillPacket ? kPacketCapacity : 1;
+  auto streamResult = writeStreamFrameHeader(
+      *streamBuilder,
+      stream->id,
+      0,
+      requestedDataLength,
+      requestedDataLength,
+      false,
+      !testCase.originalHasTimestamp);
+  ASSERT_FALSE(streamResult.hasError());
+  ASSERT_TRUE(streamResult.value().has_value());
+  const auto streamLength = *streamResult.value();
+  ASSERT_GT(streamLength, 0);
+  auto streamData = folly::IOBuf::copyBuffer(std::string(streamLength, 'x'));
+  ASSERT_NE(streamData, nullptr);
+  if (streamData == nullptr) {
+    return;
+  }
+  writeStreamFrameData(*streamBuilder, streamData->clone(), streamLength);
+
+  if (testCase.originalHasTimestamp) {
+    ASSERT_FALSE(writeFrame(TimestampFrame(kOriginalTimestamp), originalBuilder)
+                     .hasError());
+  }
+  if (testCase.fillPacket) {
+    EXPECT_EQ(0, originalBuilder.remainingSpaceInPkt());
+  }
+  auto originalPacket = std::move(originalBuilder).buildPacket();
+  ASSERT_EQ(
+      testCase.originalHasTimestamp ? 2 : 1,
+      originalPacket.packet.frames.size());
+  auto outstanding = makeDummyOutstandingPacket(originalPacket.packet, 50);
+
+  stream->retransmissionBuffer.emplace(
+      std::piecewise_construct,
+      std::forward_as_tuple(0),
+      std::forward_as_tuple(
+          std::make_unique<WriteStreamBuffer>(
+              ChainedByteRangeHead(streamData), 0, false)));
+  conn.peerTimestampFrameState.canReceive = true;
+  conn.transportSettings.oneRttTimestampFrameWriteMode = testCase.writeMode;
+  conn.transportSettings.timestampFrameTimestampExponent = 0;
+  conn.connectionTime = Clock::now() - 1s;
+  const auto minimumFreshTimestamp = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          Clock::now() - conn.connectionTime)
+          .count());
+  if (testCase.fillPacket && testCase.originalHasTimestamp) {
+    auto originalSize =
+        getTimestampFrameEncodedSize(TimestampFrame(kOriginalTimestamp));
+    auto freshSize =
+        getTimestampFrameEncodedSize(TimestampFrame(minimumFreshTimestamp));
+    ASSERT_FALSE(originalSize.hasError());
+    ASSERT_FALSE(freshSize.hasError());
+    ASSERT_GT(freshSize.value(), originalSize.value());
+  }
+
+  RegularQuicPacketBuilder rebuiltBuilder(
+      kPacketCapacity,
+      ShortHeader(ProtectionType::KeyPhaseZero, getTestConnectionId(), 1),
+      0);
+  ASSERT_FALSE(rebuiltBuilder.encodePacketHeader().hasError());
+  PacketRebuilder rebuilder(rebuiltBuilder, conn);
+  auto rebuildResult = rebuilder.rebuildFromPacket(outstanding);
+  ASSERT_FALSE(rebuildResult.hasError());
+  ASSERT_TRUE(rebuildResult.value().has_value());
+
+  auto rebuiltPacket = std::move(rebuiltBuilder).buildPacket();
+  ASSERT_EQ(
+      testCase.expectFreshTimestamp ? 2 : 1,
+      rebuiltPacket.packet.frames.size());
+  size_t timestampCount = 0;
+  const WriteStreamFrame* rebuiltStream = nullptr;
+  for (const auto& frame : rebuiltPacket.packet.frames) {
+    if (const auto* timestampFrame = frame.asTimestampFrame()) {
+      ++timestampCount;
+      if (testCase.originalHasTimestamp) {
+        EXPECT_NE(kOriginalTimestamp, timestampFrame->timestamp);
+      }
+      EXPECT_GE(timestampFrame->timestamp, minimumFreshTimestamp);
+    } else if (const auto* streamFrame = frame.asWriteStreamFrame()) {
+      rebuiltStream = streamFrame;
+    }
+  }
+  ASSERT_NE(nullptr, rebuiltStream);
+  if (rebuiltStream == nullptr) {
+    return;
+  }
+  EXPECT_EQ(streamLength, rebuiltStream->len);
+  EXPECT_EQ(testCase.expectFreshTimestamp ? 1 : 0, timestampCount);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    WriteModeAndCapacity,
+    TimestampRebuildPolicyTest,
+    Values(
+        TimestampRebuildPolicyCase{
+            "OpportunisticRoomWithoutOriginal",
+            TimestampFrameWriteMode::Opportunistic,
+            false,
+            false,
+            true},
+        TimestampRebuildPolicyCase{
+            "OpportunisticRoomWithOriginal",
+            TimestampFrameWriteMode::Opportunistic,
+            true,
+            false,
+            true},
+        TimestampRebuildPolicyCase{
+            "OpportunisticFullWithoutOriginal",
+            TimestampFrameWriteMode::Opportunistic,
+            false,
+            true,
+            false},
+        TimestampRebuildPolicyCase{
+            "OpportunisticFullWithSmallerOriginal",
+            TimestampFrameWriteMode::Opportunistic,
+            true,
+            true,
+            false},
+        TimestampRebuildPolicyCase{
+            "PrioritizedRoomWithoutOriginal",
+            TimestampFrameWriteMode::Prioritized,
+            false,
+            false,
+            true},
+        TimestampRebuildPolicyCase{
+            "PrioritizedRoomWithOriginal",
+            TimestampFrameWriteMode::Prioritized,
+            true,
+            false,
+            true},
+        TimestampRebuildPolicyCase{
+            "PrioritizedFullWithoutOriginal",
+            TimestampFrameWriteMode::Prioritized,
+            false,
+            true,
+            false},
+        TimestampRebuildPolicyCase{
+            "PrioritizedFullWithSmallerOriginal",
+            TimestampFrameWriteMode::Prioritized,
+            true,
+            true,
+            false}),
+    [](const TestParamInfo<TimestampRebuildPolicyCase>& info) {
+      return info.param.name;
+    });
+
+TEST_F(QuicPacketRebuilderTest, TimestampOnlyPacketDoesNotRebuild) {
+  RegularQuicPacketBuilder originalBuilder(
+      kDefaultUDPSendPacketLen,
+      ShortHeader(ProtectionType::KeyPhaseZero, getTestConnectionId(), 0),
+      0);
+  ASSERT_FALSE(originalBuilder.encodePacketHeader().hasError());
+  ASSERT_FALSE(writeFrame(TimestampFrame(1), originalBuilder).hasError());
+  auto originalPacket = std::move(originalBuilder).buildPacket();
+  ASSERT_EQ(1, originalPacket.packet.frames.size());
+  auto outstanding = makeDummyOutstandingPacket(originalPacket.packet, 50);
+
+  QuicServerConnectionState conn(
+      FizzServerQuicHandshakeContext::Builder().build());
+  conn.peerTimestampFrameState.canReceive = true;
+  conn.transportSettings.oneRttTimestampFrameWriteMode =
+      TimestampFrameWriteMode::Opportunistic;
+  conn.connectionTime = Clock::now() - 1s;
+  RegularQuicPacketBuilder rebuiltBuilder(
+      kDefaultUDPSendPacketLen,
+      ShortHeader(ProtectionType::KeyPhaseZero, getTestConnectionId(), 1),
+      0);
+  ASSERT_FALSE(rebuiltBuilder.encodePacketHeader().hasError());
+  PacketRebuilder rebuilder(rebuiltBuilder, conn);
+
+  auto rebuildResult = rebuilder.rebuildFromPacket(outstanding);
+  ASSERT_FALSE(rebuildResult.hasError());
+  EXPECT_FALSE(rebuildResult.value().has_value());
+  EXPECT_FALSE(outstanding.maybeClonedPacketIdentifier.has_value());
+  EXPECT_TRUE(std::move(rebuiltBuilder).buildPacket().packet.frames.empty());
+}
+
 TEST_F(QuicPacketRebuilderTest, LastStreamFrameSkipLen) {
   QuicServerConnectionState conn(
       FizzServerQuicHandshakeContext::Builder().build());
@@ -740,5 +1035,230 @@ TEST_F(QuicPacketRebuilderTest, LastStreamFrameFinOnlySkipLen) {
   auto rebuildResult = rebuilder.rebuildFromPacket(outstandingPacket);
   ASSERT_FALSE(rebuildResult.hasError());
   ASSERT_TRUE(rebuildResult.value().has_value());
+}
+
+TEST_F(
+    QuicPacketRebuilderTest,
+    UnifiedStreamCloneWritesOriginalChainedSubrange) {
+  QuicServerConnectionState conn(
+      FizzServerQuicHandshakeContext::Builder().build());
+  ASSERT_FALSE(
+      conn.streamManager->setMaxLocalBidirectionalStreams(1).hasError());
+  auto* stream = conn.streamManager->createNextBidirectionalStream().value();
+  ASSERT_NE(stream, nullptr);
+
+  stream->streamSendBuffer.emplace();
+  auto sendData = folly::IOBuf::copyBuffer("0123");
+  sendData->appendChain(folly::IOBuf::copyBuffer("456789"));
+  ASSERT_TRUE(stream->streamSendBuffer->append(std::move(sendData), true));
+  ASSERT_TRUE(stream->streamSendBuffer->markNewDataSent(
+      {.offset = 0, .len = 10, .fin = true}));
+
+  auto originalPacket = buildSingleStreamPacket(stream->id, 3, "3456789", true);
+  auto outstanding = makeDummyOutstandingPacket(originalPacket.packet, 1000);
+  RegularQuicPacketBuilder rebuiltBuilder(
+      kDefaultUDPSendPacketLen,
+      ShortHeader(ProtectionType::KeyPhaseZero, getTestConnectionId(), 1),
+      0);
+  ASSERT_FALSE(rebuiltBuilder.encodePacketHeader().hasError());
+  PacketRebuilder rebuilder(rebuiltBuilder, conn);
+
+  auto rebuildResult = rebuilder.rebuildFromPacket(outstanding);
+  ASSERT_FALSE(rebuildResult.hasError());
+  ASSERT_TRUE(rebuildResult.value().has_value());
+  auto rebuiltPacket = std::move(rebuiltBuilder).buildPacket();
+  ASSERT_EQ(1, rebuiltPacket.packet.frames.size());
+  const auto* rebuiltFrame =
+      rebuiltPacket.packet.frames.front().asWriteStreamFrame();
+  ASSERT_NE(rebuiltFrame, nullptr);
+  EXPECT_EQ(stream->id, rebuiltFrame->streamId);
+  EXPECT_EQ(3, rebuiltFrame->offset);
+  EXPECT_EQ(7, rebuiltFrame->len);
+  EXPECT_TRUE(rebuiltFrame->fin);
+  EXPECT_TRUE(folly::IOBufEqualTo()(originalPacket.body, rebuiltPacket.body));
+}
+
+TEST_F(QuicPacketRebuilderTest, UnifiedStreamCloneSkipsPartiallyAckedFrame) {
+  QuicServerConnectionState conn(
+      FizzServerQuicHandshakeContext::Builder().build());
+  ASSERT_FALSE(
+      conn.streamManager->setMaxLocalBidirectionalStreams(1).hasError());
+  auto* stream = conn.streamManager->createNextBidirectionalStream().value();
+  ASSERT_NE(stream, nullptr);
+
+  stream->streamSendBuffer.emplace();
+  auto sendData = folly::IOBuf::copyBuffer("0123");
+  sendData->appendChain(folly::IOBuf::copyBuffer("456789"));
+  ASSERT_TRUE(stream->streamSendBuffer->append(std::move(sendData), false));
+  ASSERT_TRUE(stream->streamSendBuffer->markNewDataSent(
+      {.offset = 0, .len = 10, .fin = false}));
+  auto ackResult = stream->streamSendBuffer->markAcked(
+      {.offset = 3, .len = 2, .fin = false});
+  ASSERT_TRUE(ackResult.has_value());
+  EXPECT_EQ(2, ackResult->newlyAckedBytes);
+
+  auto originalPacket = buildSingleStreamPacket(stream->id, 3, "34567", false);
+  auto outstanding = makeDummyOutstandingPacket(originalPacket.packet, 1000);
+  RegularQuicPacketBuilder rebuiltBuilder(
+      kDefaultUDPSendPacketLen,
+      ShortHeader(ProtectionType::KeyPhaseZero, getTestConnectionId(), 1),
+      0);
+  ASSERT_FALSE(rebuiltBuilder.encodePacketHeader().hasError());
+  PacketRebuilder rebuilder(rebuiltBuilder, conn);
+
+  auto rebuildResult = rebuilder.rebuildFromPacket(outstanding);
+  ASSERT_FALSE(rebuildResult.hasError());
+  EXPECT_FALSE(rebuildResult.value().has_value());
+  auto rebuiltPacket = std::move(rebuiltBuilder).buildPacket();
+  EXPECT_TRUE(rebuiltPacket.packet.frames.empty());
+  EXPECT_TRUE(rebuiltPacket.body.empty());
+}
+
+TEST_F(QuicPacketRebuilderTest, UnifiedStreamClonePreservesFinOnlyFrame) {
+  QuicServerConnectionState conn(
+      FizzServerQuicHandshakeContext::Builder().build());
+  ASSERT_FALSE(
+      conn.streamManager->setMaxLocalBidirectionalStreams(1).hasError());
+  auto* stream = conn.streamManager->createNextBidirectionalStream().value();
+  ASSERT_NE(stream, nullptr);
+
+  stream->streamSendBuffer.emplace();
+  ASSERT_TRUE(stream->streamSendBuffer->append(nullptr, true));
+  ASSERT_TRUE(stream->streamSendBuffer->markNewDataSent(
+      {.offset = 0, .len = 0, .fin = true}));
+
+  auto originalPacket = buildSingleStreamPacket(stream->id, 0, "", true);
+  auto outstanding = makeDummyOutstandingPacket(originalPacket.packet, 1000);
+  RegularQuicPacketBuilder rebuiltBuilder(
+      kDefaultUDPSendPacketLen,
+      ShortHeader(ProtectionType::KeyPhaseZero, getTestConnectionId(), 1),
+      0);
+  ASSERT_FALSE(rebuiltBuilder.encodePacketHeader().hasError());
+  PacketRebuilder rebuilder(rebuiltBuilder, conn);
+
+  auto rebuildResult = rebuilder.rebuildFromPacket(outstanding);
+  ASSERT_FALSE(rebuildResult.hasError());
+  ASSERT_TRUE(rebuildResult.value().has_value());
+  auto rebuiltPacket = std::move(rebuiltBuilder).buildPacket();
+  ASSERT_EQ(1, rebuiltPacket.packet.frames.size());
+  const auto* rebuiltFrame =
+      rebuiltPacket.packet.frames.front().asWriteStreamFrame();
+  ASSERT_NE(rebuiltFrame, nullptr);
+  EXPECT_EQ(0, rebuiltFrame->len);
+  EXPECT_TRUE(rebuiltFrame->fin);
+  EXPECT_TRUE(folly::IOBufEqualTo()(originalPacket.body, rebuiltPacket.body));
+}
+
+TEST_F(QuicPacketRebuilderTest, UnifiedStreamCloneRequiresCompleteCapacity) {
+  QuicServerConnectionState conn(
+      FizzServerQuicHandshakeContext::Builder().build());
+  ASSERT_FALSE(
+      conn.streamManager->setMaxLocalBidirectionalStreams(1).hasError());
+  auto* stream = conn.streamManager->createNextBidirectionalStream().value();
+  ASSERT_NE(stream, nullptr);
+
+  constexpr folly::StringPiece kData = "0123456789";
+  stream->streamSendBuffer.emplace();
+  ASSERT_TRUE(
+      stream->streamSendBuffer->append(folly::IOBuf::copyBuffer(kData), false));
+  ASSERT_TRUE(stream->streamSendBuffer->markNewDataSent(
+      {.offset = 0, .len = kData.size(), .fin = false}));
+
+  auto originalPacket = buildSingleStreamPacket(stream->id, 0, kData, false);
+  auto outstanding = makeDummyOutstandingPacket(originalPacket.packet, 1000);
+  const auto rebuiltCapacity =
+      originalPacket.header.computeChainDataLength() + kData.size();
+  RegularQuicPacketBuilder rebuiltBuilder(
+      static_cast<uint32_t>(rebuiltCapacity),
+      ShortHeader(ProtectionType::KeyPhaseZero, getTestConnectionId(), 1),
+      0);
+  ASSERT_FALSE(rebuiltBuilder.encodePacketHeader().hasError());
+  PacketRebuilder rebuilder(rebuiltBuilder, conn);
+
+  auto rebuildResult = rebuilder.rebuildFromPacket(outstanding);
+  ASSERT_FALSE(rebuildResult.hasError());
+  EXPECT_FALSE(rebuildResult.value().has_value());
+  auto rebuiltPacket = std::move(rebuiltBuilder).buildPacket();
+  EXPECT_TRUE(rebuiltPacket.packet.frames.empty());
+  EXPECT_TRUE(rebuiltPacket.body.empty());
+}
+
+TEST_F(
+    QuicPacketRebuilderTest,
+    UnifiedStreamCloneRejectsLengthEncodingBoundaryWithoutMutation) {
+  QuicServerConnectionState conn(
+      FizzServerQuicHandshakeContext::Builder().build());
+  ASSERT_FALSE(
+      conn.streamManager->setMaxLocalBidirectionalStreams(1).hasError());
+  auto* stream = conn.streamManager->createNextBidirectionalStream().value();
+  ASSERT_NE(stream, nullptr);
+
+  const std::string data(kTwoByteLimit - 1, 'x');
+  stream->streamSendBuffer.emplace();
+  ASSERT_TRUE(
+      stream->streamSendBuffer->append(folly::IOBuf::copyBuffer(data), false));
+  ASSERT_TRUE(stream->streamSendBuffer->markNewDataSent(
+      {.offset = 0, .len = data.size(), .fin = false}));
+
+  auto originalPacket = buildSingleStreamPacket(
+      stream->id,
+      0,
+      data,
+      false,
+      true,
+      static_cast<uint32_t>(data.size() + 64));
+  auto outstanding = makeDummyOutstandingPacket(originalPacket.packet, 1000);
+  const auto streamIdSize = QuicInteger(stream->id).getSize();
+  ASSERT_FALSE(streamIdSize.hasError());
+  const auto rebuiltCapacity = originalPacket.header.computeChainDataLength() +
+      sizeof(uint8_t) + streamIdSize.value() + 2 + data.size();
+  RegularQuicPacketBuilder rebuiltBuilder(
+      static_cast<uint32_t>(rebuiltCapacity),
+      ShortHeader(ProtectionType::KeyPhaseZero, getTestConnectionId(), 1),
+      0);
+  ASSERT_FALSE(rebuiltBuilder.encodePacketHeader().hasError());
+  PacketRebuilder rebuilder(rebuiltBuilder, conn);
+
+  auto rebuildResult = rebuilder.rebuildFromPacket(outstanding);
+
+  ASSERT_FALSE(rebuildResult.hasError());
+  EXPECT_FALSE(rebuildResult.value().has_value());
+  auto rebuiltPacket = std::move(rebuiltBuilder).buildPacket();
+  EXPECT_TRUE(rebuiltPacket.packet.frames.empty());
+  EXPECT_TRUE(rebuiltPacket.body.empty());
+}
+
+TEST_F(QuicPacketRebuilderTest, UnifiedStreamCloneSkipsRetiredData) {
+  QuicServerConnectionState conn(
+      FizzServerQuicHandshakeContext::Builder().build());
+  ASSERT_FALSE(
+      conn.streamManager->setMaxLocalBidirectionalStreams(1).hasError());
+  auto* stream = conn.streamManager->createNextBidirectionalStream().value();
+  ASSERT_NE(stream, nullptr);
+
+  constexpr folly::StringPiece kData = "retired";
+  stream->streamSendBuffer.emplace();
+  ASSERT_TRUE(
+      stream->streamSendBuffer->append(folly::IOBuf::copyBuffer(kData), false));
+  ASSERT_TRUE(stream->streamSendBuffer->markNewDataSent(
+      {.offset = 0, .len = kData.size(), .fin = false}));
+  ASSERT_TRUE(stream->streamSendBuffer->abandon(
+      {.offset = 0, .len = kData.size(), .fin = false}));
+
+  auto originalPacket = buildSingleStreamPacket(stream->id, 0, kData, false);
+  auto outstanding = makeDummyOutstandingPacket(originalPacket.packet, 1000);
+  RegularQuicPacketBuilder rebuiltBuilder(
+      kDefaultUDPSendPacketLen,
+      ShortHeader(ProtectionType::KeyPhaseZero, getTestConnectionId(), 1),
+      0);
+  ASSERT_FALSE(rebuiltBuilder.encodePacketHeader().hasError());
+  PacketRebuilder rebuilder(rebuiltBuilder, conn);
+
+  auto rebuildResult = rebuilder.rebuildFromPacket(outstanding);
+  ASSERT_FALSE(rebuildResult.hasError());
+  EXPECT_FALSE(rebuildResult.value().has_value());
+  auto rebuiltPacket = std::move(rebuiltBuilder).buildPacket();
+  EXPECT_TRUE(rebuiltPacket.packet.frames.empty());
+  EXPECT_TRUE(rebuiltPacket.body.empty());
 }
 } // namespace quic::test

@@ -27,6 +27,8 @@ namespace quic {
  * controller.
  */
 class Bbr2ProbeRtt : public CongestionController {
+  friend class Bbr2ModularTestPeer;
+
  public:
   explicit Bbr2ProbeRtt(
       QuicConnectionStateBase& conn,
@@ -82,6 +84,7 @@ class Bbr2ProbeRtt : public CongestionController {
  private:
   // Cwnd management
   [[nodiscard]] uint64_t calculateCwnd() const;
+  void finishSpuriousLossUndo();
 
   // ProbeRTT state management
   void enterProbeRtt();
@@ -92,6 +95,8 @@ class Bbr2ProbeRtt : public CongestionController {
 
   QuicConnectionStateBase& conn_;
   std::shared_ptr<Bbr2Shared> shared_;
+  Bbr2State stateBeforeProbeRtt_;
+  float pacingGainBeforeProbeRtt_;
 
   // ProbeRTT execution state
   Optional<TimePoint> probeRttDoneTimestamp_;

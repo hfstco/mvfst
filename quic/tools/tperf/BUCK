@@ -1,4 +1,6 @@
 load("@fbcode//quic:defs.bzl", "mvfst_cpp_binary", "mvfst_cpp_library")
+load("@fbcode_macros//build_defs:build_file_migration.bzl", "fbcode_target")
+load("@fbsource//tools/build_defs:cell_defs.bzl", "get_fbsource_cell")
 
 oncall("traffic_protocols")
 
@@ -37,6 +39,7 @@ mvfst_cpp_library(
     deps = [
         ":pacing_observer",
         "//fizz/crypto:utils",
+        "//fizz/record:record",
         "//folly/io:iobuf",
         "//folly/stats:histogram",
         "//quic/common/test:test_utils",
@@ -82,12 +85,42 @@ mvfst_cpp_library(
     ],
 )
 
+_TPERF_KNOBS_PATCHER_SRCS = (
+    select({
+        "DEFAULT": ["TperfKnobsPatcherXPlat.cpp"],
+        "ovr_config//os/constraints:linux": ["TperfKnobsPatcherFbcode.cpp"],
+    })
+    if get_fbsource_cell() == "fbcode"
+    else ["TperfKnobsPatcherXPlat.cpp"]
+)
+
+_TPERF_KNOBS_PATCHER_DEPS = (
+    select({
+        "DEFAULT": [],
+        "ovr_config//os/constraints:linux": [
+            "//folly:string",
+            "//justknobs:justknobs_patches",
+        ],
+    })
+    if get_fbsource_cell() == "fbcode"
+    else []
+)
+
+mvfst_cpp_library(
+    name = "tperf_knobs_patcher",
+    srcs = _TPERF_KNOBS_PATCHER_SRCS,
+    headers = ["TperfKnobsPatcher.h"],
+    deps = ["//quic/common:mvfst_logging"] + _TPERF_KNOBS_PATCHER_DEPS,
+)
+
 _TPERF_DEPS = [
     ":tperf_client",
+    ":tperf_knobs_patcher",
     ":tperf_server",
     ":tperf_tcp",
     "//folly/init:init",
     "//folly/portability:gflags",
+    "//folly:string",
     "//quic/common:mvfst_logging",
 ] + select({
     "DEFAULT": ["//folly:memcpy-use"],
@@ -108,8 +141,10 @@ mvfst_cpp_binary(
 # they compose with the selected platform/build mode rather than pinning one.
 # use_alt_crypto -> QUIC_DEFAULT_AEAD = XSecCryptoAead; force_alt_crypto -> the
 # bridge always uses xsec (bypasses the JK). No flag; :tperf is the OpenSSL
-# baseline. (xsec is linux-only; on other platforms this builds like :tperf.)
-mvfst_cpp_binary(
+# baseline. fbcode-cell only: the xsec sources live in fbcode/quic/facebook,
+# whose xplat mirror is a header-less shadow stub.
+fbcode_target(
+    _kind = mvfst_cpp_binary,
     name = "tperf-xsec",
     srcs = [
         "tperf.cpp",
@@ -118,7 +153,26 @@ mvfst_cpp_binary(
         "fbcode//quic:use_alt_crypto-enabled",
         "fbcode//quic:force_alt_crypto-enabled",
     ],
-    deps = _TPERF_DEPS,
+    deps = _TPERF_DEPS
+    + [
+        "//xsec_crypto/cpp20/haberdashery/aead/extensions:aes128gcm_zen4_extension",
+    ],
+)
+
+fbcode_target(
+    _kind = mvfst_cpp_binary,
+    name = "tperf-xsec-zen4",
+    srcs = [
+        "tperf.cpp",
+    ],
+    modifiers = [
+        "fbcode//quic:use_alt_crypto-enabled",
+        "fbcode//quic:force_alt_crypto-enabled",
+    ],
+    deps = _TPERF_DEPS
+    + [
+        "//xsec_crypto/cpp20/haberdashery/aead/extensions:aes128gcm_zen4_benchmark_extension",
+    ],
 )
 
 mvfst_cpp_library(

@@ -24,6 +24,8 @@ Bbr2ProbeRtt::Bbr2ProbeRtt(
     std::unique_ptr<CongestionController> previousController)
     : conn_(conn),
       shared_(std::move(shared)),
+      stateBeforeProbeRtt_(shared_->state_),
+      pacingGainBeforeProbeRtt_(shared_->pacingGain_),
       previousController_(std::move(previousController)) {
   shared_->pacingGain_ = kProbeRttPacingGain;
   enterProbeRtt();
@@ -71,8 +73,17 @@ void Bbr2ProbeRtt::onPacketSent(const OutstandingPacketWrapper& packet) {
 void Bbr2ProbeRtt::onPacketAckOrLoss(
     const AckEvent* FOLLY_NULLABLE ackEvent,
     const LossEvent* FOLLY_NULLABLE lossEvent) {
+  if (shared_->resolveSpuriousLossUndo(ackEvent, lossEvent)) {
+    finishSpuriousLossUndo();
+  }
+  if (ackEvent && !ackEvent->largestNewlyAckedPacket && !lossEvent) {
+    return;
+  }
   if (lossEvent && lossEvent->lostPackets > 0) {
-    if (conn_.transportSettings.ccaConfig.enableRecoveryInProbeStates) {
+    const bool recoveryEnabled =
+        conn_.transportSettings.ccaConfig.enableRecoveryInProbeStates;
+    shared_->updateSpuriousLossUndoOnLoss(*lossEvent);
+    if (recoveryEnabled) {
       auto ackedBytes = ackEvent ? ackEvent->ackedBytes : 0;
       shared_->onPacketLoss(*lossEvent, ackedBytes);
     }
@@ -126,6 +137,13 @@ uint64_t Bbr2ProbeRtt::calculateCwnd() const {
   return shared_->cwndBytes_;
 }
 
+void Bbr2ProbeRtt::finishSpuriousLossUndo() {
+  shared_->boundBwForModel(std::nullopt);
+  shared_->setSendQuantum();
+  shared_->setPacing(conn_.transportSettings.defaultRttFactor);
+  shared_->applyCwnd(calculateCwnd());
+}
+
 // ProbeRTT state management
 
 void Bbr2ProbeRtt::enterProbeRtt() {
@@ -165,14 +183,26 @@ void Bbr2ProbeRtt::checkProbeRttDone() {
 }
 
 void Bbr2ProbeRtt::exitProbeRtt() {
-  // Signal to ProbeBw that it should restart its cycle
-  shared_->returnedFromProbeRtt_ = true;
+  if (stateBeforeProbeRtt_ == Bbr2State::Startup ||
+      stateBeforeProbeRtt_ == Bbr2State::Drain) {
+    shared_->state_ = stateBeforeProbeRtt_;
+    shared_->pacingGain_ = pacingGainBeforeProbeRtt_;
+    shared_->bandwidthShortTerm_.reset();
+    shared_->inflightShortTerm_.reset();
+    shared_->returnedFromProbeRtt_ = false;
+  } else {
+    // Signal to ProbeBw that it should restart its cycle.
+    shared_->returnedFromProbeRtt_ = true;
+  }
   completedProbeRtt_ = true;
 }
 
 uint64_t Bbr2ProbeRtt::getProbeRTTCwnd() const {
+  auto probeRttCwnd = shared_->getBDPWithGain(kProbeRttCwndGain);
+  if (shared_->probeRttCwnd_.has_value()) {
+    probeRttCwnd = std::min(probeRttCwnd, *shared_->probeRttCwnd_);
+  }
   return std::max(
-      shared_->getBDPWithGain(kProbeRttCwndGain),
-      quic::kMinCwndInMssForBbr * conn_.udpSendPacketLen);
+      probeRttCwnd, quic::kMinCwndInMssForBbr * conn_.udpSendPacketLen);
 }
 } // namespace quic

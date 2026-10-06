@@ -194,7 +194,7 @@ QuicPathManager::prepareChallengeForSending(PathIdType pathId) {
       path.status != PathStatus::Validated) {
     auto pto = conn_.lossState.srtt +
         std::max(4 * conn_.lossState.rttvar, kGranularity) +
-        conn_.lossState.maxAckDelay;
+        std::min(conn_.lossState.maxAckDelay, conn_.peerMaxAckDelay);
     auto validationTimeout =
         std::max(3 * pto, 6 * conn_.transportSettings.initialRtt);
     auto timeoutMs =
@@ -448,7 +448,11 @@ void QuicPathManager::onPathPacketReceived(PathIdType pathId) {
   if (pathInfoIt != pathIdToInfo_.end() &&
       pathInfoIt->second.status != PathStatus::Validated) {
     // We are reading from an unvalidated path. Every incoming packet gives us
-    // credit for writing more packets (as many as limitedCwndInMss)
+    // credit for writing more packets (as many as limitedCwndInMss).
+    // This is intentionally not RFC 9000's limit of three times the bytes
+    // received: it matches the pre-validation limit used at connection
+    // establishment (writableBytesLimit in ServerStateMachine.cpp), so a peer
+    // gains no more amplification here than by opening a new connection.
     if (pathInfoIt->second.writableBytes <
         kDefaultMaxCwndInMss * conn_.udpSendPacketLen) {
       pathInfoIt->second.writableBytes +=

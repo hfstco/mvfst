@@ -36,9 +36,9 @@ void run(const QuicKnobsParsingTestFixture& fixture) {
 }
 
 TEST(QuicKnobsParsingTest, Simple) {
-  auto id1 = static_cast<uint64_t>(TransportKnobParamId::CC_EXPERIMENTAL);
-  auto id2 =
-      static_cast<uint64_t>(TransportKnobParamId::SHORT_HEADER_PADDING_KNOB);
+  auto id1 = static_cast<uint64_t>(
+      TransportKnobParamId::FORCIBLY_SET_UDP_PAYLOAD_SIZE);
+  auto id2 = static_cast<uint64_t>(TransportKnobParamId::MAX_PTO);
   auto id3 = static_cast<uint64_t>(TransportKnobParamId::KEEPALIVE_ENABLED);
   auto id4 = static_cast<uint64_t>(TransportKnobParamId::PACING_TIMER_TICK);
   std::string args = fmt::format(
@@ -47,10 +47,10 @@ TEST(QuicKnobsParsingTest, Simple) {
       .serializedKnobs = args,
       .expectError = false,
       .expectParams = {
-          {.id = id2, .val = uint64_t{5}},
           {.id = id3, .val = uint64_t{6}},
           {.id = id1, .val = uint64_t{1}},
-          {.id = id4, .val = uint64_t{3}}}};
+          {.id = id4, .val = uint64_t{3}},
+          {.id = id2, .val = uint64_t{5}}}};
   run(fixture);
 }
 
@@ -90,7 +90,8 @@ TEST(QuicKnobsParsingTest, Characters) {
 }
 
 TEST(QuicKnobsParsingTest, NegativeNumbers) {
-  auto key = static_cast<uint64_t>(TransportKnobParamId::CC_EXPERIMENTAL);
+  auto key = static_cast<uint64_t>(
+      TransportKnobParamId::FORCIBLY_SET_UDP_PAYLOAD_SIZE);
   std::string args = fmt::format(R"({{"{}" : -1}})", key);
   QuicKnobsParsingTestFixture fixture = {
       .serializedKnobs = args, .expectError = true, .expectParams = {}};
@@ -105,6 +106,15 @@ TEST(QuicKnobsParsingTest, ValidCCAlgorithm) {
       .serializedKnobs = args,
       .expectError = false,
       .expectParams = {{.id = key, .val = val}}};
+  run(fixture);
+}
+
+TEST(QuicKnobsParsingTest, UnknownKnobId) {
+  // 0x10003 is the removed DEFAULT_STREAM_PRIORITY knob.
+  QuicKnobsParsingTestFixture fixture = {
+      .serializedKnobs = R"({"65539" : 4})",
+      .expectError = true,
+      .expectParams = {}};
   run(fixture);
 }
 
@@ -224,6 +234,17 @@ TEST(QuicKnobsParsingTest, ValidMaxPacingRateAsString) {
   run(fixture);
 }
 
+TEST(QuicKnobsParsingTest, AdaptiveLossReorderingThresholds) {
+  auto key = static_cast<uint64_t>(
+      TransportKnobParamId::ADAPTIVE_LOSS_REORDERING_THRESHOLDS);
+  std::string args = fmt::format(R"({{"{}" : true}})", key);
+  QuicKnobsParsingTestFixture fixture = {
+      .serializedKnobs = args,
+      .expectError = false,
+      .expectParams = {{.id = key, .val = uint64_t{1}}}};
+  run(fixture);
+}
+
 TEST(QuicKnobsParsingTest, InvalidMaxPacingRateAsLargeNumber) {
   auto key = static_cast<uint64_t>(TransportKnobParamId::MAX_PACING_RATE_KNOB);
   // Decimal is UINT64_MAX + 1
@@ -247,7 +268,8 @@ TEST(QuicKnobsParsingTest, MaxPacingRateWithSequenceNumber) {
 }
 
 TEST(QuicKnobsParsingTest, NonStringKey) {
-  auto key = static_cast<uint64_t>(TransportKnobParamId::CC_EXPERIMENTAL);
+  auto key = static_cast<uint64_t>(
+      TransportKnobParamId::FORCIBLY_SET_UDP_PAYLOAD_SIZE);
   std::string args = fmt::format(R"({{{} : 1}})", key);
   QuicKnobsParsingTestFixture fixture = {
       .serializedKnobs = args,
@@ -265,7 +287,8 @@ TEST(QuicKnobsParsingTest, DoubleKey) {
 }
 
 TEST(QuicKnobsParsingTest, DoubleValue) {
-  auto key = static_cast<uint64_t>(TransportKnobParamId::CC_EXPERIMENTAL);
+  auto key = static_cast<uint64_t>(
+      TransportKnobParamId::FORCIBLY_SET_UDP_PAYLOAD_SIZE);
   std::string args = fmt::format(R"({{"{}" : 0.1}})", key);
   QuicKnobsParsingTestFixture fixture = {
       .serializedKnobs = args, .expectError = true, .expectParams = {}};
@@ -273,7 +296,8 @@ TEST(QuicKnobsParsingTest, DoubleValue) {
 }
 
 TEST(QuicKnobsParsingTest, UInt64Max) {
-  const auto id = static_cast<uint64_t>(TransportKnobParamId::CC_EXPERIMENTAL);
+  const auto id = static_cast<uint64_t>(
+      TransportKnobParamId::FORCIBLY_SET_UDP_PAYLOAD_SIZE);
   const uint64_t val = std::numeric_limits<uint64_t>::max();
   std::string str = fmt::format("{{\"{}\" : {}}}", id, val);
   QuicKnobsParsingTestFixture fixture = {

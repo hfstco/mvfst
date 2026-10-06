@@ -532,6 +532,14 @@ class TestQuicTransport
     getEventBase()->loopOnce();
   }
 
+  void invokeCheckForClosedStream() {
+    checkForClosedStream();
+  }
+
+  bool hasPendingWriteCallback(StreamId id) const {
+    return pendingWriteCallbacks_.contains(id);
+  }
+
   QuicErrorCode getConnectionError() {
     return conn_->localConnectionError->code;
   }
@@ -1971,6 +1979,28 @@ TEST_F(QuicTransportImplTestBase, CloseStreamAfterReadFin) {
 
 TEST_F(
     QuicTransportImplTestBase,
+    CheckForClosedStreamRemovesPendingWriteCallback) {
+  const auto streamId = transport->createBidirectionalStream().value();
+  NiceMock<MockWriteCallback> writeCb;
+  ASSERT_FALSE(
+      transport->notifyPendingWriteOnStream(streamId, &writeCb).hasError());
+  ASSERT_TRUE(transport->hasPendingWriteCallback(streamId));
+
+  auto* stream = transport->getStream(streamId);
+  ASSERT_NE(stream, nullptr);
+  stream->sendState = StreamSendState::Closed;
+  stream->recvState = StreamRecvState::Closed;
+  transport->transportConn->streamManager->addClosed(streamId);
+  EXPECT_CALL(connCallback, onStreamPreReaped(streamId));
+
+  transport->invokeCheckForClosedStream();
+
+  EXPECT_FALSE(transport->hasPendingWriteCallback(streamId));
+  EXPECT_FALSE(transport->transportConn->streamManager->streamExists(streamId));
+}
+
+TEST_F(
+    QuicTransportImplTestBase,
     CheckForClosedStreamReentrantCloseInOnStreamPreReaped) {
   auto stream = transport->createBidirectionalStream().value();
   NiceMock<MockReadCallback> readCb;
@@ -2054,6 +2084,38 @@ TEST_F(QuicTransportImplTestBase, DeliveryCallbackUnsetOne) {
   EXPECT_CALL(dcb2, onCanceled(_, _));
 
   transport->close(std::nullopt);
+}
+
+TEST_F(
+    QuicTransportImplTestBase,
+    UnifiedAckRetiresPayloadBeforeDeliveryCallback) {
+  transport->transportConn->transportSettings.useUnifiedAppStreamSendBuffer =
+      true;
+  const auto streamId = transport->createBidirectionalStream().value();
+  auto* stream = transport->getStream(streamId);
+  ASSERT_NE(stream, nullptr);
+  ASSERT_TRUE(stream->streamSendBuffer.has_value());
+  ASSERT_TRUE(
+      stream->streamSendBuffer->append(IOBuf::copyBuffer("abc"), false));
+  ASSERT_TRUE(stream->streamSendBuffer->markNewDataSent({0, 3, false}));
+  ASSERT_TRUE(stream->writeBuffer.empty());
+
+  StrictMock<MockByteEventCallback> callback;
+  EXPECT_CALL(callback, onByteEventRegistered(getAckMatcher(streamId, 2)));
+  ASSERT_FALSE(
+      transport->registerDeliveryCallback(streamId, 2, &callback).hasError());
+
+  EXPECT_CALL(callback, onByteEvent(getAckMatcher(streamId, 2)));
+  ASSERT_FALSE(
+      sendAckSMHandler(*stream, WriteStreamFrame(streamId, 0, 3, false))
+          .hasError());
+  EXPECT_EQ(stream->streamSendBuffer->outstandingBytes(), 0);
+  EXPECT_TRUE(stream->writeBuffer.empty());
+
+  transport->invokeProcessCallbacksAfterNetworkData();
+
+  EXPECT_TRUE(stream->writeBuffer.empty());
+  EXPECT_EQ(stream->writeBufferStartOffset, 0);
 }
 
 TEST_F(QuicTransportImplTestBase, ByteEventCallbacksManagementSingleStream) {
@@ -4925,7 +4987,8 @@ TEST_F(QuicTransportImplTest, ConsumePendingSconeRateEdgeTriggered) {
   // First consume should return the latest signal (rateB, last one delivered).
   auto info = transport->consumePendingSconeRate();
   ASSERT_TRUE(info.has_value());
-  EXPECT_EQ(info->bps, expectedBpsB);
+  EXPECT_EQ(info->rateSignal, rateB);
+  EXPECT_EQ(info->advisedBps, expectedBpsB);
   EXPECT_GE(info->receivedTime, beforeDelivery);
   EXPECT_LE(info->receivedTime, Clock::now());
 
@@ -4938,10 +5001,19 @@ TEST_F(QuicTransportImplTest, ConsumePendingSconeRateEdgeTriggered) {
   transport->invokeReadDataAndCallbacks();
   info = transport->consumePendingSconeRate();
   ASSERT_TRUE(info.has_value());
-  EXPECT_EQ(info->bps, expectedBpsA);
+  EXPECT_EQ(info->rateSignal, rateA);
+  EXPECT_EQ(info->advisedBps, expectedBpsA);
 
   // Consumed again.
   EXPECT_FALSE(transport->consumePendingSconeRate().has_value());
+
+  transport->transportConn->scone->pendingRateSignals.push_back(
+      {.rate = kSconeNoAdvice, .version = testVersion});
+  transport->invokeReadDataAndCallbacks();
+  info = transport->consumePendingSconeRate();
+  ASSERT_TRUE(info.has_value());
+  EXPECT_EQ(info->rateSignal, kSconeNoAdvice);
+  EXPECT_FALSE(info->advisedBps.has_value());
 
   transport->setConnectionCallback(nullptr);
 }
@@ -5041,6 +5113,76 @@ TEST_F(QuicTransportImplTestBase, StopSendingCallbackReentrantRegistration) {
   transport->getConnectionState().streamManager->addStopSending(
       id, /*error=*/0);
   transport->invokeProcessCallbacksAfterNetworkData();
+}
+
+TEST_F(
+    QuicTransportImplTestBase,
+    FlowControlUpdateResetReapsAnotherQueuedStream) {
+  const auto firstId = transport->createBidirectionalStream().value();
+  const auto secondId = transport->createBidirectionalStream().value();
+  const auto resetId = transport->createBidirectionalStream().value();
+
+  auto& streamManager = *transport->transportConn->streamManager;
+  streamManager.queueFlowControlUpdated(firstId);
+  streamManager.queueFlowControlUpdated(secondId);
+
+  // Match the detached snapshot's unordered iteration order.
+  const auto callbackId = *streamManager.flowControlUpdated().begin();
+  const auto reapedId = callbackId == firstId ? secondId : firstId;
+  auto* reapedStream = streamManager.getStream(reapedId).value();
+  ASSERT_NE(reapedStream, nullptr);
+  reapedStream->sendState = StreamSendState::Closed;
+  reapedStream->recvState = StreamRecvState::Closed;
+  streamManager.addClosed(reapedId);
+
+  StrictMock<MockWriteCallback> writeCallback;
+  ASSERT_FALSE(transport->notifyPendingWriteOnStream(callbackId, &writeCallback)
+                   .hasError());
+  EXPECT_CALL(writeCallback, onStreamWriteReady(_, _)).Times(0);
+
+  EXPECT_CALL(connCallback, onStreamPreReaped(reapedId));
+  EXPECT_CALL(connCallback, onFlowControlUpdate(reapedId)).Times(0);
+  EXPECT_CALL(connCallback, onFlowControlUpdate(callbackId))
+      .WillOnce([&](StreamId streamId) {
+        ASSERT_FALSE(transport->writeChain(streamId, nullptr, true).hasError());
+        ASSERT_FALSE(
+            transport
+                ->resetStream(resetId, GenericApplicationErrorCode::UNKNOWN)
+                .hasError());
+      });
+
+  transport->invokeProcessCallbacksAfterNetworkData();
+
+  EXPECT_FALSE(transport->isClosed());
+  EXPECT_FALSE(streamManager.streamExists(reapedId));
+  EXPECT_FALSE(streamManager.getStream(callbackId).value()->writable());
+}
+
+TEST_F(QuicTransportImplTestBase, FlowControlUpdateResetReapsCurrentStream) {
+  const auto callbackId = transport->createBidirectionalStream().value();
+  const auto resetId = transport->createBidirectionalStream().value();
+
+  auto& streamManager = *transport->transportConn->streamManager;
+  streamManager.queueFlowControlUpdated(callbackId);
+
+  EXPECT_CALL(connCallback, onStreamPreReaped(callbackId));
+  EXPECT_CALL(connCallback, onFlowControlUpdate(callbackId))
+      .WillOnce([&](StreamId streamId) {
+        auto* reapedStream = streamManager.getStream(streamId).value();
+        ASSERT_NE(reapedStream, nullptr);
+        reapedStream->sendState = StreamSendState::Closed;
+        reapedStream->recvState = StreamRecvState::Closed;
+        streamManager.addClosed(streamId);
+        ASSERT_FALSE(
+            transport
+                ->resetStream(resetId, GenericApplicationErrorCode::UNKNOWN)
+                .hasError());
+      });
+
+  transport->invokeProcessCallbacksAfterNetworkData();
+
+  EXPECT_FALSE(transport->isClosed());
+  EXPECT_FALSE(streamManager.streamExists(callbackId));
 }
 
 } // namespace quic::test

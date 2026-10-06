@@ -58,6 +58,11 @@ struct CongestionControlConfig {
   // limited.
   bool leaveHeadroomForCwndLimited{false};
 
+  // Used by: Cubic, BBR2, and BBR2Modular
+  // Allow a congestion controller to undo its congestion response when every
+  // packet in a loss episode is explicitly acknowledged as spurious.
+  bool enableSpuriousLossRecovery{false};
+
   // These parameters control how BBR sends ACK_FREQUENCY frames every new RTT.
   //  The first controls how many ack eliciting packets have to be received
   //  to trigger an ACK.
@@ -99,6 +104,10 @@ struct CongestionControlConfig {
   // Used by: BBR2
   // Whether BBR2 should enable reno coexistence.
   bool enableRenoCoexistence{false};
+
+  // Used by: BBR2Modular
+  // Whether BBR2 should use precautionary bandwidth probing.
+  bool enablePrecautionaryBandwidthProbing{false};
 
   // Used by: BBR2
   // Whether BBR2 paces the initial congestion window.
@@ -172,6 +181,24 @@ struct PeerReceiveTimestampsConfig {
   uint64_t exponent{0};
 };
 
+enum class TimestampFrameWriteMode : uint8_t {
+  Disabled,
+  // Writes only from capacity left after ordinary scheduling or rebuilding.
+  Opportunistic,
+  // During ordinary scheduling, reserves TIMESTAMP space before stream/datagram
+  // output, then releases that reservation rather than prevent the packet from
+  // acquiring a qualifying carrier. It never displaces earlier ACK/control
+  // frames or PacketRebuilder clone contents; rebuilt packets append TIMESTAMP
+  // only if capacity remains.
+  Prioritized,
+};
+
+enum class TimestampFramePacketSelection : uint8_t {
+  AllEligiblePackets,
+  AckElicitingPackets,
+  StreamPackets,
+};
+
 // JSON-serialized transport knobs
 struct SerializedKnob {
   uint64_t space;
@@ -183,13 +210,6 @@ struct ServerDirectEncapConfig {
   folly::IPAddress directEncapAddress;
   // Bitmask of supported zones.
   uint8_t supportedZones;
-};
-
-struct EgressPolicerConfig {
-  bool enabled{false};
-  uint64_t rateBytesPerSec{0};
-  uint32_t burstMs{100};
-  uint32_t delayMs{1000};
 };
 
 struct TransportSettings {
@@ -361,16 +381,20 @@ struct TransportSettings {
   // Whether to use adaptive loss thresholds for reodering and timeout
   bool useAdaptiveLossReorderingThresholds{false};
   bool useAdaptiveLossTimeThresholds{false};
-  // Whether to automatically increase receive conn flow control. The
-  // determination is based on the frequency we are sending flow control
-  // updates. If there has been less than 2SRTTs between flow control updates
-  // this will double the target window.
+  // Connection-level receive flow control window autotuning.
+  // If locally consumed credit requires an update less than 2SRTTs after the
+  // previous update, this increases the target window by up to 2x.
   bool autotuneReceiveConnFlowControl{false};
+  // Maximum connection receive window that autotuning may select.
+  uint64_t maxAutotunedReceiveConnFlowControlWindow{
+      kDefaultMaxAutotunedReceiveConnFlowControlWindow};
   // Stream level receive flow control window autotuning.
-  // The logic is simple - double the flow control window every time we receive
-  // a stream blocked from the sender and there has been less than 2SRTTs since
-  // last flow control update.
+  // If locally consumed credit requires an update less than 2SRTTs after the
+  // previous update, this increases the target window by up to 2x.
   bool autotuneReceiveStreamFlowControl{false};
+  // Maximum per-stream receive window that autotuning may select.
+  uint64_t maxAutotunedReceiveStreamFlowControlWindow{
+      kDefaultMaxAutotunedReceiveStreamFlowControlWindow};
   // Enable a keepalive timer. This schedules a timer to send a PING ~15%
   // before an idle timeout. To work effectively this means the idle timer
   // has to be set to something >> the RTT of the connection.
@@ -387,6 +411,23 @@ struct TransportSettings {
   bool dropIngressOnStopSending{false};
   bool advertisedReliableResetStreamSupport{false};
   bool advertisedKnobFrameSupport{false};
+  // Advertise that this endpoint accepts TIMESTAMP frames from the peer.
+  bool advertisedTimestampFrameSupport{false};
+  // Controls ordinary TIMESTAMP writes on selected non-empty 1-RTT packets;
+  // see TimestampFrameWriteMode for the priority boundary.
+  TimestampFrameWriteMode oneRttTimestampFrameWriteMode{
+      TimestampFrameWriteMode::Disabled};
+  // Select every eligible non-empty packet, every packet carrying an
+  // ack-eliciting frame, or only packets that actually carry stream data.
+  TimestampFramePacketSelection oneRttTimestampFramePacketSelection{
+      TimestampFramePacketSelection::AllEligiblePackets};
+  // Avoid redundant timing metadata when an ACK in the same packet already
+  // carries receive timestamps.
+  bool suppressOneRttTimestampFrameWhenAckReceiveTimestampsWritten{true};
+  // Local TIMESTAMP values are encoded as microseconds >> exponent; one
+  // encoded tick therefore represents 2^exponent microseconds.
+  uint64_t timestampFrameTimestampExponent{
+      kDefaultTimestampFrameTimestampExponent};
   Optional<uint16_t> quicExperimentId;
 
   // Extended ACK support to advertise to the peer. This is what we expect to
@@ -469,10 +510,18 @@ struct TransportSettings {
 
   // Temporary flag to test new stream blocked condition.
   bool useNewStreamBlockedCondition{false};
+  // Whether app streams use the unified owning send buffer.
+  bool useUnifiedAppStreamSendBuffer{false};
+  // Whether PTO probes retransmit frames without cloning packets.
+  bool useNonCloningPto{false};
   bool scheduleTimerForExcessWrites{false};
 
   // Whether to read ECN bits from ingress packets
   bool readEcnOnIngress{false};
+
+  // Whether to read the IP TTL from ingress packets. Only implemented for
+  // Linux; elsewhere the socket option is never applied and the TTL stays 0.
+  bool readTtlOnIngress{false};
 
   // DSCP value to use for outgoing packet. The two least significant bits of
   // the ToS field are for ECN controlled by the following two options.
@@ -482,11 +531,6 @@ struct TransportSettings {
   // Whether to use L4S ECN (enableEcnOnEgress must be enabled)
   bool useL4sEcn{false};
 
-  // Jumpstart values for personalized cwnd
-  // TODO: Remove this once we settle on the final values
-  uint64_t cwndWeakJumpstart{36000};
-  uint64_t cwndModerateJumpstart{48000};
-  uint64_t cwndStrongJumpstart{72000};
   bool useSockWritableEvents{false};
   // Ack timeout = SRTT * ackTimerFactor
   double ackTimerFactor{kAckTimerFactor};
@@ -541,8 +585,6 @@ struct TransportSettings {
   // Emit SCONE packets when shouldSendSconePacket allows. Set by SCONE_KNOB.
   bool enableSconeSend{false};
   std::chrono::seconds sconePacketInterval{20};
-
-  EgressPolicerConfig egressPolicerConfig;
 
   // Enable path degradation / blackhole detection callbacks.
   // When enabled, the transport fires onPathDegrading() and

@@ -51,17 +51,18 @@ class QuicAsyncUDPSocket {
       using Timestamp = std::array<struct timespec, 3>;
       std::optional<Timestamp> ts;
       uint8_t tos = 0;
+      std::optional<uint8_t> ttl;
 #ifdef _WIN32
       // Make control message space for ToS
       static constexpr size_t kCmsgSpace = CMSG_SPACE(sizeof(INT));
 #elif defined(FOLLY_HAVE_MSG_ERRQUEUE)
-      // Make control message space for GRO, timestamp, ToS, and PKTINFO
+      // Make control message space for GRO, timestamp, ToS, TTL, and PKTINFO
       // (v6+v4). Must stay equal to
       // folly::AsyncUDPSocket::ReadCallback::OnDataAvailableParams::kCmsgSpace
       // — FollyQuicAsyncUDPSocket runtime-checks the two are identical.
       static constexpr size_t kCmsgSpace = CMSG_SPACE(sizeof(uint16_t)) +
           CMSG_SPACE(sizeof(Timestamp)) + CMSG_SPACE(sizeof(uint8_t)) +
-          CMSG_SPACE(sizeof(struct in6_pktinfo)) +
+          CMSG_SPACE(sizeof(int)) + CMSG_SPACE(sizeof(struct in6_pktinfo)) +
           CMSG_SPACE(sizeof(struct in_pktinfo));
 #endif
     };
@@ -298,6 +299,13 @@ class QuicAsyncUDPSocket {
   [[nodiscard]] virtual quic::Expected<void, QuicError> setRecvTos(
       bool recvTos) = 0;
   [[nodiscard]] virtual quic::Expected<bool, QuicError> getRecvTos() = 0;
+
+  // receive ttl cmsgs
+  // if true, the IPv6 Hop Limit/IPv4 TTL field should be populated in
+  // OnDataAvailableParams.
+  [[nodiscard]] virtual quic::Expected<void, QuicError> setRecvTtl(
+      bool recvTtl) = 0;
+  [[nodiscard]] virtual quic::Expected<bool, QuicError> getRecvTtl() = 0;
 
   [[nodiscard]] virtual quic::Expected<void, QuicError> setTosOrTrafficClass(
       uint8_t tos) = 0;

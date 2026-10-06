@@ -31,17 +31,24 @@ class LibevQuicEventBase
       public QuicTimer,
       public std::enable_shared_from_this<LibevQuicEventBase> {
  public:
-  class EvLoopWeak {
+  // Supplies the libev loop that this event base runs on. The loop belongs to
+  // the embedding application, not to mvfst, so implementations decide how (and
+  // whether) to keep it alive; holding it strongly is allowed.
+  class EvLoopHolder {
    public:
     // Returns nullptr if the loop has been destroyed.
     virtual struct ev_loop* get() = 0;
 
     virtual std::optional<pthread_t> getEventLoopThread() = 0;
 
-    virtual ~EvLoopWeak() = default;
+    virtual void runInEventBaseThread(std::function<void()> /*fn*/) noexcept {
+      MVCHECK(false, "runInEventBaseThread not supported by this EvLoopHolder");
+    }
+
+    virtual ~EvLoopHolder() = default;
   };
 
-  explicit LibevQuicEventBase(std::unique_ptr<EvLoopWeak> loop);
+  explicit LibevQuicEventBase(std::unique_ptr<EvLoopHolder> loop);
   ~LibevQuicEventBase() override;
 
   void runInLoop(
@@ -68,6 +75,7 @@ class LibevQuicEventBase
       std::chrono::microseconds timeout) override;
 
   bool loop() override {
+    ensurePrepareWatcherStarted();
     return ev_run(ev_loop_, EVRUN_NOWAIT);
   }
 
@@ -75,8 +83,8 @@ class LibevQuicEventBase
     return false;
   }
 
-  void runInEventBaseThread(std::function<void()> /*fn*/) noexcept override {
-    MVCHECK(false, __func__ << " not supported in LibevQuicEventBase");
+  void runInEventBaseThread(std::function<void()> fn) noexcept override {
+    loopHolder_->runInEventBaseThread(std::move(fn));
   }
 
   void runInEventBaseThreadAndWait(
@@ -100,10 +108,12 @@ class LibevQuicEventBase
   }
 
   bool loopOnce(int /*flags*/) override {
+    ensurePrepareWatcherStarted();
     return ev_run(ev_loop_, EVRUN_ONCE | EVRUN_NOWAIT);
   }
 
   void loopForever() override {
+    ensurePrepareWatcherStarted();
     ev_run(ev_loop_, 0);
   }
 
@@ -124,8 +134,8 @@ class LibevQuicEventBase
     return ev_loop_;
   }
 
-  EvLoopWeak* getLoopWeak() {
-    return loopWeak_.get();
+  EvLoopHolder* getLoopHolder() {
+    return loopHolder_.get();
   }
 
   // This is public so the libev callback can access it
@@ -176,6 +186,8 @@ class LibevQuicEventBase
   };
 
  private:
+  void ensurePrepareWatcherStarted();
+
   class LoopCallbackWrapper
       : public QuicEventBaseLoopCallback::LoopCallbackImpl {
    public:
@@ -226,7 +238,7 @@ class LibevQuicEventBase
   };
 
   struct ev_loop* ev_loop_{EV_DEFAULT};
-  std::unique_ptr<EvLoopWeak> loopWeak_;
+  std::unique_ptr<EvLoopHolder> loopHolder_;
 
   folly::IntrusiveList<LoopCallbackWrapper, &LoopCallbackWrapper::listHook_>
       loopCallbackWrappers_;

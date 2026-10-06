@@ -3329,6 +3329,8 @@ TEST_F(
     QuicClientTransportAfterStartTest,
     MigrateConnectionCleansUpOldPathOnPacketReceived) {
   auto& conn = client->getNonConstConn();
+  // Path probes require a confirmed handshake.
+  handshakeConfirmed(conn);
   auto initialPathId = conn.currentPathId;
 
   // Add an extra peer connection ID for path probing.
@@ -4714,24 +4716,45 @@ BufPtr getHandshakePacketWithFrame(
       packetNum);
 }
 
-TEST_F(QuicClientTransportVersionAndRetryTest, FrameNotAllowed) {
+enum class InitialFrameCase : uint8_t { FlowControl, Timestamp };
+
+class QuicClientInitialFrameTest
+    : public QuicClientTransportVersionAndRetryTest,
+      public WithParamInterface<InitialFrameCase> {};
+
+TEST_P(QuicClientInitialFrameTest, RejectsDisallowedFrame) {
   StreamId streamId = *client->createBidirectionalStream();
   auto clientConnectionId = *client->getConn().clientConnectionId;
   auto serverConnId = *serverChosenConnId;
   serverConnId.data()[0] = ~serverConnId.data()[0];
+  QuicWriteFrame frame = GetParam() == InitialFrameCase::FlowControl
+      ? QuicWriteFrame(MaxStreamDataFrame(streamId, 100))
+      : QuicWriteFrame(TimestampFrame(1234));
 
   EXPECT_THROW(
       deliverData(getHandshakePacketWithFrame(
-                      MaxStreamDataFrame(streamId, 100),
+                      std::move(frame),
                       serverConnId /* src */,
                       clientConnectionId /* dest */,
                       getInitialCipher(),
                       getInitialHeaderCipher())
                       ->coalesce()),
       std::runtime_error);
-  EXPECT_TRUE(client->error());
+  ASSERT_TRUE(client->getConn().localConnectionError.has_value());
+  EXPECT_EQ(
+      client->getConn().localConnectionError->code,
+      QuicErrorCode(TransportErrorCode::PROTOCOL_VIOLATION));
   EXPECT_EQ(client->getConn().clientConnectionId, *originalConnId);
 }
+
+INSTANTIATE_TEST_SUITE_P(
+    InitialFramePolicy,
+    QuicClientInitialFrameTest,
+    Values(InitialFrameCase::FlowControl, InitialFrameCase::Timestamp),
+    [](const TestParamInfo<InitialFrameCase>& info) {
+      return info.param == InitialFrameCase::FlowControl ? "FlowControl"
+                                                         : "Timestamp";
+    });
 
 TEST_F(QuicClientTransportAfterStartTest, SendReset) {
   AckBlocks sentPackets;

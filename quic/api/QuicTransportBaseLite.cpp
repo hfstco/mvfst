@@ -25,6 +25,7 @@
 #include <limits>
 
 #include <folly/ScopeGuard.h>
+#include <folly/lang/CheckedMath.h>
 
 #include <sstream>
 
@@ -64,17 +65,17 @@ quic::QuicError maybeSetGenericAppError(
   std::string headPart = "none";
   if (head != nullptr) {
     headPart = fmt::format(
-        "id={} ctrl={} hasWritable={} hasWritableNoFc={} lossBuf={} pending={} streamFc={} writeErr={} sendState={}",
+        "id={} ctrl={} hasWritable={} hasWritableNoFc={} hasLoss={} pending={} streamFc={} writeErr={} sendState={}",
         headId,
         head->isControl,
         head->hasWritableData(true),
         head->hasWritableData(false),
-        head->lossBuffer.size(),
-        head->pendingWrites.chainLength(),
+        head->hasLoss(),
+        head->pendingWriteBytes(),
         head->flowControlState.peerAdvertisedMaxOffset >=
-                head->currentWriteOffset
+                head->nextOffsetToWrite()
             ? head->flowControlState.peerAdvertisedMaxOffset -
-                head->currentWriteOffset
+                head->nextOffsetToWrite()
             : 0,
         head->streamWriteError.has_value(),
         static_cast<int>(head->sendState));
@@ -207,7 +208,7 @@ void QuicTransportBaseLite::TransportLooper::run(bool thisIteration) noexcept {
   running_ = true;
   // Caller can call run() in the callback. But if we are in pacing mode, we
   // should prevent such loop.
-  if (pacingTimer_ && inLoopBody_) {
+  if ((pacingTimer_ || hasPacingCallback_) && inLoopBody_) {
     MVVLOG(4) << __func__ << ": " << type_
               << " in loop body and using pacing - not rescheduling";
     return;
@@ -397,6 +398,9 @@ void QuicTransportBaseLite::onNetworkData(
 
     auto packets = std::move(networkData).movePackets();
     for (auto& packet : packets) {
+      if (!conn_->initialPeerTtl.has_value()) {
+        conn_->initialPeerTtl = packet.ttlValue;
+      }
       for (const auto& pp : conn_->packetProcessors) {
         pp->onPacketRead(packet);
       }
@@ -1152,7 +1156,8 @@ QuicTransportBaseLite::getStreamFlowControl(StreamId id) const {
       getSendStreamFlowControlBytesAPI(*stream),
       stream->flowControlState.peerAdvertisedMaxOffset,
       getRecvStreamFlowControlBytes(*stream),
-      stream->flowControlState.advertisedMaxOffset);
+      stream->flowControlState.advertisedMaxOffset,
+      maxWritableOnStream(*stream));
 }
 
 void QuicTransportBaseLite::runOnEvbAsyncOp(AsyncOpData data) {
@@ -1340,6 +1345,11 @@ void QuicTransportBaseLite::maybeStopWriteLooperAndArmSocketWritableEvent() {
   }
   if (conn_->transportSettings.useSockWritableEvents &&
       !socket_->isWritableCallbackSet()) {
+    // Let pacing fire the writer while a pacing delay is pending.
+    if (writeLooper_->isPacingScheduled() || getLooperPacingDelay() != 0us) {
+      return;
+    }
+
     // Check if all data has been written and we're not limited by flow
     // control/congestion control.
     bool haveDataToWrite = shouldWriteData(*conn_) != WriteDataReason::NO_WRITE;
@@ -1436,6 +1446,7 @@ void QuicTransportBaseLite::checkForClosedStream() {
           result.error().code, std::string("checkForClosedStream() error")));
       return;
     }
+    pendingWriteCallbacks_.erase(streamId);
     maybeSendStreamLimitUpdates(*conn_);
     if (readCbIt != readCallbacks_.end()) {
       readCallbacks_.erase(readCbIt);
@@ -1630,10 +1641,15 @@ quic::Expected<void, QuicError> QuicTransportBaseLite::writeSocketData() {
       }
       // Check if we are app-limited after finish this round of sending
       auto currentSendBufLen = conn_->flowControlState.sumCurStreamBufferLen;
+      const auto cryptoLossBufferEmpty = [](const QuicCryptoStream& stream) {
+        return stream.streamSendBuffer
+            ? !stream.streamSendBuffer->hasPendingLoss()
+            : stream.lossBuffer.empty();
+      };
       auto lossBufferEmpty = !conn_->streamManager->hasLoss() &&
-          conn_->cryptoState->initialStream.lossBuffer.empty() &&
-          conn_->cryptoState->handshakeStream.lossBuffer.empty() &&
-          conn_->cryptoState->oneRttStream.lossBuffer.empty();
+          cryptoLossBufferEmpty(conn_->cryptoState->initialStream) &&
+          cryptoLossBufferEmpty(conn_->cryptoState->handshakeStream) &&
+          cryptoLossBufferEmpty(conn_->cryptoState->oneRttStream);
       if (conn_->congestionController &&
           currentSendBufLen < conn_->udpSendPacketLen && lossBufferEmpty &&
           conn_->congestionController->getWritableBytes()) {
@@ -2228,7 +2244,7 @@ void QuicTransportBaseLite::handleDeliveryCallbacks() {
         conn_->streamManager->getStream(streamId).value_or(nullptr));
     auto maxOffsetToDeliver = getLargestDeliverableOffset(*stream);
 
-    if (maxOffsetToDeliver.has_value()) {
+    if (maxOffsetToDeliver.has_value() && !stream->usesUnifiedSendBuffer()) {
       size_t amountTrimmed = stream->writeBuffer.trimStartAtMost(
           *maxOffsetToDeliver - stream->writeBufferStartOffset);
       stream->writeBufferStartOffset += amountTrimmed;
@@ -2269,12 +2285,12 @@ void QuicTransportBaseLite::handleStreamFlowControlUpdatedCallbacks(
   // Iterate over streams that changed their flow control window and give
   // their registered listeners their updates.
   // We don't really need flow control notifications when we are closed.
+  // The callback can synchronously reap any stream in this detached snapshot,
+  // so every stream lookup must tolerate absence.
   streamStorage = conn_->streamManager->consumeFlowControlUpdated();
-  const auto& flowControlUpdated = streamStorage;
-  for (auto streamId : flowControlUpdated) {
-    auto stream = MVCHECK_NOTNULL(
-        conn_->streamManager->getStream(streamId).value_or(nullptr));
-    if (!stream->writable()) {
+  for (const auto streamId : streamStorage) {
+    auto* stream = conn_->streamManager->getStreamIfExists(streamId);
+    if (!stream || !stream->writable()) {
       pendingWriteCallbacks_.erase(streamId);
       continue;
     }
@@ -2282,20 +2298,29 @@ void QuicTransportBaseLite::handleStreamFlowControlUpdatedCallbacks(
     if (closeState_ != CloseState::OPEN) {
       return;
     }
-    // In case the callback modified the stream map, get it again.
-    stream = MVCHECK_NOTNULL(
-        conn_->streamManager->getStream(streamId).value_or(nullptr));
-    auto maxStreamWritable = maxWritableOnStream(*stream);
-    if (maxStreamWritable != 0 && !pendingWriteCallbacks_.empty()) {
-      auto pendingWriteIt = pendingWriteCallbacks_.find(stream->id);
-      if (pendingWriteIt != pendingWriteCallbacks_.end()) {
-        auto wcb = pendingWriteIt->second;
-        pendingWriteCallbacks_.erase(stream->id);
-        wcb->onStreamWriteReady(stream->id, maxStreamWritable);
-        if (closeState_ != CloseState::OPEN) {
-          return;
-        }
-      }
+
+    auto pendingWriteIt = pendingWriteCallbacks_.find(streamId);
+    if (pendingWriteIt == pendingWriteCallbacks_.end()) {
+      continue;
+    }
+
+    // The callback can remove the stream or make it non-writable.
+    stream = conn_->streamManager->getStreamIfExists(streamId);
+    if (!stream || !stream->writable()) {
+      pendingWriteCallbacks_.erase(pendingWriteIt);
+      continue;
+    }
+
+    const auto maxStreamWritable = maxWritableOnStream(*stream);
+    if (maxStreamWritable == 0) {
+      continue;
+    }
+
+    auto wcb = pendingWriteIt->second;
+    pendingWriteCallbacks_.erase(pendingWriteIt);
+    wcb->onStreamWriteReady(streamId, maxStreamWritable);
+    if (closeState_ != CloseState::OPEN) {
+      return;
     }
   }
 
@@ -2837,10 +2862,15 @@ QuicTransportBaseLite::consumePendingSconeRate() {
   }
   auto signal = conn_->scone->pendingReceivedSignal.value();
   conn_->scone->pendingReceivedSignal.reset();
-  // Convert SCONE logarithmic rate (0-127) to bps: 100_000 * 10^(rate/20)
-  auto bps = static_cast<uint64_t>(
-      100000.0 * std::pow(10.0, static_cast<double>(signal.rate) / 20.0));
-  return SconeRateInfo{.bps = bps, .receivedTime = signal.receivedTime};
+  Optional<uint64_t> advisedBps;
+  if (signal.rate != kSconeNoAdvice) {
+    advisedBps = static_cast<uint64_t>(
+        100000.0 * std::pow(10.0, static_cast<double>(signal.rate) / 20.0));
+  }
+  return SconeRateInfo{
+      .rateSignal = signal.rate,
+      .advisedBps = advisedBps,
+      .receivedTime = signal.receivedTime};
 }
 
 const TransportSettings& QuicTransportBaseLite::getTransportSettings() const {
@@ -3163,17 +3193,16 @@ void QuicTransportBaseLite::setIdleTimer() {
 
 void QuicTransportBaseLite::setTransportSettings(
     TransportSettings transportSettings) {
-  if (conn_->nodeType == QuicNodeType::Client) {
-    if (useSinglePacketInplaceBatchWriter(
-            transportSettings.maxBatchSize, transportSettings.dataPathType)) {
-      createBufAccessor(conn_->udpSendPacketLen);
-    } else if (
-        transportSettings.dataPathType ==
-        quic::DataPathType::ContinuousMemory) {
-      // Create generic buf for in-place batch writer.
-      createBufAccessor(
-          conn_->udpSendPacketLen * transportSettings.maxBatchSize);
-    }
+  if (conn_->nodeType == QuicNodeType::Client &&
+      transportSettings.dataPathType == DataPathType::ContinuousMemory) {
+    size_t capacity = 0;
+    MVCHECK(
+        folly::checked_mul(
+            &capacity,
+            static_cast<size_t>(kDefaultMaxUDPPayload),
+            static_cast<size_t>(transportSettings.maxBatchSize)),
+        "ContinuousMemory buffer capacity overflow");
+    createBufAccessor(capacity);
   }
 
   // If transport parameters are encoded, we can only update congestion
@@ -3253,11 +3282,14 @@ void QuicTransportBaseLite::setTransportSettings(
   if (conn_->readCodec) {
     // Update the codec parameters. In case of the client, the codec was
     // initialized in the constructor and did not have the transport settings.
-    conn_->readCodec->setCodecParameters(CodecParameters(
+    CodecParameters codecParams(
         conn_->peerAckDelayExponent,
         conn_->originalVersion.value(),
         conn_->transportSettings.maybeAckReceiveTimestampsConfigSentToPeer,
-        conn_->transportSettings.advertisedExtendedAckFeatures));
+        conn_->transportSettings.advertisedExtendedAckFeatures);
+    codecParams.peerTimestampFrameTimestampExponent =
+        conn_->peerTimestampFrameState.sendExponent;
+    conn_->readCodec->setCodecParameters(std::move(codecParams));
   }
 }
 

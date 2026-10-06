@@ -13,7 +13,6 @@
 #include <quic/fizz/handshake/FizzCryptoFactory.h>
 #include <quic/fizz/server/handshake/AppToken.h>
 #include <quic/logging/FileQLogger.h>
-#include <quic/priority/HTTPPriorityQueue.h>
 #include <quic/server/handshake/ServerHandshake.h>
 #include <quic/server/state/ServerStateMachine.h>
 #include <quic/state/QuicStreamFunctions.h>
@@ -73,6 +72,40 @@ class QuicServerTransportTest : public QuicServerTransportAfterStartTestBase {
     return 0;
   }
 };
+
+TEST_F(QuicServerTransportTest, CapturesFirstAvailablePeerTtl) {
+  auto deliverPingWithTtl = [&](OptionalIntegral<uint8_t> ttl) {
+    ShortHeader header(
+        ProtectionType::KeyPhaseZero,
+        *server->getConn().serverConnectionId,
+        clientNextAppDataPacketNum++);
+    RegularQuicPacketBuilder builder(
+        static_cast<uint32_t>(server->getConn().udpSendPacketLen),
+        std::move(header),
+        0 /* largestAcked */);
+    ASSERT_FALSE(builder.encodePacketHeader().hasError());
+    ASSERT_FALSE(writeFrame(PingFrame(), builder).hasError());
+
+    ReceivedUdpPacket udpPacket(packetToBuf(std::move(builder).buildPacket()));
+    udpPacket.ttlValue = ttl;
+    deliverData(NetworkData(std::move(udpPacket)));
+  };
+
+  EXPECT_FALSE(server->getConn().initialPeerTtl.has_value());
+
+  // A datagram that carried no TTL leaves the latch open.
+  deliverPingWithTtl(std::nullopt);
+  EXPECT_FALSE(server->getConn().initialPeerTtl.has_value());
+
+  deliverPingWithTtl(42);
+  ASSERT_TRUE(server->getConn().initialPeerTtl.has_value());
+  EXPECT_EQ(*server->getConn().initialPeerTtl, 42);
+
+  // Later packets do not overwrite it, so path changes cannot move the value.
+  deliverPingWithTtl(43);
+  ASSERT_TRUE(server->getConn().initialPeerTtl.has_value());
+  EXPECT_EQ(*server->getConn().initialPeerTtl, 42);
+}
 
 TEST_F(QuicServerTransportTest, TestReadMultipleStreams) {
   PacketNum clientPacketNum = clientNextAppDataPacketNum++;
@@ -2206,6 +2239,12 @@ class QuicUnencryptedServerTransportTest : public QuicServerTransportTest {
   void setupConnection() override {}
 };
 
+enum class UnprotectedFrameCase : uint8_t { FlowControl, Timestamp };
+
+class QuicUnencryptedServerTransportFrameTest
+    : public QuicUnencryptedServerTransportTest,
+      public WithParamInterface<UnprotectedFrameCase> {};
+
 TEST_F(QuicUnencryptedServerTransportTest, FirstPacketProcessedCallback) {
   getFakeHandshakeLayer()->allowZeroRttKeys();
   EXPECT_CALL(connSetupCallback, onFirstPeerPacketProcessed()).Times(1);
@@ -2575,6 +2614,51 @@ TEST_F(
       kDefaultUDPSendPacketLen, std::move(header), /*largestAckedPacketNum=*/0);
   ASSERT_FALSE(
       writeSimpleFrame(PathResponseFrame(0xaabbccddeeff), builder).hasError());
+
+  // add some data
+  auto data = IOBuf::copyBuffer("hello!");
+  auto res = *writeStreamFrameHeader(
+      builder,
+      /*id=*/4,
+      /*offset=*/0,
+      data->computeChainDataLength(),
+      data->computeChainDataLength(),
+      /*fin=*/true,
+      /*skipLenHint=*/std::nullopt);
+  ASSERT_TRUE(res.has_value());
+  auto dataLen = *res;
+  writeStreamFrameData(
+      builder,
+      data->clone(),
+      std::min(static_cast<size_t>(dataLen), data->computeChainDataLength()));
+
+  ASSERT_FALSE(builder.encodePacketHeader().hasError());
+  builder.accountForCipherOverhead(0);
+
+  auto packet = std::move(builder).buildPacket();
+  EXPECT_THROW(deliverData(packetToBuf(packet), true), std::runtime_error);
+  EXPECT_TRUE(server->getConn().localConnectionError);
+}
+
+TEST_F(
+    QuicUnencryptedServerTransportTest,
+    ReceiveTimestampFrameInZeroRttPacket) {
+  server->getNonConstConn().transportSettings.disableMigration = false;
+  server->getNonConstConn().transportSettings.advertisedTimestampFrameSupport =
+      true;
+  fakeHandshake->allowZeroRttKeys();
+  recvClientHello();
+
+  // create 0-rtt packet with some stream data and a timestamp frame
+  LongHeader header(
+      LongHeader::Types::ZeroRtt,
+      *clientConnectionId,
+      *initialDestinationConnectionId,
+      clientNextAppDataPacketNum++,
+      server->getConn().supportedVersions[0]);
+  RegularQuicPacketBuilder builder(
+      kDefaultUDPSendPacketLen, std::move(header), /*largestAckedPacketNum=*/0);
+  ASSERT_FALSE(writeFrame(TimestampFrame(1234), builder).hasError());
 
   // add some data
   auto data = IOBuf::copyBuffer("hello!");
@@ -3322,22 +3406,37 @@ BufPtr getHandshakePacketWithFrame(
       clientPacketNum);
 }
 
-TEST_F(QuicUnencryptedServerTransportTest, TestNotAllowedInUnencryptedPacket) {
+TEST_P(QuicUnencryptedServerTransportFrameTest, RejectsFrameInHandshakePacket) {
   // This should trigger derivation of keys.
   recvClientHello();
 
-  StreamId streamId = 4;
-  auto data = IOBuf::copyBuffer("data");
+  QuicWriteFrame frame = GetParam() == UnprotectedFrameCase::FlowControl
+      ? QuicWriteFrame(MaxStreamDataFrame(4, 100))
+      : QuicWriteFrame(TimestampFrame(1234));
+  auto handshakeCipher = test::createNoOpAead();
+  auto handshakeHeaderCipher = test::createNoOpHeaderCipher().value();
 
   EXPECT_THROW(
       deliverData(getHandshakePacketWithFrame(
-          MaxStreamDataFrame(streamId, 100),
+          std::move(frame),
           *clientConnectionId,
-          *getInitialCipher(),
-          *getInitialHeaderCipher())),
+          *handshakeCipher,
+          *handshakeHeaderCipher)),
       std::runtime_error);
-  EXPECT_TRUE(server->error());
+  ASSERT_TRUE(server->getConn().localConnectionError.has_value());
+  EXPECT_EQ(
+      server->getConn().localConnectionError->code,
+      QuicErrorCode(TransportErrorCode::PROTOCOL_VIOLATION));
 }
+
+INSTANTIATE_TEST_SUITE_P(
+    UnprotectedFramePolicy,
+    QuicUnencryptedServerTransportFrameTest,
+    Values(UnprotectedFrameCase::FlowControl, UnprotectedFrameCase::Timestamp),
+    [](const TestParamInfo<UnprotectedFrameCase>& info) {
+      return info.param == UnprotectedFrameCase::FlowControl ? "FlowControl"
+                                                             : "Timestamp";
+    });
 
 TEST_F(QuicUnencryptedServerTransportTest, TestCloseWhileAsyncPending) {
   folly::EventBase testLooper;
@@ -3982,6 +4081,20 @@ TEST_F(QuicServerTransportTest, TestRegisterAndHandleTransportKnobParams) {
   EXPECT_EQ(flag, 1);
 }
 
+TEST_F(QuicServerTransportTest, TestReservedTransportKnobIdHasNoHandler) {
+  constexpr uint64_t kReservedTransportKnobId = 0x20001;
+
+  EXPECT_CALL(
+      *quicStats_,
+      onTransportKnobError(
+          Eq(TransportKnobParamId(TransportKnobParamId::UNKNOWN))));
+  EXPECT_CALL(*quicStats_, onTransportKnobApplied(_)).Times(0);
+
+  server->handleKnobParams({
+      {.id = kReservedTransportKnobId, .val = std::string{"1,0,500"}},
+  });
+}
+
 TEST_F(
     QuicServerTransportTest,
     TestHandleTransportKnobParamWithUnexpectedValTypes) {
@@ -4086,27 +4199,6 @@ TEST_F(QuicServerTransportTest, TestSkipKnobsWhenNotAdvertisingSupport) {
   EXPECT_TRUE(server->getConn().pendingEvents.knobs.empty());
 }
 
-TEST_F(QuicServerTransportTest, TestCCExperimentalKnobHandler) {
-  auto mockCongestionController =
-      std::make_unique<NiceMock<MockCongestionController>>();
-  auto rawCongestionController = mockCongestionController.get();
-  server->getNonConstConn().congestionController =
-      std::move(mockCongestionController);
-
-  EXPECT_CALL(*rawCongestionController, setExperimental(true)).Times(2);
-  server->handleKnobParams(
-      {{.id = static_cast<uint64_t>(TransportKnobParamId::CC_EXPERIMENTAL),
-        .val = uint64_t{1}}});
-  server->handleKnobParams(
-      {{.id = static_cast<uint64_t>(TransportKnobParamId::CC_EXPERIMENTAL),
-        .val = uint64_t{2}}});
-
-  EXPECT_CALL(*rawCongestionController, setExperimental(false)).Times(1);
-  server->handleKnobParams(
-      {{.id = static_cast<uint64_t>(TransportKnobParamId::CC_EXPERIMENTAL),
-        .val = uint64_t{0}}});
-}
-
 TEST_F(QuicServerTransportTest, TestCCConfigKnobHandler) {
   auto& transportSettings = server->getNonConstConn().transportSettings;
 
@@ -4138,6 +4230,19 @@ TEST_F(QuicServerTransportTest, TestCCConfigKnobHandlerInvalidJSON) {
       {{.id = static_cast<uint64_t>(TransportKnobParamId::CC_CONFIG),
         .val = std::string(R"({"conservativeRecovery": "blabla"})")}});
   EXPECT_EQ(transportSettings.ccaConfig.conservativeRecovery, false);
+}
+
+TEST_F(QuicServerTransportTest, TestCCConfigKnobHandlerRejectsZeroDivisor) {
+  auto& transportSettings = server->getNonConstConn().transportSettings;
+  auto ccConfigKnobId = static_cast<uint64_t>(TransportKnobParamId::CC_CONFIG);
+
+  EXPECT_FALSE(transportSettings.ccaConfig.ackFrequencyConfig.has_value());
+
+  EXPECT_CALL(*quicStats_, onTransportKnobError(Eq(ccConfigKnobId))).Times(1);
+  server->handleKnobParams(
+      {{.id = ccConfigKnobId,
+        .val = std::string(R"({"ackFrequencyConfig":{"minRttDivisor":0}})")}});
+  EXPECT_FALSE(transportSettings.ccaConfig.ackFrequencyConfig.has_value());
 }
 
 TEST_F(QuicServerTransportTest, TestConnMigrationKnobHandler) {
@@ -4174,103 +4279,6 @@ TEST_F(QuicServerTransportTest, TestAutotuneStreamFlowControlKnobHandler) {
             TransportKnobParamId::AUTOTUNE_RECV_STREAM_FLOW_CONTROL),
         .val = uint64_t(0)}});
   EXPECT_FALSE(transportSettings.autotuneReceiveStreamFlowControl);
-}
-
-TEST_F(QuicServerTransportTest, TestAckFrequencyPolicyKnobHandler) {
-  server->handleKnobParams(
-      {{.id = static_cast<uint64_t>(TransportKnobParamId::ACK_FREQUENCY_POLICY),
-        .val = uint64_t{1}}});
-  EXPECT_FALSE(server->getTransportSettings().ccaConfig.ackFrequencyConfig);
-  server->handleKnobParams(
-      {{.id = static_cast<uint64_t>(TransportKnobParamId::ACK_FREQUENCY_POLICY),
-        .val = "blah,blah,blah"}});
-  EXPECT_FALSE(server->getTransportSettings().ccaConfig.ackFrequencyConfig);
-  server->handleKnobParams(
-      {{.id = static_cast<uint64_t>(TransportKnobParamId::ACK_FREQUENCY_POLICY),
-        .val = "1,1,"}});
-  EXPECT_FALSE(server->getTransportSettings().ccaConfig.ackFrequencyConfig);
-  server->handleKnobParams(
-      {{.id = static_cast<uint64_t>(TransportKnobParamId::ACK_FREQUENCY_POLICY),
-        .val = "1,1,1,1"}});
-  EXPECT_FALSE(server->getTransportSettings().ccaConfig.ackFrequencyConfig);
-  server->handleKnobParams(
-      {{.id = static_cast<uint64_t>(TransportKnobParamId::ACK_FREQUENCY_POLICY),
-        .val = "10,3,1,1"}});
-  ASSERT_TRUE(server->getTransportSettings().ccaConfig.ackFrequencyConfig);
-  EXPECT_EQ(
-      server->getTransportSettings()
-          .ccaConfig.ackFrequencyConfig->ackElicitingThreshold,
-      10);
-  EXPECT_EQ(
-      server->getTransportSettings()
-          .ccaConfig.ackFrequencyConfig->reorderingThreshold,
-      3);
-  EXPECT_EQ(
-      server->getTransportSettings()
-          .ccaConfig.ackFrequencyConfig->minRttDivisor,
-      1);
-  EXPECT_EQ(
-      server->getTransportSettings()
-          .ccaConfig.ackFrequencyConfig->useSmallThresholdDuringStartup,
-      true);
-  server->getNonConstConn()
-      .transportSettings.ccaConfig.ackFrequencyConfig.reset();
-  server->handleKnobParams(
-      {{.id = static_cast<uint64_t>(TransportKnobParamId::ACK_FREQUENCY_POLICY),
-        .val = "10,3,-1,1"}});
-  EXPECT_FALSE(server->getTransportSettings().ccaConfig.ackFrequencyConfig);
-  server->handleKnobParams(
-      {{.id = static_cast<uint64_t>(TransportKnobParamId::ACK_FREQUENCY_POLICY),
-        .val = "10,-1,1,1"}});
-  EXPECT_FALSE(server->getTransportSettings().ccaConfig.ackFrequencyConfig);
-  server->handleKnobParams(
-      {{.id = static_cast<uint64_t>(TransportKnobParamId::ACK_FREQUENCY_POLICY),
-        .val = "-1,3,1,1"}});
-  EXPECT_FALSE(server->getTransportSettings().ccaConfig.ackFrequencyConfig);
-  server->handleKnobParams(
-      {{.id = static_cast<uint64_t>(TransportKnobParamId::ACK_FREQUENCY_POLICY),
-        .val = "10,3,0,1"}});
-  EXPECT_FALSE(server->getTransportSettings().ccaConfig.ackFrequencyConfig);
-  server->handleKnobParams(
-      {{.id = static_cast<uint64_t>(TransportKnobParamId::ACK_FREQUENCY_POLICY),
-        .val = "10,1,1,1"}});
-  EXPECT_FALSE(server->getTransportSettings().ccaConfig.ackFrequencyConfig);
-  server->handleKnobParams(
-      {{.id = static_cast<uint64_t>(TransportKnobParamId::ACK_FREQUENCY_POLICY),
-        .val = "1,3,1,1"}});
-  server->handleKnobParams(
-      {{.id = static_cast<uint64_t>(
-            TransportKnobParamId::DEFAULT_STREAM_PRIORITY),
-        .val = "1,1"}});
-  EXPECT_EQ(
-      HTTPPriorityQueue::Priority(
-          server->getTransportSettings().defaultPriority),
-      HTTPPriorityQueue::Priority(1, true));
-  server->handleKnobParams(
-      {{.id = static_cast<uint64_t>(
-            TransportKnobParamId::DEFAULT_STREAM_PRIORITY),
-        .val = "4,0"}});
-  EXPECT_EQ(
-      HTTPPriorityQueue::Priority(
-          server->getTransportSettings().defaultPriority),
-      HTTPPriorityQueue::Priority(4, false));
-  server->handleKnobParams(
-      {{.id = static_cast<uint64_t>(
-            TransportKnobParamId::DEFAULT_STREAM_PRIORITY),
-        .val = "4,0,10"}});
-  EXPECT_EQ(
-      HTTPPriorityQueue::Priority(
-          server->getTransportSettings().defaultPriority),
-      HTTPPriorityQueue::Priority(4, false));
-  // level too large, unchanged
-  server->handleKnobParams(
-      {{.id = static_cast<uint64_t>(
-            TransportKnobParamId::DEFAULT_STREAM_PRIORITY),
-        .val = "20,0"}});
-  EXPECT_EQ(
-      HTTPPriorityQueue::Priority(
-          server->getTransportSettings().defaultPriority),
-      HTTPPriorityQueue::Priority(4, false));
 }
 
 TEST_F(QuicServerTransportTest, TestSetMaxPacingRateLifecycle) {
@@ -4543,17 +4551,6 @@ TEST_F(
   EXPECT_EQ(server->getConn().udpSendPacketLen, 1452);
 }
 
-TEST_F(
-    QuicServerTransportTest,
-    TestHandleTransportKnobParamFixedShortHeaderPadding) {
-  EXPECT_EQ(server->getConn().transportSettings.fixedShortHeaderPadding, 0);
-  server->handleKnobParams(
-      {{.id = static_cast<uint64_t>(
-            TransportKnobParamId::FIXED_SHORT_HEADER_PADDING_KNOB),
-        .val = uint64_t{42}}});
-  EXPECT_EQ(server->getConn().transportSettings.fixedShortHeaderPadding, 42);
-}
-
 TEST_F(QuicServerTransportTest, TestBurstSizeKnobHandlers) {
   auto& transportSettings = server->getNonConstConn().transportSettings;
 
@@ -4708,6 +4705,30 @@ TEST_F(QuicServerTransportTest, TestSendCloseOnIdleTimeoutKnobHandler) {
   EXPECT_TRUE(transportSettings.alwaysSendConnectionCloseOnIdleTimeout);
 }
 
+TEST_F(
+    QuicServerTransportTest,
+    TestAdaptiveLossReorderingThresholdsKnobHandler) {
+  auto& transportSettings = server->getNonConstConn().transportSettings;
+  auto knobParamId = static_cast<uint64_t>(
+      TransportKnobParamId::ADAPTIVE_LOSS_REORDERING_THRESHOLDS);
+
+  ASSERT_FALSE(transportSettings.useAdaptiveLossReorderingThresholds);
+
+  EXPECT_CALL(*quicStats_, onTransportKnobApplied(Eq(knobParamId))).Times(1);
+  server->handleKnobParams({{.id = knobParamId, .val = uint64_t{1}}});
+  EXPECT_TRUE(transportSettings.useAdaptiveLossReorderingThresholds);
+
+  EXPECT_CALL(*quicStats_, onTransportKnobApplied(Eq(knobParamId))).Times(1);
+  server->handleKnobParams({{.id = knobParamId, .val = uint64_t{0}}});
+  EXPECT_FALSE(transportSettings.useAdaptiveLossReorderingThresholds);
+
+  EXPECT_CALL(*quicStats_, onTransportKnobError(Eq(knobParamId))).Times(2);
+  server->handleKnobParams(
+      {{.id = knobParamId, .val = uint64_t{2}},
+       {.id = knobParamId, .val = std::string("true")}});
+  EXPECT_FALSE(transportSettings.useAdaptiveLossReorderingThresholds);
+}
+
 TEST_F(QuicServerTransportTest, TestRxPacketsBeforeAckKnobHandler) {
   auto& transportSettings = server->getNonConstConn().transportSettings;
 
@@ -4813,7 +4834,7 @@ TEST_F(QuicServerTransportTest, SconeRateSignalProcessingE2E) {
   // processed followed by successful packet processing that should queue the
   // rate signal
 
-  uint8_t testRate = 0x25;
+  uint8_t testRate = kSconeNoAdvice;
 
   // Create a simple coalesced packet buffer that contains both SCONE and
   // regular packet This approach uses the existing test infrastructure more

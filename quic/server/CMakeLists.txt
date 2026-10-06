@@ -38,7 +38,6 @@ mvfst_add_library(mvfst_server_server
     mvfst_fizz_handshake
     mvfst_fizz_server_handshake
     mvfst_logging_oops_logger
-    mvfst_priority_http_priority_queue
     mvfst_server_accept_observer
     mvfst_server_handshake_app_token
     mvfst_server_handshake_default_app_token_validator
@@ -52,7 +51,6 @@ mvfst_add_library(mvfst_server_server
     Folly::folly_portability_gflags
     Folly::folly_system_hardware_concurrency
     Folly::folly_system_thread_id
-    Folly::folly_token_bucket
     fmt::fmt
   EXPORTED_DEPS
     mvfst_api_quic_batch_writer

@@ -16,6 +16,7 @@
 #include <quic/fizz/client/handshake/FizzClientQuicHandshakeContext.h>
 #include <quic/fizz/server/handshake/FizzServerQuicHandshakeContext.h>
 #include <quic/server/state/ServerStateMachine.h>
+#include <quic/state/test/MockQuicStats.h>
 
 using namespace folly;
 using namespace testing;
@@ -109,10 +110,112 @@ TEST_F(QuicStreamFunctionsTestBase, TestCreateBoth) {
   }
 }
 
+TEST_F(QuicStreamFunctionsTestBase, UnifiedSendBufferDisabledByDefault) {
+  auto* stream = conn.streamManager->createNextBidirectionalStream().value();
+
+  EXPECT_FALSE(stream->usesUnifiedSendBuffer());
+}
+
+TEST_F(QuicStreamFunctionsTestBase, UnifiedSendBufferForSendCapableStreams) {
+  conn.transportSettings.useUnifiedAppStreamSendBuffer = true;
+  NiceMock<MockQuicStats> stats;
+  conn.statsCallback = &stats;
+  EXPECT_CALL(stats, onNewQuicStream()).Times(3);
+  EXPECT_CALL(stats, onNewUnifiedAppStream()).Times(2);
+
+  const auto bidiId =
+      conn.streamManager->createNextBidirectionalStream().value()->id;
+  const auto localUniId =
+      conn.streamManager->createNextUnidirectionalStream().value()->id;
+  auto* peerUni = conn.streamManager->getStream(0x03).value();
+  auto* bidi = conn.streamManager->findStream(bidiId);
+  auto* localUni = conn.streamManager->findStream(localUniId);
+
+  ASSERT_NE(bidi, nullptr);
+  ASSERT_NE(localUni, nullptr);
+  ASSERT_NE(peerUni, nullptr);
+  EXPECT_TRUE(bidi->usesUnifiedSendBuffer());
+  EXPECT_TRUE(localUni->usesUnifiedSendBuffer());
+  EXPECT_EQ(peerUni->sendState, StreamSendState::Invalid);
+  EXPECT_FALSE(peerUni->usesUnifiedSendBuffer());
+}
+
+TEST_F(QuicStreamFunctionsTestBase, UnifiedSendBufferModeSurvivesMigration) {
+  conn.transportSettings.useUnifiedAppStreamSendBuffer = true;
+  QuicStreamState source(0x00, conn);
+  QuicClientConnectionState disabledDestination(
+      FizzClientQuicHandshakeContext::Builder().build());
+  disabledDestination.transportSettings.useUnifiedAppStreamSendBuffer = false;
+
+  QuicStreamState migratedToDisabled(disabledDestination, std::move(source));
+
+  QuicClientConnectionState disabledSource(
+      FizzClientQuicHandshakeContext::Builder().build());
+  disabledSource.transportSettings.useUnifiedAppStreamSendBuffer = false;
+  QuicStreamState sourceWithoutUnifiedBuffer(0x00, disabledSource);
+  QuicClientConnectionState enabledDestination(
+      FizzClientQuicHandshakeContext::Builder().build());
+  enabledDestination.transportSettings.useUnifiedAppStreamSendBuffer = true;
+  QuicStreamState migratedToEnabled(
+      enabledDestination, std::move(sourceWithoutUnifiedBuffer));
+
+  EXPECT_TRUE(migratedToDisabled.usesUnifiedSendBuffer());
+  EXPECT_FALSE(migratedToEnabled.usesUnifiedSendBuffer());
+}
+
+TEST_F(QuicStreamFunctionsTestBase, UnifiedSendBufferFacades) {
+  conn.transportSettings.useUnifiedAppStreamSendBuffer = true;
+  QuicStreamState stream(0x00, conn);
+  ASSERT_TRUE(stream.streamSendBuffer.has_value());
+  ASSERT_TRUE(
+      stream.streamSendBuffer->append(IOBuf::copyBuffer("hello"), true));
+
+  EXPECT_EQ(stream.pendingWriteBytes(), 5);
+  EXPECT_EQ(stream.writeBufferEndOffset(), 5);
+  EXPECT_EQ(stream.nextOffsetToWrite(), 0);
+  EXPECT_TRUE(stream.hasWritableData());
+
+  auto range = stream.streamSendBuffer->nextNewData(5);
+  ASSERT_TRUE(range.has_value());
+  ASSERT_TRUE(stream.streamSendBuffer->markNewDataSent(*range));
+  EXPECT_EQ(stream.nextOffsetToWrite(), 5);
+  EXPECT_TRUE(stream.hasSentFIN());
+  EXPECT_EQ(*getLargestWriteOffsetTxed(stream), 5);
+
+  stream.streamSendBuffer->markLoss(*range);
+  EXPECT_TRUE(stream.hasLoss());
+  conn.streamManager->updateWritableStreams(stream);
+  EXPECT_TRUE(conn.streamManager->hasLoss());
+
+  ASSERT_TRUE(stream.streamSendBuffer->markAcked(*range).has_value());
+  conn.streamManager->updateWritableStreams(stream);
+  EXPECT_FALSE(stream.hasLoss());
+  EXPECT_FALSE(conn.streamManager->hasLoss());
+  EXPECT_EQ(*getLargestDeliverableOffset(stream), 5);
+  EXPECT_GT(getAckIntervalSetVersion(stream), 0);
+  EXPECT_TRUE(allBytesTillFinAcked(stream));
+}
+
+TEST_F(QuicStreamFunctionsTestBase, UnifiedFinOnlyUsesVirtualByteOffset) {
+  conn.transportSettings.useUnifiedAppStreamSendBuffer = true;
+  QuicStreamState stream(0x00, conn);
+  ASSERT_TRUE(stream.streamSendBuffer.has_value());
+  ASSERT_TRUE(stream.streamSendBuffer->append(nullptr, true));
+
+  const auto range = stream.streamSendBuffer->nextNewData(0);
+  ASSERT_TRUE(range.has_value());
+  ASSERT_TRUE(stream.streamSendBuffer->markNewDataSent(*range));
+
+  ASSERT_TRUE(getLargestWriteOffsetTxed(stream).has_value());
+  EXPECT_EQ(0u, *getLargestWriteOffsetTxed(stream));
+}
+
 TEST_F(QuicStreamFunctionsTestBase, TestWriteStream) {
   auto stream = conn.streamManager->createNextBidirectionalStream().value();
   auto buf1 = IOBuf::copyBuffer("I just met you");
   auto buf2 = IOBuf::copyBuffer("and this is crazy");
+  const auto expectedLength =
+      buf1->computeChainDataLength() + buf2->computeChainDataLength();
 
   ASSERT_FALSE(writeDataToQuicStream(*stream, buf1->clone(), false).hasError());
   ASSERT_FALSE(writeDataToQuicStream(*stream, buf2->clone(), false).hasError());
@@ -120,7 +223,71 @@ TEST_F(QuicStreamFunctionsTestBase, TestWriteStream) {
   IOBufEqualTo eq;
   buf1->appendToChain(std::move(buf2));
 
+  EXPECT_FALSE(stream->usesUnifiedSendBuffer());
+  EXPECT_EQ(stream->pendingWrites.chainLength(), expectedLength);
   EXPECT_TRUE(eq(stream->writeBuffer.move(), buf1));
+}
+
+TEST_F(QuicStreamFunctionsTestBase, UnifiedWriteOwnsChainedData) {
+  conn.transportSettings.useUnifiedAppStreamSendBuffer = true;
+  auto* stream = conn.streamManager->createNextBidirectionalStream().value();
+  auto data = IOBuf::copyBuffer("abc");
+  data->appendChain(IOBuf::copyBuffer("def"));
+
+  auto result = writeDataToQuicStream(*stream, std::move(data), false);
+
+  ASSERT_FALSE(result.hasError());
+  ASSERT_TRUE(stream->streamSendBuffer.has_value());
+  EXPECT_EQ(stream->pendingWriteBytes(), 6);
+  EXPECT_TRUE(stream->pendingWrites.empty());
+  EXPECT_TRUE(stream->writeBuffer.empty());
+  EXPECT_EQ(conn.flowControlState.sumCurStreamBufferLen, 6);
+  EXPECT_TRUE(writableContains(*conn.streamManager, stream->id));
+
+  std::string written;
+  ASSERT_TRUE(
+      stream->streamSendBuffer->writeAt(0, 6, [&written](ByteRange range) {
+        written.append(
+            reinterpret_cast<const char*>(range.data()), range.size());
+        return true;
+      }));
+  EXPECT_EQ(written, "abcdef");
+}
+
+TEST_F(QuicStreamFunctionsTestBase, UnifiedEmptyWriteAndFin) {
+  conn.transportSettings.useUnifiedAppStreamSendBuffer = true;
+  auto* stream = conn.streamManager->createNextBidirectionalStream().value();
+
+  ASSERT_FALSE(writeDataToQuicStream(*stream, nullptr, false).hasError());
+  ASSERT_TRUE(stream->streamSendBuffer.has_value());
+  EXPECT_EQ(stream->pendingWriteBytes(), 0);
+  EXPECT_FALSE(stream->finalWriteOffset.has_value());
+  EXPECT_FALSE(writableContains(*conn.streamManager, stream->id));
+
+  ASSERT_FALSE(writeDataToQuicStream(*stream, nullptr, true).hasError());
+  ASSERT_TRUE(stream->finalWriteOffset.has_value());
+  EXPECT_EQ(*stream->finalWriteOffset, 0);
+  EXPECT_TRUE(stream->streamSendBuffer->finBuffered());
+  EXPECT_TRUE(writableContains(*conn.streamManager, stream->id));
+  EXPECT_EQ(conn.flowControlState.sumCurStreamBufferLen, 0);
+}
+
+TEST_F(QuicStreamFunctionsTestBase, UnifiedWriteAfterFinReturnsError) {
+  conn.transportSettings.useUnifiedAppStreamSendBuffer = true;
+  auto* stream = conn.streamManager->createNextBidirectionalStream().value();
+  ASSERT_FALSE(writeDataToQuicStream(*stream, IOBuf::copyBuffer("abc"), true)
+                   .hasError());
+  const auto bufferedBytes = conn.flowControlState.sumCurStreamBufferLen;
+
+  auto result = writeDataToQuicStream(*stream, IOBuf::copyBuffer("def"), false);
+
+  ASSERT_TRUE(result.hasError());
+  const auto* localError = result.error().code.asLocalErrorCode();
+  ASSERT_NE(localError, nullptr);
+  EXPECT_EQ(*localError, LocalErrorCode::INVALID_WRITE_DATA);
+  EXPECT_EQ(stream->pendingWriteBytes(), 3);
+  EXPECT_EQ(stream->writeBufferEndOffset(), 3);
+  EXPECT_EQ(conn.flowControlState.sumCurStreamBufferLen, bufferedBytes);
 }
 
 TEST_F(QuicStreamFunctionsTestBase, TestReadDataWrittenInOrder) {
@@ -2499,8 +2666,79 @@ TEST_F(QuicStreamFunctionsTestBase, AckCryptoStream) {
   auto chlo = IOBuf::copyBuffer("CHLO");
   conn.cryptoState->handshakeStream.retransmissionBuffer.emplace(
       0, std::make_unique<WriteStreamBuffer>(ChainedByteRangeHead(chlo), 0));
-  processCryptoStreamAck(conn.cryptoState->handshakeStream, 0, chlo->length());
+  ASSERT_TRUE(processCryptoStreamAck(
+                  conn.cryptoState->handshakeStream, 0, chlo->length())
+                  .has_value());
   EXPECT_EQ(conn.cryptoState->handshakeStream.retransmissionBuffer.size(), 0);
+}
+
+TEST_F(QuicStreamFunctionsTestBase, CryptoStreamUsesLegacyBufferByDefault) {
+  auto& cryptoStream = conn.cryptoState->handshakeStream;
+
+  writeDataToQuicStream(conn, cryptoStream, IOBuf::copyBuffer("CHLO"));
+
+  EXPECT_FALSE(cryptoStream.streamSendBuffer.has_value());
+  EXPECT_EQ(cryptoStream.pendingWrites.chainLength(), 4);
+
+  conn.transportSettings.useUnifiedAppStreamSendBuffer = true;
+  writeDataToQuicStream(conn, cryptoStream, IOBuf::copyBuffer("more"));
+  EXPECT_FALSE(cryptoStream.streamSendBuffer.has_value());
+  EXPECT_EQ(cryptoStream.pendingWrites.chainLength(), 8);
+}
+
+TEST_F(QuicStreamFunctionsTestBase, CryptoStreamUsesOwningSendBuffer) {
+  conn.transportSettings.useUnifiedAppStreamSendBuffer = true;
+  conn.transportSettings.useNonCloningPto = true;
+  auto& cryptoStream = conn.cryptoState->handshakeStream;
+
+  writeDataToQuicStream(conn, cryptoStream, IOBuf::copyBuffer("CHLO"));
+
+  ASSERT_TRUE(cryptoStream.streamSendBuffer.has_value());
+  EXPECT_EQ(
+      cryptoStream.streamSendBuffer->nextNewData(10),
+      (StreamSendBuffer::SendRange{0, 4, false}));
+  EXPECT_TRUE(cryptoStream.pendingWrites.empty());
+  EXPECT_TRUE(cryptoStream.writeBuffer.empty());
+}
+
+TEST_F(QuicStreamFunctionsTestBase, CryptoStreamRequiresBothPtoSettings) {
+  conn.transportSettings.useNonCloningPto = true;
+  auto& cryptoStream = conn.cryptoState->handshakeStream;
+
+  writeDataToQuicStream(conn, cryptoStream, IOBuf::copyBuffer("CHLO"));
+
+  EXPECT_FALSE(cryptoStream.streamSendBuffer.has_value());
+  EXPECT_EQ(cryptoStream.pendingWrites.chainLength(), 4);
+}
+
+TEST_F(QuicStreamFunctionsTestBase, AckCryptoStreamRangeInOwningSendBuffer) {
+  conn.transportSettings.useUnifiedAppStreamSendBuffer = true;
+  conn.transportSettings.useNonCloningPto = true;
+  auto& cryptoStream = conn.cryptoState->initialStream;
+  writeDataToQuicStream(conn, cryptoStream, IOBuf::copyBuffer("0123456789"));
+  ASSERT_TRUE(cryptoStream.streamSendBuffer->markNewDataSent({0, 10, false}));
+  EXPECT_TRUE(cryptoStream.streamSendBuffer->markLoss({0, 10, false}));
+
+  ASSERT_TRUE(processCryptoStreamAck(cryptoStream, 2, 4).has_value());
+  ASSERT_TRUE(processCryptoStreamAck(cryptoStream, 2, 4).has_value());
+
+  EXPECT_EQ(cryptoStream.streamSendBuffer->outstandingBytes(), 6);
+  EXPECT_EQ(
+      cryptoStream.streamSendBuffer->nextLoss(10),
+      (StreamSendBuffer::SendRange{0, 2, false}));
+}
+
+TEST_F(QuicStreamFunctionsTestBase, AckCryptoStreamRejectsInvalidOwningRange) {
+  conn.transportSettings.useUnifiedAppStreamSendBuffer = true;
+  conn.transportSettings.useNonCloningPto = true;
+  auto& cryptoStream = conn.cryptoState->initialStream;
+  writeDataToQuicStream(conn, cryptoStream, IOBuf::copyBuffer("initial"));
+  ASSERT_TRUE(cryptoStream.streamSendBuffer->markNewDataSent({0, 7, false}));
+
+  const auto result = processCryptoStreamAck(cryptoStream, 6, 2);
+
+  EXPECT_TRUE(result.hasError());
+  EXPECT_EQ(cryptoStream.streamSendBuffer->outstandingBytes(), 7);
 }
 
 TEST_F(QuicStreamFunctionsTestBase, AckCryptoStreamOffsetLengthMismatch) {
@@ -2508,13 +2746,16 @@ TEST_F(QuicStreamFunctionsTestBase, AckCryptoStreamOffsetLengthMismatch) {
   auto& cryptoStream = conn.cryptoState->handshakeStream;
   cryptoStream.retransmissionBuffer.emplace(
       0, std::make_unique<WriteStreamBuffer>(ChainedByteRangeHead(chlo), 0));
-  processCryptoStreamAck(cryptoStream, 1, chlo->length());
+  ASSERT_TRUE(
+      processCryptoStreamAck(cryptoStream, 1, chlo->length()).has_value());
   EXPECT_EQ(cryptoStream.retransmissionBuffer.size(), 1);
 
-  processCryptoStreamAck(cryptoStream, 0, chlo->length() - 2);
+  ASSERT_TRUE(
+      processCryptoStreamAck(cryptoStream, 0, chlo->length() - 2).has_value());
   EXPECT_EQ(cryptoStream.retransmissionBuffer.size(), 1);
 
-  processCryptoStreamAck(cryptoStream, 20, chlo->length());
+  ASSERT_TRUE(
+      processCryptoStreamAck(cryptoStream, 20, chlo->length()).has_value());
   EXPECT_EQ(cryptoStream.retransmissionBuffer.size(), 1);
 }
 
@@ -2540,6 +2781,53 @@ TEST_F(QuicStreamFunctionsTestBase, CryptoStreamBufferLimitExceeded) {
   EXPECT_EQ(
       res2.error().code,
       QuicErrorCode(TransportErrorCode::CRYPTO_BUFFER_EXCEEDED));
+}
+
+TEST_F(QuicStreamFunctionsTestBase, AppendBeyondStreamFlowControlRejected) {
+  // Regression for T279928027: a STREAM fragment whose end offset exceeds the
+  // advertised stream flow-control window must abort the append with
+  // FLOW_CONTROL_ERROR and buffer nothing.
+  auto* stream = conn.streamManager->createNextBidirectionalStream().value();
+  stream->flowControlState.advertisedMaxOffset = 100;
+
+  // In-window data is accepted and buffered.
+  auto inWindow = IOBuf::create(100);
+  inWindow->append(100);
+  ASSERT_FALSE(
+      appendDataToReadBuffer(*stream, StreamBuffer(std::move(inWindow), 0))
+          .hasError());
+  EXPECT_EQ(stream->readBuffer.size(), 1);
+
+  // A 1-byte fragment one past the advertised window is rejected, and nothing
+  // is buffered for it.
+  auto beyond = IOBuf::create(1);
+  beyond->append(1);
+  auto res =
+      appendDataToReadBuffer(*stream, StreamBuffer(std::move(beyond), 100));
+  ASSERT_TRUE(res.hasError());
+  EXPECT_EQ(
+      res.error().code, QuicErrorCode(TransportErrorCode::FLOW_CONTROL_ERROR));
+  EXPECT_EQ(stream->readBuffer.size(), 1);
+}
+
+TEST_F(
+    QuicStreamFunctionsTestBase,
+    FlowControlViolationWithFinLeavesStreamClean) {
+  // A frame that carries a FIN and violates flow control must not leave
+  // finalReadOffset behind from the EOF bookkeeping.
+  auto* stream = conn.streamManager->createNextBidirectionalStream().value();
+  stream->flowControlState.advertisedMaxOffset = 100;
+
+  auto beyond = IOBuf::create(10);
+  beyond->append(10);
+  auto res = appendDataToReadBuffer(
+      *stream, StreamBuffer(std::move(beyond), 200, /*eofIn=*/true));
+  ASSERT_TRUE(res.hasError());
+  EXPECT_EQ(
+      res.error().code, QuicErrorCode(TransportErrorCode::FLOW_CONTROL_ERROR));
+  EXPECT_FALSE(stream->finalReadOffset.has_value());
+  EXPECT_EQ(stream->maxOffsetObserved, 0);
+  EXPECT_TRUE(stream->readBuffer.empty());
 }
 
 } // namespace quic::test

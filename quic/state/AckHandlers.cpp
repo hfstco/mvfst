@@ -64,12 +64,44 @@ Optional<uint64_t> getAckIntervalSetVersion(
   return getAckIntervalSetVersion(*maybeAckedStreamState);
 }
 
+quic::Expected<void, QuicError> processUnifiedStreamFramesForSpuriousAck(
+    QuicConnectionStateBase& conn,
+    const OutstandingPacketWrapper& packet,
+    const AckedFrameVisitor& ackedFrameVisitor) {
+  for (const auto& packetFrame : packet.packet.frames) {
+    bool shouldProcess = false;
+    if (const auto* streamFrame = packetFrame.asWriteStreamFrame()) {
+      const auto* stream =
+          conn.streamManager->findStream(streamFrame->streamId);
+      shouldProcess = packet.packet.header.getPacketNumberSpace() ==
+              PacketNumberSpace::AppData &&
+          stream && stream->streamSendBuffer;
+    } else if (packetFrame.asWriteCryptoFrame()) {
+      const auto encryptionLevel = protectionTypeToEncryptionLevel(
+          packet.packet.header.getProtectionType());
+      shouldProcess = getCryptoStream(*conn.cryptoState, encryptionLevel)
+                          ->streamSendBuffer.has_value();
+    }
+    if (!shouldProcess) {
+      continue;
+    }
+    auto result = ackedFrameVisitor(packet, packetFrame);
+    if (!result.has_value()) {
+      return result;
+    }
+  }
+  return {};
+}
+
 void updateCongestionControllerForAck(
     QuicConnectionStateBase& conn,
     AckEvent& ack,
     Optional<LossEvent>& lossEvent) {
-  if (conn.congestionController &&
-      (ack.largestNewlyAckedPacket.has_value() || lossEvent)) {
+  const bool hasAckOrLoss =
+      ack.largestNewlyAckedPacket.has_value() || lossEvent.has_value();
+  const bool hasCongestionControllerEvent =
+      hasAckOrLoss || ack.numPacketsSpuriouslyAcked > 0;
+  if (conn.congestionController && hasCongestionControllerEvent) {
     if (lossEvent) {
       PROTO_OOPS_LOG_BUILDER_IF(
           conn.nodeType == QuicNodeType::Server &&
@@ -103,10 +135,12 @@ void updateCongestionControllerForAck(
     }
     conn.congestionController->onPacketAckOrLoss(
         &ack, lossEvent.has_value() ? &lossEvent.value() : nullptr);
-    for (auto& packetProcessor : conn.packetProcessors) {
-      packetProcessor->onPacketAck(&ack);
-      packetProcessor->onPacketAckOrLoss(
-          &ack, lossEvent.has_value() ? &lossEvent.value() : nullptr);
+    if (hasAckOrLoss) {
+      for (auto& packetProcessor : conn.packetProcessors) {
+        packetProcessor->onPacketAck(&ack);
+        packetProcessor->onPacketAckOrLoss(
+            &ack, lossEvent.has_value() ? &lossEvent.value() : nullptr);
+      }
     }
 
     ack.ccState = conn.congestionController->getState();
@@ -270,12 +304,20 @@ quic::Expected<AckEvent, QuicError> processAckFrame(
             TransportErrorCode::INTERNAL_ERROR,
             "Failed to modify state for spurious loss"));
       }
+      if (!ack.implicit) {
+        ++ack.numPacketsSpuriouslyAcked;
+      }
       QUIC_STATS(conn.statsCallback, onPacketSpuriousLoss);
       if (spuriousLossEvent) {
         spuriousLossEvent->addSpuriousPacket(
             ackedPacketIterator->metadata,
             ackedPacketIterator->packet.header.getPacketSequenceNum(),
             ackedPacketIterator->packet.header.getPacketNumberSpace());
+      }
+      auto dataAckResult = processUnifiedStreamFramesForSpuriousAck(
+          conn, *ackedPacketIterator, ackedFrameVisitor);
+      if (!dataAckResult.has_value()) {
+        return quic::make_unexpected(dataAckResult.error());
       }
       ackedPacketIterator.next();
       continue;
@@ -658,8 +700,8 @@ PacketNum decrementPacketNum(PacketNum pktNum) {
 }
 
 // Legacy mvfst receive-timestamp parser. Uses `recvdPacketsTimestampRanges`
-// with `gap` semantics derived from `maybeLatestRecvdPacketNum`. Over-limit
-// is soft-logged and the parser returns early without raising an error.
+// with `gap` semantics derived from `largestAcked`. Over-limit is soft-logged
+// and the parser returns early without raising an error.
 void parseAckReceiveTimestampsLegacy(
     const QuicConnectionStateBase& conn,
     const quic::ReadAckFrame& frame,
@@ -682,7 +724,12 @@ void parseAckReceiveTimestampsLegacy(
     return;
   }
 
-  auto receivedPacketNum = frame.maybeLatestRecvdPacketNum.value();
+  // Wire invariant: the peer seeds its packet-number walk at Largest
+  // Acknowledged. Only the first range's `gap` is relative to it; later gaps
+  // chain off the previous range's start. Unlike draft-02, which anchors every
+  // range on Largest Acknowledged independently. See
+  // `fillFrameWithPacketReceiveTimestamps()` in QuicWriteCodec.cpp.
+  auto receivedPacketNum = frame.largestAcked;
 
   if (!firstPacketNum.has_value() ||
       receivedPacketNum < firstPacketNum.value()) {
@@ -719,9 +766,8 @@ void parseAckReceiveTimestampsLegacy(
                     << packetReceiveTimeStamps.size()
                     << " than requested timestamps from peer: "
                     << maxReceiveTimestampsRequestedFromPeer << " current PN "
-                    << receivedPacketNum << " largest PN "
-                    << frame.maybeLatestRecvdPacketNum.value() << " deltas  "
-                    << timeStampRange.deltas.size();
+                    << receivedPacketNum << " largest PN " << frame.largestAcked
+                    << " deltas  " << timeStampRange.deltas.size();
         return;
       }
       receiveTimeStamp -= delta;

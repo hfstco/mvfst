@@ -85,6 +85,7 @@ bool isUnprotectedPacketFrameInvalid(const QuicFrame& quicFrame) {
     case QuicFrame::Type::NoopFrame:
     case QuicFrame::Type::ImmediateAckFrame:
     case QuicFrame::Type::QuicSimpleFrame:
+    case QuicFrame::Type::TimestampFrame:
       return true;
   }
   folly::assume_unreachable();
@@ -114,6 +115,7 @@ bool isZeroRttPacketFrameInvalid(const QuicFrame& quicFrame) {
     case QuicFrame::Type::ReadCryptoFrame:
     case QuicFrame::Type::ReadNewTokenFrame:
     case QuicFrame::Type::ImmediateAckFrame:
+    case QuicFrame::Type::TimestampFrame:
       return true;
     case QuicFrame::Type::PingFrame:
     case QuicFrame::Type::ConnectionCloseFrame:
@@ -351,6 +353,22 @@ quic::Expected<void, QuicError> processClientInitialParams(
   }
   auto extendedAckFeatures = extendedAckFeaturesResult.value();
 
+  auto timestampFrameSupportedResult = getIntegerParameter(
+      TransportParameterId::timestamp_frame_supported, clientParams.parameters);
+  if (timestampFrameSupportedResult.hasError()) {
+    return quic::make_unexpected(timestampFrameSupportedResult.error());
+  }
+  auto timestampFrameSupported = timestampFrameSupportedResult.value();
+
+  auto timestampFrameTimestampExponentResult = getIntegerParameter(
+      TransportParameterId::timestamp_frame_timestamp_exponent,
+      clientParams.parameters);
+  if (timestampFrameTimestampExponentResult.hasError()) {
+    return quic::make_unexpected(timestampFrameTimestampExponentResult.error());
+  }
+  auto timestampFrameTimestampExponent =
+      timestampFrameTimestampExponentResult.value();
+
   auto quicExperimentResult = getIntegerParameter(
       static_cast<TransportParameterId>(TransportParameterId::quic_experiment),
       clientParams.parameters);
@@ -465,6 +483,10 @@ quic::Expected<void, QuicError> processClientInitialParams(
   }
   conn.peerAckDelayExponent =
       ackDelayExponent.value_or(kDefaultAckDelayExponent);
+  conn.peerMaxAckDelay = maxAckDelay.has_value()
+      ? std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::milliseconds(*maxAckDelay))
+      : kMaxAckTimeout;
   if (minAckDelay.has_value()) {
     conn.peerMinAckDelay = std::chrono::microseconds(minAckDelay.value());
   }
@@ -537,6 +559,26 @@ quic::Expected<void, QuicError> processClientInitialParams(
   }
 
   conn.peerAdvertisedKnobFrameSupport = knobFrameSupported.value_or(0) > 0;
+  conn.peerTimestampFrameState.canReceive =
+      timestampFrameSupported.value_or(0) > 0;
+  if (timestampFrameTimestampExponent &&
+      *timestampFrameTimestampExponent > kMaxTimestampFrameTimestampExponent) {
+    return quic::make_unexpected(QuicError(
+        TransportErrorCode::TRANSPORT_PARAMETER_ERROR,
+        fmt::format(
+            "timestamp_frame_timestamp_exponent above max: {} > {}",
+            *timestampFrameTimestampExponent,
+            kMaxTimestampFrameTimestampExponent)));
+  }
+  conn.peerTimestampFrameState.sendExponent =
+      static_cast<uint8_t>(timestampFrameTimestampExponent.value_or(
+          kDefaultTimestampFrameTimestampExponent));
+  if (conn.readCodec) {
+    auto codecParams = conn.readCodec->getCodecParameters();
+    codecParams.peerTimestampFrameTimestampExponent =
+        conn.peerTimestampFrameState.sendExponent;
+    conn.readCodec->setCodecParameters(std::move(codecParams));
+  }
   conn.peerAdvertisedExtendedAckFeatures = extendedAckFeatures.value_or(0);
   if (quicExperiment.has_value()) {
     conn.peerQuicExperimentId = static_cast<uint16_t>(*quicExperiment);
@@ -1136,11 +1178,14 @@ quic::Expected<void, QuicError> onServerReadDataFromOpen(
     conn.readCodec->setServerConnectionId(*conn.serverConnectionId);
     QLOG(conn, setScid, conn.serverConnectionId);
     QLOG(conn, setDcid, initialDestinationConnectionId);
-    conn.readCodec->setCodecParameters(CodecParameters(
+    CodecParameters codecParams(
         conn.peerAckDelayExponent,
         version,
         conn.transportSettings.maybeAckReceiveTimestampsConfigSentToPeer,
-        conn.transportSettings.advertisedExtendedAckFeatures));
+        conn.transportSettings.advertisedExtendedAckFeatures);
+    codecParams.peerTimestampFrameTimestampExponent =
+        conn.peerTimestampFrameState.sendExponent;
+    conn.readCodec->setCodecParameters(std::move(codecParams));
     auto serverInitialCipherResult = cryptoFactory.getServerInitialCipher(
         initialDestinationConnectionId, version);
     if (serverInitialCipherResult.hasError()) {
@@ -1249,7 +1294,7 @@ quic::Expected<void, QuicError> onServerReadDataFromOpen(
                     "scone_received:rate={}", static_cast<int>(sp->rate)));
           }
 
-          if (conn.scone && sp->rate != kSconeNoAdvice) {
+          if (conn.scone) {
             // Store rate signal conditionally - only queue if subsequent packet
             // processes successfully
             pendingSconeRateSignal = QuicConnectionStateBase::SconeRateSignal{
@@ -1454,8 +1499,7 @@ quic::Expected<void, QuicError> onServerReadDataFromOpen(
           const WriteCryptoFrame& frame = *packetFrame.asWriteCryptoFrame();
           auto cryptoStream =
               getCryptoStream(*conn.cryptoState, encryptionLevel);
-          processCryptoStreamAck(*cryptoStream, frame.offset, frame.len);
-          break;
+          return processCryptoStreamAck(*cryptoStream, frame.offset, frame.len);
         }
         case QuicWriteFrame::Type::RstStreamFrame: {
           const RstStreamFrame& frame = *packetFrame.asRstStreamFrame();
@@ -1769,6 +1813,9 @@ quic::Expected<void, QuicError> onServerReadDataFromOpen(
           isNonProbingPacket |= simpleResult.value();
           break;
         }
+        case QuicFrame::Type::TimestampFrame:
+          isNonProbingPacket = true;
+          break;
         case QuicFrame::Type::DatagramFrame: {
           DatagramFrame& frame = *quicFrame.asDatagramFrame();
           MVVLOG(10) << "Server received datagram data: " << " len="

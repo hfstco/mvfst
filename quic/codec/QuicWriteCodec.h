@@ -38,6 +38,11 @@ namespace quic {
     QuicWriteFrame&& frame,
     PacketBuilderInterface& builder);
 
+[[nodiscard]] quic::Expected<size_t, QuicError> getTimestampFrameEncodedSize(
+    const TimestampFrame& frame);
+
+[[nodiscard]] Optional<uint64_t> getStreamFrameDataLengthSize(uint64_t dataLen);
+
 /**
  * Write a complete stream frame header into builder
  * This writes the stream frame header into the parameter builder and returns
@@ -64,6 +69,16 @@ void writeStreamFrameData(
     PacketBuilderInterface& builder,
     const ChainedByteRangeHead& writeBuffer,
     uint64_t dataLen);
+
+/**
+ * Write a CryptoFrame header for up to dataLen bytes. The caller writes the
+ * returned number of bytes to the builder after this function returns.
+ */
+[[nodiscard]] quic::Expected<Optional<WriteCryptoFrame>, QuicError>
+writeCryptoFrameHeader(
+    uint64_t offsetIn,
+    uint64_t dataLen,
+    PacketBuilderInterface& builder);
 
 /**
  * Write a CryptoFrame into builder. The builder may not be able to accept all

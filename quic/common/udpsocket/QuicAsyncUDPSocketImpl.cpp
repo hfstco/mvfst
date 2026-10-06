@@ -45,9 +45,14 @@ QuicAsyncUDPSocketImpl::recvmmsgNetworkData(
   if (FOLLY_UNLIKELY(recvTosResult.hasError())) {
     return quic::make_unexpected(recvTosResult.error());
   }
+  auto recvTtlResult = getRecvTtl();
+  if (FOLLY_UNLIKELY(recvTtlResult.hasError())) {
+    return quic::make_unexpected(recvTtlResult.error());
+  }
 #if defined(FOLLY_HAVE_MSG_ERRQUEUE) || defined(_WIN32)
   bool useGRO = *groResult > 0;
-  bool checkCmsgs = useGRO || *timestampingResult > 0 || *recvTosResult;
+  bool checkCmsgs =
+      useGRO || *timestampingResult > 0 || *recvTosResult || *recvTtlResult;
   std::vector<std::array<
       char,
       QuicAsyncUDPSocket::ReadCallback::OnDataAvailableParams::kCmsgSpace>>
@@ -156,6 +161,11 @@ QuicAsyncUDPSocketImpl::recvmmsgNetworkData(
       timings.maybeSoftwareTs = convertToSocketTimestampExt(*params.ts);
     }
 
+    OptionalIntegral<uint8_t> packetTtl;
+    if (params.ttl.has_value()) {
+      packetTtl = *params.ttl;
+    }
+
     MVVLOG(10) << "Got data from socket len=" << bytesRead;
     readBuffer->append(bytesRead);
     if (params.gro > 0) {
@@ -181,6 +191,7 @@ QuicAsyncUDPSocketImpl::recvmmsgNetworkData(
           remaining -= params.gro;
           auto& packet =
               networkData.emplacePacket(std::move(tmp), timings, params.tos);
+          packet.ttlValue = packetTtl;
           packet.peerAddress = packetPeerAddress;
         } else {
           // do not clone the last packet
@@ -190,12 +201,14 @@ QuicAsyncUDPSocketImpl::recvmmsgNetworkData(
           remaining = 0;
           auto& packet = networkData.emplacePacket(
               std::move(readBuffer), timings, params.tos);
+          packet.ttlValue = packetTtl;
           packet.peerAddress = packetPeerAddress;
         }
       }
     } else {
-      networkData.emplacePacket(
+      auto& packet = networkData.emplacePacket(
           std::move(readBuffer), timings, params.tos, rawAddr, kAddrLen);
+      packet.ttlValue = packetTtl;
     }
   }
 

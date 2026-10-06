@@ -73,6 +73,10 @@ class QuicTransportStatsCallback {
 
   virtual void onPacketLoss() = 0;
 
+  virtual void onPacketLossByTimeout() = 0;
+
+  virtual void onPacketLossByReorderingThreshold() = 0;
+
   virtual void onPacketSpuriousLoss() = 0;
 
   virtual void onPersistentCongestion() = 0;
@@ -80,8 +84,6 @@ class QuicTransportStatsCallback {
   virtual void onPacketDropped(quic::PacketDropReason reason) = 0;
 
   virtual void onPacketForwarded() = 0;
-
-  virtual void onPacketDroppedByEgressPolicer() = 0;
 
   virtual void onForwardedPacketReceived() = 0;
 
@@ -119,6 +121,8 @@ class QuicTransportStatsCallback {
 
   // stream level metrics
   virtual void onNewQuicStream() = 0;
+
+  virtual void onNewUnifiedAppStream() {}
 
   virtual void onQuicStreamClosed() = 0;
 

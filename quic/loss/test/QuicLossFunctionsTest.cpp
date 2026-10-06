@@ -323,6 +323,28 @@ RegularQuicWritePacket stripPaddingFrames(RegularQuicWritePacket packet) {
   return packet;
 }
 
+RegularQuicWritePacket
+makeStreamPacket(StreamId streamId, uint64_t offset, uint64_t len, bool fin) {
+  RegularQuicWritePacket packet(
+      ShortHeader(ProtectionType::KeyPhaseZero, getTestConnectionId(), 0));
+  packet.frames.push_back(WriteStreamFrame(streamId, offset, len, fin));
+  return packet;
+}
+
+RegularQuicWritePacket makeInitialCryptoPacket(
+    const QuicConnectionStateBase& conn,
+    uint64_t offset,
+    uint64_t len) {
+  RegularQuicWritePacket packet(LongHeader(
+      LongHeader::Types::Initial,
+      *conn.clientConnectionId,
+      *conn.serverConnectionId,
+      0,
+      *conn.version));
+  packet.frames.push_back(WriteCryptoFrame(offset, len));
+  return packet;
+}
+
 TEST_F(QuicLossFunctionsTest, AllPacketsProcessed) {
   auto conn = createConn();
   EXPECT_CALL(*quicStats_, onPTO()).Times(0);
@@ -542,6 +564,147 @@ TEST_F(QuicLossFunctionsTest, TestMarkPacketLoss) {
   EXPECT_EQ(buffer.offset, 0);
   EXPECT_EQ(
       ByteRange(buf->data(), buf->length()), buffer.data.getHead()->getRange());
+}
+
+TEST_F(QuicLossFunctionsTest, UnifiedLossExcludesPreviouslyAckedBytes) {
+  auto conn = createConn();
+  conn->transportSettings.useUnifiedAppStreamSendBuffer = true;
+  EXPECT_CALL(*quicStats_, onNewQuicStream()).Times(1);
+  auto* stream = conn->streamManager->createNextBidirectionalStream().value();
+  ASSERT_TRUE(stream->streamSendBuffer.has_value());
+  ASSERT_TRUE(stream->streamSendBuffer->append(
+      folly::IOBuf::copyBuffer("abcdefgh"), true));
+  ASSERT_TRUE(stream->streamSendBuffer->markNewDataSent({0, 8, true}));
+
+  ASSERT_FALSE(
+      sendAckSMHandler(*stream, WriteStreamFrame(stream->id, 2, 4, false))
+          .hasError());
+  auto packet = makeStreamPacket(stream->id, 0, 8, true);
+  ASSERT_FALSE(
+      markPacketLoss(*conn, conn->currentPathId, packet, false).hasError());
+
+  EXPECT_EQ(stream->streamLossCount, 1);
+  EXPECT_TRUE(stream->hasLoss());
+  EXPECT_TRUE(conn->streamManager->hasLoss());
+  EXPECT_EQ(
+      stream->streamSendBuffer->nextLoss(8),
+      StreamSendBuffer::SendRange(0, 2, false));
+
+  stream->streamSendBuffer->markRetransmissionSent(
+      {.offset = 0, .len = 2, .fin = false});
+  EXPECT_EQ(
+      stream->streamSendBuffer->nextLoss(8),
+      StreamSendBuffer::SendRange(6, 2, true));
+
+  ASSERT_FALSE(
+      markPacketLoss(*conn, conn->currentPathId, packet, true).hasError());
+  EXPECT_EQ(stream->streamLossCount, 1);
+
+  ASSERT_FALSE(
+      sendAckSMHandler(*stream, WriteStreamFrame(stream->id, 0, 8, true))
+          .hasError());
+  EXPECT_EQ(stream->sendState, StreamSendState::Closed);
+  EXPECT_FALSE(stream->hasLoss());
+  EXPECT_FALSE(conn->streamManager->hasLoss());
+}
+
+TEST_F(QuicLossFunctionsTest, CryptoLossExcludesPreviouslyAckedBytes) {
+  auto conn = createConn();
+  conn->transportSettings.useUnifiedAppStreamSendBuffer = true;
+  conn->transportSettings.useNonCloningPto = true;
+  auto& cryptoStream = conn->cryptoState->initialStream;
+  writeDataToQuicStream(
+      *conn, cryptoStream, folly::IOBuf::copyBuffer("abcdefgh"));
+  ASSERT_TRUE(cryptoStream.streamSendBuffer->markNewDataSent(
+      {.offset = 0, .len = 8, .fin = false}));
+  ASSERT_TRUE(processCryptoStreamAck(cryptoStream, 2, 4).has_value());
+
+  auto packet = makeInitialCryptoPacket(*conn, 0, 8);
+  ASSERT_FALSE(
+      markPacketLoss(*conn, conn->currentPathId, packet, false).hasError());
+
+  EXPECT_EQ(
+      cryptoStream.streamSendBuffer->nextLoss(8),
+      StreamSendBuffer::SendRange(0, 2, false));
+  cryptoStream.streamSendBuffer->markRetransmissionSent(
+      {.offset = 0, .len = 2, .fin = false});
+  EXPECT_EQ(
+      cryptoStream.streamSendBuffer->nextLoss(8),
+      StreamSendBuffer::SendRange(6, 2, false));
+}
+
+TEST_F(QuicLossFunctionsTest, UnifiedLossAfterDuplicateAckIsIgnored) {
+  auto conn = createConn();
+  conn->transportSettings.useUnifiedAppStreamSendBuffer = true;
+  EXPECT_CALL(*quicStats_, onNewQuicStream()).Times(1);
+  auto* stream = conn->streamManager->createNextBidirectionalStream().value();
+  ASSERT_TRUE(stream->streamSendBuffer.has_value());
+  ASSERT_TRUE(
+      stream->streamSendBuffer->append(folly::IOBuf::copyBuffer("data"), true));
+  ASSERT_TRUE(stream->streamSendBuffer->markNewDataSent({0, 4, true}));
+
+  const WriteStreamFrame frame(stream->id, 0, 4, true);
+  ASSERT_FALSE(sendAckSMHandler(*stream, frame).hasError());
+  const auto ackVersion = stream->streamSendBuffer->ackInsertVersion();
+  ASSERT_FALSE(sendAckSMHandler(*stream, frame).hasError());
+  EXPECT_EQ(stream->streamSendBuffer->ackInsertVersion(), ackVersion);
+
+  auto packet = makeStreamPacket(stream->id, 0, 4, true);
+  ASSERT_FALSE(
+      markPacketLoss(*conn, conn->currentPathId, packet, false).hasError());
+  EXPECT_FALSE(stream->hasLoss());
+  EXPECT_FALSE(conn->streamManager->hasLoss());
+  EXPECT_EQ(stream->streamLossCount, 0);
+}
+
+TEST_F(QuicLossFunctionsTest, UnifiedFinOnlyLossIsClearedByAck) {
+  auto conn = createConn();
+  conn->transportSettings.useUnifiedAppStreamSendBuffer = true;
+  EXPECT_CALL(*quicStats_, onNewQuicStream()).Times(1);
+  auto* stream = conn->streamManager->createNextBidirectionalStream().value();
+  ASSERT_TRUE(stream->streamSendBuffer.has_value());
+  ASSERT_TRUE(stream->streamSendBuffer->append(nullptr, true));
+  ASSERT_TRUE(stream->streamSendBuffer->markNewDataSent({0, 0, true}));
+
+  auto packet = makeStreamPacket(stream->id, 0, 0, true);
+  ASSERT_FALSE(
+      markPacketLoss(*conn, conn->currentPathId, packet, false).hasError());
+  EXPECT_EQ(
+      stream->streamSendBuffer->nextLoss(1),
+      StreamSendBuffer::SendRange(0, 0, true));
+  EXPECT_EQ(stream->streamLossCount, 1);
+  EXPECT_TRUE(conn->streamManager->hasLoss());
+
+  ASSERT_FALSE(
+      sendAckSMHandler(*stream, WriteStreamFrame(stream->id, 0, 0, true))
+          .hasError());
+  EXPECT_EQ(stream->sendState, StreamSendState::Closed);
+  EXPECT_FALSE(stream->hasLoss());
+  EXPECT_FALSE(conn->streamManager->hasLoss());
+}
+
+TEST_F(
+    QuicLossFunctionsTest,
+    UnifiedLossIsAbandonedWhenRetransmissionDisabled) {
+  auto conn = createConn();
+  conn->transportSettings.useUnifiedAppStreamSendBuffer = true;
+  EXPECT_CALL(*quicStats_, onNewQuicStream()).Times(1);
+  auto* stream = conn->streamManager->createNextBidirectionalStream().value();
+  ASSERT_TRUE(stream->streamSendBuffer.has_value());
+  ASSERT_TRUE(
+      stream->streamSendBuffer->append(folly::IOBuf::copyBuffer("data"), true));
+  ASSERT_TRUE(stream->streamSendBuffer->markNewDataSent({0, 4, true}));
+  stream->retransmissionDisabled_ = true;
+
+  auto packet = makeStreamPacket(stream->id, 0, 4, true);
+  ASSERT_FALSE(
+      markPacketLoss(*conn, conn->currentPathId, packet, false).hasError());
+
+  EXPECT_EQ(stream->streamSendBuffer->outstandingBytes(), 0);
+  EXPECT_FALSE(stream->hasLoss());
+  EXPECT_FALSE(conn->streamManager->hasLoss());
+  EXPECT_EQ(stream->streamLossCount, 0);
+  EXPECT_FALSE(writeQueueContains(*conn, stream->id));
 }
 
 bool areEqual(folly::IOBuf* ptr, ChainedByteRangeHead* rch) {
@@ -1489,6 +1652,20 @@ TEST_F(QuicLossFunctionsTest, PTOAvoidPointless) {
   EXPECT_EQ(conn->pendingEvents.numProbePackets[PacketNumberSpace::AppData], 1);
 }
 
+TEST_F(QuicLossFunctionsTest, PTOLegacyPendingCryptoDoesNotAddProbe) {
+  auto conn = createConn();
+  conn->initialWriteCipher = createNoOpAead();
+  conn->initialHeaderCipher = createNoOpHeaderCipher().value();
+  conn->outstandings.packetCount[PacketNumberSpace::Initial] = 1;
+  conn->cryptoState->initialStream.pendingWrites.append(
+      folly::IOBuf::copyBuffer("pending"));
+
+  const auto result = onPTOAlarm(*conn);
+
+  EXPECT_FALSE(result.hasError());
+  EXPECT_EQ(conn->pendingEvents.numProbePackets[PacketNumberSpace::Initial], 1);
+}
+
 TEST_F(QuicLossFunctionsTest, EmptyOutstandingNoTimeout) {
   auto conn = createConn();
   EXPECT_CALL(timeout, cancelLossTimeout()).Times(1);
@@ -1925,11 +2102,12 @@ TEST_F(QuicLossFunctionsTest, TestZeroRttRejectedWithClones) {
   }
 }
 
-TEST_F(QuicLossFunctionsTest, PTOLargerThanMaxDelay) {
+TEST_F(QuicLossFunctionsTest, PTOBoundsObservedAckDelay) {
   QuicConnectionStateBase conn(QuicNodeType::Client);
   conn.lossState.srtt = 1ms;
   conn.lossState.maxAckDelay = 20s;
-  EXPECT_GE(calculatePTO(conn), 20s);
+  conn.peerMaxAckDelay = 20ms;
+  EXPECT_EQ(21ms, calculatePTO(conn));
 }
 
 TEST_F(QuicLossFunctionsTest, InitialPTOs) {
@@ -2074,6 +2252,7 @@ TEST_F(QuicLossFunctionsTest, PersistentCongestion) {
 
   conn->lossState.rttvar = 2s;
   conn->lossState.maxAckDelay = 5s;
+  conn->peerMaxAckDelay = 5s;
   EXPECT_TRUE(isPersistentCongestion(
       calculatePTO(*conn), currentTime - 42s, currentTime, ack));
   EXPECT_TRUE(isPersistentCongestion(
@@ -2236,6 +2415,8 @@ TEST_F(QuicLossFunctionsTest, ObserverLossEventReorder) {
 
   auto& ackState = getAckState(*conn, PacketNumberSpace::AppData);
   ackState.largestAckedByPeer = largestSent;
+  EXPECT_CALL(*quicStats_, onPacketLossByTimeout()).Times(0);
+  EXPECT_CALL(*quicStats_, onPacketLossByReorderingThreshold()).Times(2);
   ASSERT_FALSE(detectLossPackets(
                    *conn,
                    ackState,
@@ -2328,6 +2509,8 @@ TEST_F(QuicLossFunctionsTest, ObserverLossEventTimeout) {
       .Times(1);
   auto& ackState = getAckState(*conn, PacketNumberSpace::AppData);
   ackState.largestAckedByPeer = largestSent;
+  EXPECT_CALL(*quicStats_, onPacketLossByTimeout()).Times(6);
+  EXPECT_CALL(*quicStats_, onPacketLossByReorderingThreshold()).Times(0);
   ASSERT_FALSE(detectLossPackets(
                    *conn,
                    ackState,
@@ -2429,6 +2612,8 @@ TEST_F(QuicLossFunctionsTest, ObserverLossEventTimeoutAndReorder) {
       .Times(1);
   auto& ackState = getAckState(*conn, PacketNumberSpace::AppData);
   ackState.largestAckedByPeer = largestSent;
+  EXPECT_CALL(*quicStats_, onPacketLossByTimeout()).Times(3);
+  EXPECT_CALL(*quicStats_, onPacketLossByReorderingThreshold()).Times(2);
   ASSERT_FALSE(detectLossPackets(
                    *conn,
                    ackState,

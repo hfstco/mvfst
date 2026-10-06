@@ -253,15 +253,21 @@ class QuicSocketLite {
     // The max offset I have provided to the peer.
     uint64_t receiveWindowMaxOffset;
 
+    // Max number of bytes we can write; i.e. result of
+    // maxWritableOn(Stream|Conn) for get(Stream|Conn)FlowControl
+    uint64_t maxWritable;
+
     FlowControlState(
         uint64_t sendWindowAvailableIn,
         uint64_t sendWindowMaxOffsetIn,
         uint64_t receiveWindowAvailableIn,
-        uint64_t receiveWindowMaxOffsetIn)
+        uint64_t receiveWindowMaxOffsetIn,
+        uint64_t maxWritableIn)
         : sendWindowAvailable(sendWindowAvailableIn),
           sendWindowMaxOffset(sendWindowMaxOffsetIn),
           receiveWindowAvailable(receiveWindowAvailableIn),
-          receiveWindowMaxOffset(receiveWindowMaxOffsetIn) {}
+          receiveWindowMaxOffset(receiveWindowMaxOffsetIn),
+          maxWritable(maxWritableIn) {}
   };
 
   /**
@@ -813,15 +819,17 @@ class QuicSocketLite {
    * Information about a received SCONE rate signal.
    */
   struct SconeRateInfo {
-    // SCONE rate converted to bits per second.
-    uint64_t bps;
+    // Raw 7-bit SCONE rate signal. kSconeNoAdvice means no rate advice.
+    uint8_t rateSignal;
+    // SCONE rate converted to bits per second, absent for kSconeNoAdvice.
+    Optional<uint64_t> advisedBps;
     // steady_clock time when the signal was received.
     TimePoint receivedTime;
   };
 
   /**
    * Returns and clears the pending SCONE rate signal received from the peer.
-   * The rate is converted from the SCONE logarithmic encoding to bps.
+   * Valid rates are converted from the SCONE logarithmic encoding to bps.
    * Edge-triggered: subsequent calls return nullopt until a new signal arrives.
    * Must be called from the event base thread.
    */

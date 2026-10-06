@@ -342,6 +342,22 @@ class MockQuicSocket : public QuicSocket {
 
   MOCK_METHOD(WriteResult, writeDatagram, (SharedBuf));
 
+  WriteResult writeDatagram(
+      PriorityQueue::Priority priority,
+      BufPtr data,
+      std::optional<std::chrono::milliseconds> maxQueueTime =
+          std::nullopt) override {
+    SharedBuf sharedData(data.release());
+    return writeDatagramWithPriority(priority, sharedData, maxQueueTime);
+  }
+
+  MOCK_METHOD(
+      WriteResult,
+      writeDatagramWithPriority,
+      (PriorityQueue::Priority,
+       SharedBuf,
+       std::optional<std::chrono::milliseconds>));
+
   MOCK_METHOD(
       (quic::Expected<uint32_t, LocalErrorCode>),
       createDatagramFlowId,
@@ -349,7 +365,8 @@ class MockQuicSocket : public QuicSocket {
 
   quic::Expected<void, LocalErrorCode> writeDatagram(
       uint32_t flowId,
-      BufPtr data) override {
+      BufPtr data,
+      uint64_t /*intraFlowPriority*/ = 0) override {
     SharedBuf sharedData(data.release());
     return writeDatagramWithFlowId(flowId, sharedData);
   }
@@ -363,7 +380,17 @@ class MockQuicSocket : public QuicSocket {
 
   MOCK_METHOD(
       (quic::Expected<void, LocalErrorCode>),
+      setDatagramFlowMaxQueueTime,
+      (uint32_t, std::chrono::milliseconds));
+
+  MOCK_METHOD(
+      (quic::Expected<void, LocalErrorCode>),
       closeDatagramFlow,
+      (uint32_t));
+
+  MOCK_METHOD(
+      (quic::Expected<void, LocalErrorCode>),
+      closeDatagramFlowNow,
       (uint32_t));
 
   MOCK_METHOD(

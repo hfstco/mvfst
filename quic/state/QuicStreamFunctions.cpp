@@ -33,16 +33,26 @@ writeDataToQuicStream(QuicStreamState& stream, BufPtr data, bool eof) {
   if (data) {
     len = data->computeChainDataLength();
   }
-  if (len > 0) {
-    // We call this before updating the writeBuffer because we only want to
-    // write a blocked frame first time the stream becomes blocked
-    maybeWriteBlockAfterAPIWrite(stream);
+  const bool hadPendingWrites = stream.pendingWriteBytes() > 0;
+  if (stream.streamSendBuffer) {
+    if (!stream.streamSendBuffer->append(std::move(data), eof)) {
+      return quic::make_unexpected(QuicError(
+          QuicErrorCode(LocalErrorCode::INVALID_WRITE_DATA),
+          "Cannot append data to the unified stream send buffer"));
+    }
+    if (eof) {
+      stream.finalWriteOffset = stream.streamSendBuffer->tailOffset();
+    }
+  } else {
+    stream.pendingWrites.append(data);
+    stream.writeBuffer.append(std::move(data));
+    if (eof) {
+      auto bufferSize = stream.pendingWrites.chainLength();
+      stream.finalWriteOffset = stream.currentWriteOffset + bufferSize;
+    }
   }
-  stream.pendingWrites.append(data);
-  stream.writeBuffer.append(std::move(data));
-  if (eof) {
-    auto bufferSize = stream.pendingWrites.chainLength();
-    stream.finalWriteOffset = stream.currentWriteOffset + bufferSize;
+  if (len > 0) {
+    maybeWriteBlockAfterAPIWrite(stream, hadPendingWrites);
   }
   auto result = updateFlowControlOnWriteToStream(stream, len);
   if (!result.has_value()) {
@@ -55,6 +65,28 @@ writeDataToQuicStream(QuicStreamState& stream, BufPtr data, bool eof) {
 void writeDataToQuicStream(QuicCryptoStream& stream, BufPtr data) {
   stream.pendingWrites.append(data);
   stream.writeBuffer.append(std::move(data));
+}
+
+void writeDataToQuicStream(
+    QuicConnectionStateBase& conn,
+    QuicCryptoStream& stream,
+    BufPtr data) {
+  if (!stream.streamSendBuffer) {
+    const bool useOwnedSendBuffer =
+        conn.transportSettings.useUnifiedAppStreamSendBuffer &&
+        conn.transportSettings.useNonCloningPto &&
+        stream.pendingWrites.empty() && stream.writeBuffer.empty() &&
+        stream.retransmissionBuffer.empty() && stream.lossBuffer.empty() &&
+        stream.currentWriteOffset == 0;
+    if (!useOwnedSendBuffer) {
+      writeDataToQuicStream(stream, std::move(data));
+      return;
+    }
+    stream.streamSendBuffer.emplace();
+  }
+  MVCHECK(
+      stream.streamSendBuffer->append(std::move(data), false),
+      "Cannot append data to the crypto stream send buffer");
 }
 
 // Helper function which appends a raw data range to what MUST be a "tail" of
@@ -93,7 +125,8 @@ quic::Expected<void, QuicError> appendDataToReadBufferCommon(
     QuicStreamLike& stream,
     StreamBuffer buffer,
     uint32_t coalescingSize,
-    FunctionRef<void(uint64_t, uint64_t)> connFlowControlVisitor) {
+    FunctionRef<quic::Expected<void, QuicError>(uint64_t, uint64_t)>
+        connFlowControlVisitor) {
   auto& readBuffer = stream.readBuffer;
   auto it = readBuffer.begin();
 
@@ -119,7 +152,6 @@ quic::Expected<void, QuicError> appendDataToReadBufferCommon(
           QuicErrorCode(TransportErrorCode::FINAL_SIZE_ERROR),
           std::string("EOF in middle of stream")));
     }
-    stream.finalReadOffset = bufferEofOffset;
   } else if (stream.finalReadOffset) {
     // We did not receive a segment with an EOF set.
     if (buffer.offset + buffer.data.chainLength() > *stream.finalReadOffset) {
@@ -129,8 +161,16 @@ quic::Expected<void, QuicError> appendDataToReadBufferCommon(
     }
   }
   // Update the flow control information before changing max offset observed on
-  // the stream.
-  connFlowControlVisitor(stream.maxOffsetObserved, bufferEndOffset);
+  // the stream. This runs after the consistency checks but before any stream
+  // mutation, so a violation leaves the stream state untouched.
+  auto flowControlResult =
+      connFlowControlVisitor(stream.maxOffsetObserved, bufferEndOffset);
+  if (!flowControlResult.has_value()) {
+    return quic::make_unexpected(flowControlResult.error());
+  }
+  if (bufferEofOffset) {
+    stream.finalReadOffset = bufferEofOffset;
+  }
   stream.maxOffsetObserved =
       std::max(stream.maxOffsetObserved, bufferEndOffset);
 
@@ -319,7 +359,10 @@ quic::Expected<void, QuicError> appendDataToReadBuffer(
         "crypto read buffer limit exceeded"));
   }
   return appendDataToReadBufferCommon(
-      stream, std::move(buffer), 0, [](uint64_t, uint64_t) {});
+      stream,
+      std::move(buffer),
+      0,
+      [](uint64_t, uint64_t) -> quic::Expected<void, QuicError> { return {}; });
 }
 
 std::pair<BufPtr, bool> readDataInOrderFromReadBuffer(
@@ -477,8 +520,13 @@ bool allBytesTillFinAcked(const QuicStreamState& stream) {
    * 4. We have no bytes left to write
    * 5. We have no bytes that are detected as lost.
    */
+  if (stream.streamSendBuffer) {
+    return stream.streamSendBuffer->finBuffered() &&
+        stream.streamSendBuffer->allBytesAckedTill(
+            stream.streamSendBuffer->tailOffset());
+  }
   return stream.hasSentFIN() && stream.retransmissionBuffer.empty() &&
-      stream.pendingWrites.empty() && stream.lossBuffer.empty();
+      stream.pendingWrites.empty() && !stream.hasLoss();
 }
 
 void appendPendingStreamReset(
@@ -503,7 +551,7 @@ void appendPendingStreamReset(
    * RESET_STREAM_AT frames by virtue of the fact that it's the maxiumum of the
    * current write offset and the new reliable size.
    */
-  uint64_t finalSize = stream.currentWriteOffset;
+  uint64_t finalSize = stream.nextOffsetToWrite();
   if (reliableSize) {
     // It's possible that we've queued up data at the socket, but haven't yet
     // written it out to the wire, so stream.currentWriteOffset could be
@@ -521,20 +569,26 @@ void appendPendingStreamReset(
 }
 
 uint64_t getLargestWriteOffsetSeen(const QuicStreamState& stream) {
-  return stream.finalWriteOffset.value_or(
-      stream.currentWriteOffset + stream.pendingWrites.chainLength());
+  return stream.finalWriteOffset.value_or(stream.writeBufferEndOffset());
 }
 
 Optional<uint64_t> getLargestWriteOffsetTxed(const QuicStreamState& stream) {
-  // currentWriteOffset is really nextWriteOffset
+  if (stream.streamSendBuffer && stream.streamSendBuffer->finSent()) {
+    return stream.streamSendBuffer->tailOffset();
+  }
+  const auto nextWriteOffset = stream.nextOffsetToWrite();
+  // nextWriteOffset is the next offset to transmit.
   // when 0, it indicates nothing has been written yet
-  if (stream.currentWriteOffset == 0) {
+  if (nextWriteOffset == 0) {
     return std::nullopt;
   }
-  return stream.currentWriteOffset - 1;
+  return nextWriteOffset - 1;
 }
 
 Optional<uint64_t> getLargestDeliverableOffset(const QuicStreamState& stream) {
+  if (stream.streamSendBuffer) {
+    return stream.streamSendBuffer->largestDeliverableOffset();
+  }
   // If the acked intervals is not empty, then the furthest acked interval
   // starting at zero is the next offset. If there is no interval starting at
   // zero then we cannot deliver any offsets.
@@ -546,7 +600,8 @@ Optional<uint64_t> getLargestDeliverableOffset(const QuicStreamState& stream) {
 }
 
 uint64_t getAckIntervalSetVersion(const QuicStreamState& stream) {
-  return stream.ackedIntervals.insertVersion();
+  return stream.streamSendBuffer ? stream.streamSendBuffer->ackInsertVersion()
+                                 : stream.ackedIntervals.insertVersion();
 }
 
 uint64_t getNumPacketsTxWithNewData(const QuicStreamState& stream) {
@@ -573,18 +628,29 @@ QuicCryptoStream* getCryptoStream(
   folly::assume_unreachable();
 }
 
-void processCryptoStreamAck(
+quic::Expected<void, QuicError> processCryptoStreamAck(
     QuicCryptoStream& cryptoStream,
     uint64_t offset,
     uint64_t len) {
+  if (cryptoStream.streamSendBuffer) {
+    const auto ackResult = cryptoStream.streamSendBuffer->markAcked(
+        {.offset = offset, .len = len, .fin = false});
+    if (!ackResult.has_value()) {
+      return quic::make_unexpected(QuicError(
+          TransportErrorCode::INTERNAL_ERROR,
+          "ACK range is not valid for the crypto stream send buffer"));
+    }
+    return {};
+  }
   auto ackedBuffer = cryptoStream.retransmissionBuffer.find(offset);
   if (ackedBuffer == cryptoStream.retransmissionBuffer.end() ||
       ackedBuffer->second->offset != offset ||
       ackedBuffer->second->data.chainLength() != len) {
     // It's possible retransmissions of crypto data were canceled.
-    return;
+    return {};
   }
   cryptoStream.retransmissionBuffer.erase(ackedBuffer);
+  return {};
 }
 
 void processTxStopSending(QuicStreamState& stream) {

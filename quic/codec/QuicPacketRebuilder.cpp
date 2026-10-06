@@ -15,16 +15,57 @@
 #include <quic/state/QuicStateFunctions.h>
 #include <quic/state/QuicStreamFunctions.h>
 #include <quic/state/SimpleFrameFunctions.h>
+#include <quic/state/TimestampFrameFunctions.h>
 
 namespace quic {
+namespace {
+
+quic::Expected<bool, QuicError> completeStreamFrameFits(
+    const WriteStreamFrame& frame,
+    bool skipLengthField,
+    uint64_t availableSpace) {
+  uint64_t headerSize = sizeof(uint8_t);
+  auto streamIdSize = QuicInteger(frame.streamId).getSize();
+  if (streamIdSize.hasError()) {
+    return quic::make_unexpected(streamIdSize.error());
+  }
+  headerSize += streamIdSize.value();
+
+  if (frame.offset != 0) {
+    auto offsetSize = QuicInteger(frame.offset).getSize();
+    if (offsetSize.hasError()) {
+      return quic::make_unexpected(offsetSize.error());
+    }
+    headerSize += offsetSize.value();
+  }
+
+  if (!skipLengthField) {
+    const auto lengthFieldSize = getStreamFrameDataLengthSize(frame.len);
+    if (!lengthFieldSize) {
+      return false;
+    }
+    headerSize += *lengthFieldSize;
+  }
+
+  return availableSpace >= headerSize &&
+      frame.len <= availableSpace - headerSize;
+}
+
+} // namespace
 
 PacketRebuilder::PacketRebuilder(
     PacketBuilderInterface& regularBuilder,
     QuicConnectionStateBase& conn)
-    : builder_(regularBuilder), conn_(conn) {}
+    : conn_(conn),
+      timestampPacketObserver_(),
+      builder_(
+          regularBuilder,
+          timestampPacketObserver_,
+          shouldWriteOneRttTimestampFrame(conn_, false) &&
+              regularBuilder.getPacketHeader().asShort()) {}
 
 uint64_t PacketRebuilder::getHeaderBytes() const {
-  return builder_.getHeaderBytes();
+  return builder_.builder().getHeaderBytes();
 }
 
 ClonedPacketIdentifier PacketRebuilder::cloneOutstandingPacket(
@@ -77,6 +118,7 @@ PacketRebuilder::rebuildFromPacket(OutstandingPacketWrapper& packet) {
   bool shouldWriteWindowUpdate = false;
   bool notPureAck = false;
   bool shouldRebuildWriteAckFrame = false;
+  auto& packetBuilder = builder_.builder();
   auto encryptionLevel =
       protectionTypeToEncryptionLevel(packet.packet.header.getProtectionType());
   // First check if there's an ACK in this packet. We do this because we need
@@ -119,10 +161,63 @@ PacketRebuilder::rebuildFromPacket(OutstandingPacketWrapper& packet) {
         }
         auto* stream = streamResult.value();
         if (stream && retransmittable(*stream)) {
+          if (stream->streamSendBuffer) {
+            const bool skipLengthField =
+                lastFrame && streamFrame.len != 0 && !hasAckFrame;
+            const StreamSendBuffer::SendRange sendRange{
+                .offset = streamFrame.offset,
+                .len = streamFrame.len,
+                .fin = streamFrame.fin};
+            if (!stream->streamSendBuffer->isOutstanding(sendRange)) {
+              writeSuccess = false;
+              break;
+            }
+
+            auto frameFits = completeStreamFrameFits(
+                streamFrame,
+                skipLengthField,
+                packetBuilder.remainingSpaceInPkt());
+            if (frameFits.hasError()) {
+              return quic::make_unexpected(frameFits.error());
+            }
+            if (!frameFits.value()) {
+              writeSuccess = false;
+              break;
+            }
+
+            auto res = writeStreamFrameHeader(
+                packetBuilder,
+                streamFrame.streamId,
+                streamFrame.offset,
+                streamFrame.len,
+                streamFrame.len,
+                streamFrame.fin,
+                skipLengthField);
+            if (res.hasError()) {
+              return quic::make_unexpected(res.error());
+            }
+            if (!res.value().has_value() || *res.value() != streamFrame.len) {
+              writeSuccess = false;
+              break;
+            }
+
+            const bool dataWritten = stream->streamSendBuffer->writeAt(
+                streamFrame.offset,
+                streamFrame.len,
+                [&packetBuilder](ByteRange range) {
+                  packetBuilder.push(range.data(), range.size());
+                  return true;
+                });
+            MVCHECK(dataWritten);
+            notPureAck = true;
+            writeSuccess = true;
+            break;
+          }
+
           auto streamData = cloneRetransmissionBuffer(streamFrame, stream);
           auto bufferLen = streamData ? streamData->chainLength() : 0;
           auto res = writeStreamFrameHeader(
-              builder_,
+              packetBuilder,
               streamFrame.streamId,
               streamFrame.offset,
               bufferLen,
@@ -153,7 +248,7 @@ PacketRebuilder::rebuildFromPacket(OutstandingPacketWrapper& packet) {
                 "FIN");
             MVCHECK(streamData || streamFrame.fin);
             if (streamData) {
-              writeStreamFrameData(builder_, *streamData, *dataLen);
+              writeStreamFrameData(packetBuilder, *streamData, *dataLen);
             }
             notPureAck = true;
             writeSuccess = true;
@@ -180,7 +275,7 @@ PacketRebuilder::rebuildFromPacket(OutstandingPacketWrapper& packet) {
           break;
         }
         auto cryptoWriteResult =
-            writeCryptoFrame(cryptoFrame.offset, *buf, builder_);
+            writeCryptoFrame(cryptoFrame.offset, *buf, packetBuilder);
         if (cryptoWriteResult.hasError()) {
           return quic::make_unexpected(cryptoWriteResult.error());
         }
@@ -193,7 +288,8 @@ PacketRebuilder::rebuildFromPacket(OutstandingPacketWrapper& packet) {
       }
       case QuicWriteFrame::Type::MaxDataFrame: {
         shouldWriteWindowUpdate = true;
-        auto writeResult = writeFrame(generateMaxDataFrame(conn_), builder_);
+        auto writeResult =
+            writeFrame(generateMaxDataFrame(conn_), packetBuilder);
         if (writeResult.hasError()) {
           return quic::make_unexpected(writeResult.error());
         }
@@ -222,7 +318,7 @@ PacketRebuilder::rebuildFromPacket(OutstandingPacketWrapper& packet) {
         }
         shouldWriteWindowUpdate = true;
         auto writeResult =
-            writeFrame(generateMaxStreamDataFrame(*stream), builder_);
+            writeFrame(generateMaxStreamDataFrame(*stream), packetBuilder);
         if (writeResult.hasError()) {
           return quic::make_unexpected(writeResult.error());
         }
@@ -234,7 +330,7 @@ PacketRebuilder::rebuildFromPacket(OutstandingPacketWrapper& packet) {
       }
       case QuicWriteFrame::Type::PaddingFrame: {
         const PaddingFrame& paddingFrame = *frame.asPaddingFrame();
-        auto writeResult = writeFrame(paddingFrame, builder_);
+        auto writeResult = writeFrame(paddingFrame, packetBuilder);
         if (writeResult.hasError()) {
           return quic::make_unexpected(writeResult.error());
         }
@@ -243,7 +339,7 @@ PacketRebuilder::rebuildFromPacket(OutstandingPacketWrapper& packet) {
       }
       case QuicWriteFrame::Type::PingFrame: {
         const PingFrame& pingFrame = *frame.asPingFrame();
-        auto writeResult = writeFrame(pingFrame, builder_);
+        auto writeResult = writeFrame(pingFrame, packetBuilder);
         if (writeResult.hasError()) {
           return quic::make_unexpected(writeResult.error());
         }
@@ -260,7 +356,7 @@ PacketRebuilder::rebuildFromPacket(OutstandingPacketWrapper& packet) {
           break;
         }
         auto writeResult =
-            writeSimpleFrame(std::move(*updatedSimpleFrame), builder_);
+            writeSimpleFrame(std::move(*updatedSimpleFrame), packetBuilder);
         if (writeResult.hasError()) {
           return quic::make_unexpected(writeResult.error());
         }
@@ -270,11 +366,13 @@ PacketRebuilder::rebuildFromPacket(OutstandingPacketWrapper& packet) {
         break;
       }
       case QuicWriteFrame::Type::DatagramFrame:
-        // Do not clone Datagram frames.
+      case QuicWriteFrame::Type::TimestampFrame:
+        // Datagram data is unreliable, and TIMESTAMP reflects send time.
+        // Neither frame is meaningful to clone.
         writeSuccess = true;
         break;
       default: {
-        auto writeResult = writeFrame(QuicWriteFrame(frame), builder_);
+        auto writeResult = writeFrame(QuicWriteFrame(frame), packetBuilder);
         if (writeResult.hasError()) {
           return quic::make_unexpected(writeResult.error());
         }
@@ -294,12 +392,12 @@ PacketRebuilder::rebuildFromPacket(OutstandingPacketWrapper& packet) {
   // that ACK fails, just ignore it and use the rest of the
   // cloned packet.
   if (shouldRebuildWriteAckFrame) {
-    auto& packetHeader = builder_.getPacketHeader();
+    auto& packetHeader = packetBuilder.getPacketHeader();
     const AckState& ackState = getAckState(
         conn_,
         protectionTypeToPacketNumberSpace(packetHeader.getProtectionType()));
     AckScheduler ackScheduler(conn_, ackState);
-    auto writeResult = ackScheduler.writeNextAcks(builder_);
+    auto writeResult = ackScheduler.writeNextAcks(packetBuilder);
     if (writeResult.hasError()) {
       return quic::make_unexpected(writeResult.error());
     }
@@ -313,10 +411,28 @@ PacketRebuilder::rebuildFromPacket(OutstandingPacketWrapper& packet) {
     return std::nullopt;
   }
 
+  // TIMESTAMP is non-retransmittable telemetry. Preserve rebuilt content first,
+  // then generate a fresh TIMESTAMP from current policy if capacity remains.
+  // Prioritized reserves only before stream/datagram scheduler output; it does
+  // not displace clone contents on this path.
+  if (builder_.isTracking() && encryptionLevel == EncryptionLevel::AppData &&
+      packet.packet.header.getHeaderForm() == HeaderForm::Short &&
+      timestampPacketObserver_.matchesPacketSelection(
+          conn_.transportSettings.oneRttTimestampFramePacketSelection) &&
+      shouldWriteOneRttTimestampFrame(
+          conn_, timestampPacketObserver_.hasAckReceiveTimestamps())) {
+    if (auto timestampFrame = generateOneRttTimestampFrame(conn_)) {
+      auto writeResult = writeFrame(*timestampFrame, packetBuilder);
+      if (writeResult.hasError()) {
+        return quic::make_unexpected(writeResult.error());
+      }
+    }
+  }
+
   if (encryptionLevel == EncryptionLevel::Initial) {
     // Pad anything else that's left.
-    while (builder_.remainingSpaceInPkt() > 0) {
-      auto writeResult = writeFrame(PaddingFrame(), builder_);
+    while (packetBuilder.remainingSpaceInPkt() > 0) {
+      auto writeResult = writeFrame(PaddingFrame(), packetBuilder);
       if (writeResult.hasError()) {
         return quic::make_unexpected(writeResult.error());
       }

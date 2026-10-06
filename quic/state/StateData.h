@@ -38,7 +38,6 @@
 #include <quic/state/StreamData.h>
 #include <quic/state/TransportSettings.h>
 
-#include <folly/TokenBucket.h>
 #include <folly/container/F14Map.h>
 #include <folly/io/async/DelayedDestruction.h>
 #include <quic/common/Optional.h>
@@ -240,6 +239,9 @@ struct PacingRate {
 
 struct QuicCryptoStream : public QuicStreamLike {
   ~QuicCryptoStream() override = default;
+
+  // Present when crypto writes are owned independently of packet clones.
+  Optional<StreamSendBuffer> streamSendBuffer;
 };
 
 struct QuicCryptoState {
@@ -317,6 +319,15 @@ struct ReadDatagram {
   BufQueue buf_;
 };
 
+struct PeerTimestampFrameState {
+  // The peer advertised that it can receive TIMESTAMP frames, so this endpoint
+  // may write them.
+  bool canReceive{false};
+  // The exponent the peer applies to TIMESTAMP frames it sends. This is
+  // independent of canReceive because an endpoint may be configured send-only.
+  uint8_t sendExponent{kDefaultTimestampFrameTimestampExponent};
+};
+
 struct QuicConnectionStateBase : public folly::DelayedDestruction {
   ~QuicConnectionStateBase() override = default;
 
@@ -339,11 +350,6 @@ struct QuicConnectionStateBase : public folly::DelayedDestruction {
 
   // Pacer
   std::unique_ptr<Pacer> pacer;
-
-  // Egress token bucket policer for rate limiting outgoing packets.
-  // Server-only: only set via server transport knob handlers.
-  std::unique_ptr<folly::TokenBucket> egressPolicer;
-  Optional<TimePoint> egressPolicerActivationTime;
 
   // Congestion Controller factory to create specific impl of cc algorithm
   std::shared_ptr<CongestionControllerFactory> congestionControllerFactory;
@@ -591,6 +597,9 @@ struct QuicConnectionStateBase : public folly::DelayedDestruction {
   // Value of the negotiated ack delay exponent.
   uint64_t peerAckDelayExponent{kDefaultAckDelayExponent};
 
+  // Maximum ACK delay that the peer is authorized to report.
+  std::chrono::microseconds peerMaxAckDelay{kMaxAckTimeout};
+
   // The value of the peer's min_ack_delay, for creating ACK_FREQUENCY and
   // IMMEDIATE_ACK frames.
   OptionalMicros peerMinAckDelay;
@@ -743,6 +752,8 @@ struct QuicConnectionStateBase : public folly::DelayedDestruction {
 
   bool peerAdvertisedKnobFrameSupport{false};
 
+  PeerTimestampFrameState peerTimestampFrameState;
+
   ExtendedAckFeatureMaskType peerAdvertisedExtendedAckFeatures{0};
 
   Optional<uint16_t> peerQuicExperimentId;
@@ -781,6 +792,9 @@ struct QuicConnectionStateBase : public folly::DelayedDestruction {
   };
 
   TosHeader socketTos;
+
+  // Hop Limit / TTL of the first UDP datagram that carried one
+  OptionalIntegral<uint8_t> initialPeerTtl;
 
   // Number of QUIC initial packets received.
   uint16_t initialPacketsReceived{0};

@@ -96,6 +96,26 @@ TEST_F(QuicOpenStateTest, ReadInvalidData) {
   EXPECT_NE(result.error().code.asTransportErrorCode(), nullptr);
 }
 
+TEST_F(QuicOpenStateTest, ReadStreamDataBeyondFlowControlRejected) {
+  // Regression for T279928027: receiveReadStreamFrameSMHandler must surface a
+  // FLOW_CONTROL_ERROR when a fragment's end offset exceeds the advertised
+  // stream window, rather than silently buffering it.
+  auto conn = createConn();
+  StreamId id = 0x00;
+  QuicStreamState stream(id, *conn);
+  stream.flowControlState.advertisedMaxOffset = 100;
+
+  ReadStreamFrame frame(id, /*offsetIn=*/100, /*finIn=*/false);
+  frame.data = IOBuf::copyBuffer("x");
+  auto result = receiveReadStreamFrameSMHandler(stream, std::move(frame));
+  ASSERT_TRUE(result.hasError());
+  ASSERT_NE(result.error().code.asTransportErrorCode(), nullptr);
+  EXPECT_EQ(
+      *result.error().code.asTransportErrorCode(),
+      TransportErrorCode::FLOW_CONTROL_ERROR);
+  EXPECT_TRUE(stream.readBuffer.empty());
+}
+
 TEST_F(QuicOpenStateTest, InvalidEvent) {
   auto conn = createConn();
   StreamId id = 5;
@@ -260,6 +280,134 @@ TEST_F(QuicOpenStateTest, AckStreamMulti) {
   ASSERT_EQ(stream->ackedIntervals.front().end, 20);
 }
 
+TEST_F(QuicOpenStateTest, UnifiedAckHandlesReorderingAndDuplicates) {
+  auto conn = createConn();
+  conn->transportSettings.useUnifiedAppStreamSendBuffer = true;
+  auto* stream = conn->streamManager->createNextBidirectionalStream().value();
+  ASSERT_TRUE(stream->streamSendBuffer.has_value());
+  ASSERT_TRUE(
+      stream->streamSendBuffer->append(IOBuf::copyBuffer("abcdef"), true));
+  ASSERT_TRUE(stream->streamSendBuffer->markNewDataSent({0, 6, true}));
+
+  const WriteStreamFrame tailFrame(stream->id, 3, 3, true);
+  ASSERT_FALSE(sendAckSMHandler(*stream, tailFrame).hasError());
+  EXPECT_EQ(stream->sendState, StreamSendState::Open);
+  EXPECT_EQ(stream->streamSendBuffer->ackInsertVersion(), 1);
+  EXPECT_FALSE(stream->streamSendBuffer->largestDeliverableOffset());
+  EXPECT_TRUE(conn->streamManager->deliverableContains(stream->id));
+
+  ASSERT_FALSE(sendAckSMHandler(*stream, tailFrame).hasError());
+  EXPECT_EQ(stream->streamSendBuffer->ackInsertVersion(), 1);
+
+  const WriteStreamFrame headFrame(stream->id, 0, 3, false);
+  ASSERT_FALSE(sendAckSMHandler(*stream, headFrame).hasError());
+  EXPECT_EQ(stream->sendState, StreamSendState::Closed);
+  EXPECT_EQ(stream->streamSendBuffer->ackInsertVersion(), 2);
+  ASSERT_TRUE(stream->streamSendBuffer->largestDeliverableOffset().has_value());
+  EXPECT_EQ(6u, *stream->streamSendBuffer->largestDeliverableOffset());
+  EXPECT_EQ(stream->streamSendBuffer->outstandingBytes(), 0);
+
+  std::string retiredData;
+  EXPECT_FALSE(
+      stream->streamSendBuffer->writeAt(0, 6, [&retiredData](ByteRange range) {
+        retiredData.append(
+            reinterpret_cast<const char*>(range.data()), range.size());
+        return true;
+      }));
+  EXPECT_TRUE(retiredData.empty());
+}
+
+TEST_F(QuicOpenStateTest, UnifiedAckHandlesFinOnly) {
+  auto conn = createConn();
+  conn->transportSettings.useUnifiedAppStreamSendBuffer = true;
+  auto* stream = conn->streamManager->createNextBidirectionalStream().value();
+  ASSERT_TRUE(stream->streamSendBuffer.has_value());
+  ASSERT_TRUE(stream->streamSendBuffer->append(nullptr, true));
+  ASSERT_TRUE(stream->streamSendBuffer->markNewDataSent({0, 0, true}));
+
+  const WriteStreamFrame finFrame(stream->id, 0, 0, true);
+  ASSERT_FALSE(sendAckSMHandler(*stream, finFrame).hasError());
+  EXPECT_EQ(stream->sendState, StreamSendState::Closed);
+  EXPECT_TRUE(stream->streamSendBuffer->finAcked());
+
+  const auto ackVersion = stream->streamSendBuffer->ackInsertVersion();
+  ASSERT_FALSE(sendAckSMHandler(*stream, finFrame).hasError());
+  EXPECT_EQ(stream->streamSendBuffer->ackInsertVersion(), ackVersion);
+}
+
+TEST_F(QuicOpenStateTest, UnifiedAckClearsStreamManagerLossState) {
+  auto conn = createConn();
+  conn->transportSettings.useUnifiedAppStreamSendBuffer = true;
+  auto* stream = conn->streamManager->createNextBidirectionalStream().value();
+  ASSERT_TRUE(stream->streamSendBuffer.has_value());
+  ASSERT_TRUE(
+      stream->streamSendBuffer->append(IOBuf::copyBuffer("abcdef"), false));
+  ASSERT_TRUE(stream->streamSendBuffer->markNewDataSent({0, 6, false}));
+  ASSERT_TRUE(stream->streamSendBuffer->markLoss({0, 6, false}));
+  conn->streamManager->updateWritableStreams(*stream);
+  ASSERT_TRUE(conn->streamManager->hasLoss());
+
+  ASSERT_FALSE(
+      sendAckSMHandler(*stream, WriteStreamFrame(stream->id, 0, 6, false))
+          .hasError());
+
+  EXPECT_FALSE(stream->streamSendBuffer->hasPendingLoss());
+  EXPECT_FALSE(conn->streamManager->hasLoss());
+}
+
+#if !defined(NDEBUG) && !defined(_WIN32)
+TEST_F(QuicOpenStateTest, ClosedUnifiedAckRejectsPendingData) {
+  auto conn = createConn();
+  conn->transportSettings.useUnifiedAppStreamSendBuffer = true;
+  auto* stream = conn->streamManager->createNextBidirectionalStream().value();
+  ASSERT_TRUE(
+      stream->streamSendBuffer->append(IOBuf::copyBuffer("abcdef"), false));
+  ASSERT_TRUE(stream->streamSendBuffer->markNewDataSent({0, 3, false}));
+  stream->sendState = StreamSendState::Closed;
+
+  const WriteStreamFrame frame(stream->id, 0, 3, false);
+  EXPECT_DEATH({ (void)sendAckSMHandler(*stream, frame); }, "");
+}
+
+TEST_F(QuicOpenStateTest, ClosedUnifiedAckRejectsLostData) {
+  auto conn = createConn();
+  conn->transportSettings.useUnifiedAppStreamSendBuffer = true;
+  auto* stream = conn->streamManager->createNextBidirectionalStream().value();
+  ASSERT_TRUE(
+      stream->streamSendBuffer->append(IOBuf::copyBuffer("abcdef"), false));
+  ASSERT_TRUE(stream->streamSendBuffer->markNewDataSent({0, 6, false}));
+  ASSERT_TRUE(stream->streamSendBuffer->markLoss({3, 3, false}));
+  stream->sendState = StreamSendState::Closed;
+
+  const WriteStreamFrame frame(stream->id, 0, 3, false);
+  EXPECT_DEATH({ (void)sendAckSMHandler(*stream, frame); }, "");
+}
+
+TEST_F(QuicOpenStateTest, ClosedUnifiedAckRejectsOutstandingData) {
+  auto conn = createConn();
+  conn->transportSettings.useUnifiedAppStreamSendBuffer = true;
+  auto* stream = conn->streamManager->createNextBidirectionalStream().value();
+  ASSERT_TRUE(
+      stream->streamSendBuffer->append(IOBuf::copyBuffer("abcdef"), false));
+  ASSERT_TRUE(stream->streamSendBuffer->markNewDataSent({0, 6, false}));
+  stream->sendState = StreamSendState::Closed;
+
+  const WriteStreamFrame frame(stream->id, 0, 3, false);
+  EXPECT_DEATH({ (void)sendAckSMHandler(*stream, frame); }, "");
+}
+
+TEST_F(QuicOpenStateTest, ClosedUnifiedAckRejectsUnackedFin) {
+  auto conn = createConn();
+  conn->transportSettings.useUnifiedAppStreamSendBuffer = true;
+  auto* stream = conn->streamManager->createNextBidirectionalStream().value();
+  ASSERT_TRUE(stream->streamSendBuffer->append(IOBuf::copyBuffer("abc"), true));
+  ASSERT_TRUE(stream->streamSendBuffer->markNewDataSent({0, 3, true}));
+  stream->sendState = StreamSendState::Closed;
+
+  const WriteStreamFrame frame(stream->id, 0, 3, false);
+  EXPECT_DEATH({ (void)sendAckSMHandler(*stream, frame); }, "");
+}
+#endif
 TEST_F(QuicOpenStateTest, RetxBufferSortedAfterAck) {
   auto conn = createConn();
   auto stream = conn->streamManager->createNextBidirectionalStream().value();

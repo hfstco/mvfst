@@ -261,6 +261,43 @@ TEST_F(
 
 TEST_F(
     QuicClientTransportLiteMigrationTest,
+    PreviousPathRemovalIsDeferredAcrossValidationCallback) {
+  auto initialPathId = quicClient_->getConn()->currentPathId;
+
+  quic::SocketAddress firstAddr("::", 12345);
+  auto firstSocket = createProbeSocketMock(firstAddr);
+  TestPathValidationCallback firstCallback(quicClient_.get(), true);
+  auto firstResult =
+      quicClient_->startPathProbe(std::move(firstSocket), &firstCallback);
+  ASSERT_TRUE(firstResult.has_value()) << firstResult.error();
+  auto firstPathId = firstResult.value();
+  validatePath(firstPathId);
+  ASSERT_EQ(quicClient_->getConn()->currentPathId, firstPathId);
+
+  quic::SocketAddress secondAddr("::", 12346);
+  auto secondSocket = createProbeSocketMock(secondAddr);
+  auto* secondSocketPtr = secondSocket.get();
+  TestPathValidationCallback secondCallback(quicClient_.get(), true);
+  auto secondResult =
+      quicClient_->startPathProbe(std::move(secondSocket), &secondCallback);
+  ASSERT_TRUE(secondResult.has_value()) << secondResult.error();
+  auto secondPathId = secondResult.value();
+  validatePath(secondPathId);
+  ASSERT_EQ(quicClient_->getConn()->currentPathId, secondPathId);
+  sockPtr_ = secondSocketPtr;
+
+  EXPECT_NE(
+      quicClient_->getConn()->pathManager->getPath(initialPathId), nullptr);
+  qEvb_->loopOnce();
+  EXPECT_EQ(
+      quicClient_->getConn()->pathManager->getPath(initialPathId), nullptr);
+  EXPECT_NE(quicClient_->getConn()->pathManager->getPath(firstPathId), nullptr);
+  EXPECT_NE(
+      quicClient_->getConn()->pathManager->getPath(secondPathId), nullptr);
+}
+
+TEST_F(
+    QuicClientTransportLiteMigrationTest,
     MigrateConnectionSwitchesCurrentPath) {
   quic::SocketAddress localAddr("::", 22334);
   auto probeSock = createProbeSocketMock(localAddr);
@@ -282,6 +319,39 @@ TEST_F(
 
   // Loop once to allow evb callbacks from the path result callback to execute
   qEvb_->loopOnce();
+}
+
+TEST_F(
+    QuicClientTransportLiteMigrationTest,
+    MigrateConnectionPausesOldSocketWritableEvents) {
+  auto* conn = quicClient_->getConn();
+  auto oldPathId = conn->currentPathId;
+  auto* oldSocket = sockPtr_;
+  auto probeSocket = createProbeSocketMock(quic::SocketAddress("::", 22334));
+  auto* newSocket = probeSocket.get();
+
+  auto startResult =
+      quicClient_->startPathProbe(std::move(probeSocket), nullptr);
+  ASSERT_TRUE(startResult.has_value());
+  auto pathId = startResult.value();
+  validatePath(pathId);
+
+  conn->transportSettings.useSockWritableEvents = true;
+  EXPECT_CALL(*oldSocket, isWritableCallbackSet()).WillOnce(Return(true));
+  EXPECT_CALL(*oldSocket, pauseWrite()).WillOnce(Invoke([conn, oldPathId] {
+    EXPECT_EQ(conn->pathManager->getPath(oldPathId)->socket, nullptr);
+  }));
+  EXPECT_CALL(*newSocket, pauseWrite()).Times(0);
+
+  auto migrationResult = quicClient_->migrateConnection(pathId);
+  ASSERT_TRUE(migrationResult.has_value()) << migrationResult.error();
+  sockPtr_ = newSocket;
+
+  EXPECT_EQ(conn->currentPathId, pathId);
+  EXPECT_EQ(conn->pathManager->getPath(oldPathId)->socket.get(), oldSocket);
+  EXPECT_TRUE(conn->pendingEvents.sendPing);
+  EXPECT_TRUE(Mock::VerifyAndClearExpectations(oldSocket));
+  EXPECT_TRUE(Mock::VerifyAndClearExpectations(newSocket));
 }
 
 TEST_F(QuicClientTransportLiteMigrationTest, PathProbeTimeout) {
@@ -440,6 +510,44 @@ TEST_F(
       std::string::npos);
 }
 
+TEST_F(
+    QuicClientTransportLiteMigrationTest,
+    CannotStartProbeWithHandshakeCipher) {
+  quic::SocketAddress localAddr("::", 57576);
+  auto probeSock = createProbeSocketMock(localAddr);
+
+  quicClient_->getConn()->handshakeWriteCipher = test::createNoOpAead();
+  quicClient_->getConn()->handshakeWriteHeaderCipher =
+      test::createNoOpHeaderCipher().value();
+
+  auto res = quicClient_->startPathProbe(std::move(probeSock), nullptr);
+  EXPECT_TRUE(res.hasError());
+  EXPECT_EQ(res.error().code, LocalErrorCode::INTERNAL_ERROR);
+  EXPECT_TRUE(
+      res.error().message.find(
+          "Cannot initiate probe before handshake is confirmed") !=
+      std::string::npos);
+}
+
+TEST_F(
+    QuicClientTransportLiteMigrationTest,
+    CannotStartProbeWithInitialCipher) {
+  quic::SocketAddress localAddr("::", 57577);
+  auto probeSock = createProbeSocketMock(localAddr);
+
+  quicClient_->getConn()->initialWriteCipher = test::createNoOpAead();
+  quicClient_->getConn()->initialHeaderCipher =
+      test::createNoOpHeaderCipher().value();
+
+  auto res = quicClient_->startPathProbe(std::move(probeSock), nullptr);
+  EXPECT_TRUE(res.hasError());
+  EXPECT_EQ(res.error().code, LocalErrorCode::INTERNAL_ERROR);
+  EXPECT_TRUE(
+      res.error().message.find(
+          "Cannot initiate probe before handshake is confirmed") !=
+      std::string::npos);
+}
+
 TEST_F(QuicClientTransportLiteMigrationTest, CannotStartProbeWithoutSocket) {
   auto res = quicClient_->startPathProbe(nullptr, nullptr);
   EXPECT_EQ(res.error().code, LocalErrorCode::INTERNAL_ERROR);
@@ -511,6 +619,11 @@ TEST_F(
       res.error().message.find("available") != std::string::npos ||
       res.error().message.find("connection id") != std::string::npos)
       << "Error message should mention connection IDs or availability";
+
+  // The failed probe must not leave a path or scheduled validation behind.
+  EXPECT_EQ(conn->pathManager->getPath(localAddr, conn->peerAddress), nullptr);
+  EXPECT_TRUE(conn->pendingEvents.pathChallenges.empty());
+  EXPECT_FALSE(callback.called);
 }
 
 TEST_F(

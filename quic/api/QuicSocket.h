@@ -19,6 +19,7 @@
 #include <quic/priority/PriorityQueue.h>
 #include <quic/state/EarlyDataAppParamsHandler.h>
 #include <chrono>
+#include <optional>
 
 namespace quic {
 
@@ -386,6 +387,18 @@ class QuicSocket : virtual public QuicSocketLite {
   virtual WriteResult writeDatagram(BufPtr buf) = 0;
 
   /**
+   * Writes a Datagram frame with a specific priority. Creates an ephemeral
+   * flow for this datagram that is automatically cleaned up when the datagram
+   * is sent.
+   * maxQueueTime specifies how long the datagram can be queued before being
+   * dropped; nullopt or 0 means no timeout.
+   */
+  virtual WriteResult writeDatagram(
+      PriorityQueue::Priority priority,
+      BufPtr buf,
+      std::optional<std::chrono::milliseconds> maxQueueTime = std::nullopt) = 0;
+
+  /**
    * Creates a new datagram flow ID that can be used to send datagrams
    * with a specific priority.
    */
@@ -394,8 +407,14 @@ class QuicSocket : virtual public QuicSocketLite {
   /**
    * Writes a Datagram frame to a specific flow. The flow's priority
    * determines scheduling order relative to other flows and streams.
+   * Optional intraFlowPriority orders this datagram against the others queued
+   * on the same flow; lower is sent first and equal values stay FIFO.
+   * sendDropOldDataFirst then drops the next to send, not the oldest.
    */
-  virtual WriteResult writeDatagram(uint32_t flowId, BufPtr buf) = 0;
+  virtual WriteResult writeDatagram(
+      uint32_t flowId,
+      BufPtr buf,
+      uint64_t intraFlowPriority = 0) = 0;
 
   /**
    * Sets the priority for a datagram flow. Lower values = higher priority.
@@ -407,9 +426,38 @@ class QuicSocket : virtual public QuicSocketLite {
       PriorityQueue::Priority priority) = 0;
 
   /**
-   * Closes a datagram flow. Any queued datagrams in the flow will be dropped.
+   * Sets the max queue time for a datagram flow.
+   * Datagrams in the flow will be dropped if they are queued longer than
+   * maxTime. A value of 0 means no timeout, as does anything negative or
+   * longer than DatagramFlowManager::kMaxQueueTime.
+   * Applies to datagrams written from here on; anything already queued on the
+   * flow will not expire.
+   */
+  virtual quic::Expected<void, LocalErrorCode> setDatagramFlowMaxQueueTime(
+      uint32_t flowId,
+      std::chrono::milliseconds maxTime) = 0;
+
+  /**
+   * Closes a datagram flow, draining whatever is already queued on it. A flow
+   * with nothing queued closes immediately; otherwise it closes once the
+   * queued datagrams have been written.
+   * The flow id is finished either way - further writeDatagram() calls on it
+   * fail, whether or not it has finished draining - so discard the id and
+   * call createDatagramFlowId() again if you need another flow.
+   * Only flows from createDatagramFlowId() can be closed; the default flow
+   * backing writeDatagram(BufPtr) has no id to discard, so closing it returns
+   * INVALID_OPERATION.
    */
   virtual quic::Expected<void, LocalErrorCode> closeDatagramFlow(
+      uint32_t flowId) = 0;
+
+  /**
+   * Closes a datagram flow immediately, dropping any datagrams still queued on
+   * it. Prefer closeDatagramFlow() unless the queued datagrams are known to be
+   * worthless - this discards data the peer will never see.
+   * As with closeDatagramFlow(), the default flow cannot be closed.
+   */
+  virtual quic::Expected<void, LocalErrorCode> closeDatagramFlowNow(
       uint32_t flowId) = 0;
 
   /**

@@ -24,11 +24,12 @@ class MockQuicStats : public QuicTransportStatsCallback {
   MOCK_METHOD(void, onPacketSent, ());
   MOCK_METHOD(void, onPacketRetransmission, ());
   MOCK_METHOD(void, onPacketLoss, ());
+  MOCK_METHOD(void, onPacketLossByTimeout, ());
+  MOCK_METHOD(void, onPacketLossByReorderingThreshold, ());
   MOCK_METHOD(void, onPacketSpuriousLoss, ());
   MOCK_METHOD(void, onPersistentCongestion, ());
   MOCK_METHOD(void, onPacketDropped, (PacketDropReason));
   MOCK_METHOD(void, onPacketForwarded, ());
-  MOCK_METHOD(void, onPacketDroppedByEgressPolicer, ());
   MOCK_METHOD(void, onForwardedPacketReceived, ());
   MOCK_METHOD(void, onForwardedPacketProcessed, ());
   MOCK_METHOD(void, onClientInitialReceived, (QuicVersion));
@@ -43,6 +44,7 @@ class MockQuicStats : public QuicTransportStatsCallback {
   MOCK_METHOD(void, onPathValidationSuccess, ());
   MOCK_METHOD(void, onPathValidationFailure, ());
   MOCK_METHOD(void, onNewQuicStream, ());
+  MOCK_METHOD(void, onNewUnifiedAppStream, ());
   MOCK_METHOD(void, onQuicStreamClosed, ());
   MOCK_METHOD(void, onQuicStreamReset, (QuicErrorCode));
   MOCK_METHOD(void, onConnFlowControlUpdate, ());

@@ -15,6 +15,88 @@
 
 namespace quic {
 
+namespace {
+
+void checkClosedSendState(const QuicStreamState& stream) {
+  if (stream.streamSendBuffer) {
+    [[maybe_unused]] const auto pendingWriteBytes = stream.pendingWriteBytes();
+    PROTO_OOPS_LOG_BUILDER_IF(
+        stream.conn.nodeType == QuicNodeType::Server && pendingWriteBytes != 0,
+        stream.conn.oopsLogger,
+        proto_oops::makeConnectionSpecificOopsFieldsBuilder(stream.conn)
+            .setStreamId(stream.id)
+            .setErrorCode(
+                static_cast<uint64_t>(TransportErrorCode::STREAM_STATE_ERROR)),
+        "quic_stream_send_handlers",
+        "closed send stream has pending writes");
+    MVDCHECK_EQ(pendingWriteBytes, 0);
+
+    PROTO_OOPS_LOG_BUILDER_IF(
+        stream.conn.nodeType == QuicNodeType::Server && stream.hasLoss(),
+        stream.conn.oopsLogger,
+        proto_oops::makeConnectionSpecificOopsFieldsBuilder(stream.conn)
+            .setStreamId(stream.id)
+            .setErrorCode(
+                static_cast<uint64_t>(TransportErrorCode::STREAM_STATE_ERROR)),
+        "quic_stream_send_handlers",
+        "closed send stream has lost data");
+    MVDCHECK(!stream.hasLoss());
+
+    [[maybe_unused]] const auto outstandingBytes =
+        stream.streamSendBuffer->outstandingBytes();
+    PROTO_OOPS_LOG_BUILDER_IF(
+        stream.conn.nodeType == QuicNodeType::Server && outstandingBytes != 0,
+        stream.conn.oopsLogger,
+        proto_oops::makeConnectionSpecificOopsFieldsBuilder(stream.conn)
+            .setStreamId(stream.id)
+            .setErrorCode(
+                static_cast<uint64_t>(TransportErrorCode::STREAM_STATE_ERROR)),
+        "quic_stream_send_handlers",
+        "closed send stream has outstanding data");
+    MVDCHECK_EQ(outstandingBytes, 0);
+
+    [[maybe_unused]] const bool hasUnackedBufferedFin =
+        stream.streamSendBuffer->finBuffered() &&
+        !stream.streamSendBuffer->finAcked();
+    PROTO_OOPS_LOG_BUILDER_IF(
+        stream.conn.nodeType == QuicNodeType::Server && hasUnackedBufferedFin,
+        stream.conn.oopsLogger,
+        proto_oops::makeConnectionSpecificOopsFieldsBuilder(stream.conn)
+            .setStreamId(stream.id)
+            .setErrorCode(
+                static_cast<uint64_t>(TransportErrorCode::STREAM_STATE_ERROR)),
+        "quic_stream_send_handlers",
+        "closed send stream has unacknowledged buffered fin");
+    MVDCHECK(!hasUnackedBufferedFin);
+    return;
+  }
+
+  PROTO_OOPS_LOG_BUILDER_IF(
+      stream.conn.nodeType == QuicNodeType::Server &&
+          !stream.retransmissionBuffer.empty(),
+      stream.conn.oopsLogger,
+      proto_oops::makeConnectionSpecificOopsFieldsBuilder(stream.conn)
+          .setStreamId(stream.id)
+          .setErrorCode(
+              static_cast<uint64_t>(TransportErrorCode::STREAM_STATE_ERROR)),
+      "quic_stream_send_handlers",
+      "closed send stream has retransmission data");
+  MVDCHECK(stream.retransmissionBuffer.empty());
+  PROTO_OOPS_LOG_BUILDER_IF(
+      stream.conn.nodeType == QuicNodeType::Server &&
+          !stream.pendingWrites.empty(),
+      stream.conn.oopsLogger,
+      proto_oops::makeConnectionSpecificOopsFieldsBuilder(stream.conn)
+          .setStreamId(stream.id)
+          .setErrorCode(
+              static_cast<uint64_t>(TransportErrorCode::STREAM_STATE_ERROR)),
+      "quic_stream_send_handlers",
+      "closed send stream has pending writes");
+  MVDCHECK(stream.pendingWrites.empty());
+}
+
+} // namespace
+
 /**
  *  Welcome to the send state machine, we got fun and games.
  *
@@ -184,6 +266,38 @@ quic::Expected<void, QuicError> sendRstSMHandler(
 quic::Expected<void, QuicError> sendAckSMHandler(
     QuicStreamState& stream,
     const WriteStreamFrame& ackedFrame) {
+  if (stream.streamSendBuffer && stream.sendState != StreamSendState::Invalid) {
+    const bool hadLoss = stream.hasLoss();
+    auto ackResult = stream.streamSendBuffer->markAcked(
+        {.offset = ackedFrame.offset,
+         .len = ackedFrame.len,
+         .fin = ackedFrame.fin});
+    if (!ackResult) {
+      return quic::make_unexpected(QuicError(
+          TransportErrorCode::INTERNAL_ERROR,
+          "Failed to update unified stream send buffer ACK state"));
+    }
+
+    stream.conn.streamManager->addDeliverable(stream.id);
+
+    const bool allReliableDataDelivered = stream.minReliableSizeAcked &&
+        (*stream.minReliableSizeAcked == 0 ||
+         stream.allBytesAckedTill(*stream.minReliableSizeAcked - 1));
+    if (allBytesTillFinAcked(stream) || allReliableDataDelivered) {
+      stream.sendState = StreamSendState::Closed;
+      if (stream.inTerminalStates()) {
+        stream.conn.streamManager->addClosed(stream.id);
+      }
+    }
+    if (hadLoss && !stream.hasLoss()) {
+      stream.conn.streamManager->updateWritableStreams(stream);
+    }
+    if (stream.sendState == StreamSendState::Closed) {
+      checkClosedSendState(stream);
+    }
+    return {};
+  }
+
   switch (stream.sendState) {
     case StreamSendState::Open:
     case StreamSendState::ResetSent: {
@@ -261,30 +375,7 @@ quic::Expected<void, QuicError> sendAckSMHandler(
       break;
     }
     case StreamSendState::Closed: {
-      PROTO_OOPS_LOG_BUILDER_IF(
-          stream.conn.nodeType == QuicNodeType::Server &&
-              !stream.retransmissionBuffer.empty(),
-          stream.conn.oopsLogger,
-          proto_oops::makeConnectionSpecificOopsFieldsBuilder(stream.conn)
-              .setStreamId(stream.id)
-              .setErrorCode(
-                  static_cast<uint64_t>(
-                      TransportErrorCode::STREAM_STATE_ERROR)),
-          "quic_stream_send_handlers",
-          "closed send stream has retransmission data");
-      MVDCHECK(stream.retransmissionBuffer.empty());
-      PROTO_OOPS_LOG_BUILDER_IF(
-          stream.conn.nodeType == QuicNodeType::Server &&
-              !stream.pendingWrites.empty(),
-          stream.conn.oopsLogger,
-          proto_oops::makeConnectionSpecificOopsFieldsBuilder(stream.conn)
-              .setStreamId(stream.id)
-              .setErrorCode(
-                  static_cast<uint64_t>(
-                      TransportErrorCode::STREAM_STATE_ERROR)),
-          "quic_stream_send_handlers",
-          "closed send stream has pending writes");
-      MVDCHECK(stream.pendingWrites.empty());
+      checkClosedSendState(stream);
       break;
     }
     case StreamSendState::Invalid: {

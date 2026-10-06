@@ -145,6 +145,84 @@ TEST_F(QuicBatchWriterTest, TestBatchingNone) {
   }
 }
 
+class BatchWriterFactoryTest
+    : public QuicBatchWriterTest,
+      public WithParamInterface<
+          std::tuple<DataPathType, QuicBatchingMode, uint32_t, bool>> {};
+
+TEST_P(BatchWriterFactoryTest, WritesPacketFromSelectedMemoryPath) {
+  const auto [dataPath, mode, batchSize, gsoSupported] = GetParam();
+  BufAccessor accessor(conn_.udpSendPacketLen * batchSize);
+  conn_.bufAccessor = &accessor;
+  auto writer = BatchWriterFactory::makeBatchWriter(
+      mode, batchSize, dataPath, conn_, gsoSupported);
+  if (dataPath == DataPathType::ContinuousMemory) {
+    ASSERT_EQ(dynamic_cast<SinglePacketBatchWriter*>(writer.get()), nullptr);
+    ASSERT_EQ(dynamic_cast<SendmmsgPacketBatchWriter*>(writer.get()), nullptr);
+  }
+
+  folly::EventBase evb;
+  auto qEvb = std::make_shared<FollyQuicEventBase>(&evb);
+  quic::test::MockAsyncUDPSocket sock(qEvb);
+  const std::string payload = "factory payload";
+  size_t writes = 0;
+  auto checkPayload =
+      [&](const SocketAddress&, const iovec* vec, size_t count) {
+        ++writes;
+        EXPECT_TRUE(
+            folly::IOBufEqualTo()(
+                folly::IOBuf::wrapIov(vec, count),
+                folly::IOBuf::copyBuffer(payload)));
+        return static_cast<ssize_t>(payload.size());
+      };
+  EXPECT_CALL(sock, write(_, _, _))
+      .Times(AtMost(1))
+      .WillRepeatedly(Invoke(checkPayload));
+  EXPECT_CALL(sock, writeGSO(_, _, _, _))
+      .Times(AtMost(1))
+      .WillRepeatedly([&](const SocketAddress& addr,
+                          const iovec* vec,
+                          size_t count,
+                          QuicAsyncUDPSocket::WriteOptions) {
+        return checkPayload(addr, vec, count);
+      });
+
+  BufPtr buf;
+  if (dataPath == DataPathType::ContinuousMemory) {
+    memcpy(accessor.writableTail(), payload.data(), payload.size());
+    accessor.append(payload.size());
+  } else {
+    buf = folly::IOBuf::copyBuffer(payload);
+  }
+  writer->append(std::move(buf), payload.size(), SocketAddress(), &sock);
+  ASSERT_FALSE(writer->empty());
+  EXPECT_EQ(writer->write(sock, SocketAddress()), payload.size());
+  EXPECT_EQ(writes, 1);
+  EXPECT_FALSE(writer->empty());
+  if (dataPath == DataPathType::ContinuousMemory) {
+    EXPECT_EQ(
+        std::string(
+            reinterpret_cast<const char*>(accessor.data()), accessor.length()),
+        payload);
+  }
+  writer->reset();
+  EXPECT_TRUE(writer->empty());
+  EXPECT_EQ(accessor.length(), 0);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    MemoryPaths,
+    BatchWriterFactoryTest,
+    Combine(
+        Values(DataPathType::ChainedMemory, DataPathType::ContinuousMemory),
+        Values(
+            QuicBatchingMode::BATCHING_MODE_NONE,
+            QuicBatchingMode::BATCHING_MODE_GSO,
+            QuicBatchingMode::BATCHING_MODE_SENDMMSG,
+            QuicBatchingMode::BATCHING_MODE_SENDMMSG_GSO),
+        Values(1u, 16u, kQuicMaxBatchSizeLimit),
+        Bool()));
+
 TEST_F(QuicBatchWriterTest, TestBatchingGSOBase) {
   folly::EventBase evb;
   std::shared_ptr<FollyQuicEventBase> qEvb =
@@ -339,6 +417,58 @@ TEST_F(QuicBatchWriterTest, TestBatchingSendmmsg) {
     size += kStrLen;
     CHECK_EQ(batchWriter->size(), size);
     batchWriter->reset();
+  }
+}
+
+TEST_F(QuicBatchWriterTest, SendmmsgPreservesSocketResult) {
+  for (const auto path :
+       {DataPathType::ChainedMemory, DataPathType::ContinuousMemory}) {
+    for (const bool heapIovecs : {false, true}) {
+      if (path == DataPathType::ContinuousMemory && heapIovecs) {
+        continue;
+      }
+      for (const int socketResult : {3, 1, 0, -EAGAIN, -ENOBUFS, -EIO}) {
+        SCOPED_TRACE(static_cast<int>(path));
+        SCOPED_TRACE(heapIovecs);
+        SCOPED_TRACE(socketResult);
+        BufAccessor accessor(conn_.udpSendPacketLen * 3);
+        conn_.bufAccessor = &accessor;
+        auto writer = BatchWriterFactory::makeBatchWriter(
+            QuicBatchingMode::BATCHING_MODE_SENDMMSG, 3, path, conn_, false);
+        size_t bytes = 0;
+        for (size_t i = 0; i < 3; ++i) {
+          auto buf = folly::IOBuf::copyBuffer("packet");
+          if (heapIovecs) {
+            for (size_t j = 0; j < kNumIovecBufferChains; ++j) {
+              buf->appendToChain(folly::IOBuf::copyBuffer("fragment"));
+            }
+          }
+          const auto size = buf->computeChainDataLength();
+          bytes += size;
+          if (path == DataPathType::ContinuousMemory) {
+            memcpy(accessor.writableTail(), buf->data(), size);
+            accessor.append(size);
+            buf.reset();
+          }
+          writer->append(std::move(buf), size, SocketAddress(), nullptr);
+        }
+        folly::EventBase evb;
+        auto qEvb = std::make_shared<FollyQuicEventBase>(&evb);
+        quic::test::MockAsyncUDPSocket sock(qEvb);
+        EXPECT_CALL(sock, writem(_, _, _, 3)).WillOnce(InvokeWithoutArgs([&]() {
+          errno = socketResult < 0 ? -socketResult : 0;
+          return socketResult < 0 ? -1 : socketResult;
+        }));
+        const ssize_t expected = socketResult == 3
+            ? static_cast<ssize_t>(bytes)
+            : (socketResult < 0 ? -1 : 0);
+        EXPECT_EQ(writer->write(sock, SocketAddress()), expected);
+        EXPECT_EQ(errno, socketResult < 0 ? -socketResult : 0);
+        writer->reset();
+        EXPECT_TRUE(writer->empty());
+        EXPECT_EQ(accessor.length(), 0);
+      }
+    }
   }
 }
 
@@ -552,6 +682,7 @@ TEST_F(QuicBatchWriterTest, TestBatchingSendmmsgInplace) {
           return 0;
         }));
     batchWriter->write(sock, quic::SocketAddress());
+    batchWriter->reset();
     expectedIovecs.clear();
     EXPECT_TRUE(bufAccessor->buf()->empty());
 
@@ -718,6 +849,7 @@ TEST_F(QuicBatchWriterTest, TestBatchingSendmmsgGSOInplaceSameSizeAll) {
         return 1;
       }));
   batchWriter->write(sock, quic::SocketAddress());
+  batchWriter->reset();
   EXPECT_TRUE(bufAccessor->buf()->empty());
 }
 
@@ -789,6 +921,7 @@ TEST_F(QuicBatchWriterTest, TestBatchingSendmmsgGSOInplaceSmallerSizeInMiddle) {
         return 2;
       }));
   batchWriter->write(sock, quic::SocketAddress());
+  batchWriter->reset();
   EXPECT_TRUE(bufAccessor->buf()->empty());
 }
 
@@ -858,6 +991,7 @@ TEST_F(QuicBatchWriterTest, TestBatchingSendmmsgGSOInplaceLargerSizeInMiddle) {
         return 2;
       }));
   batchWriter->write(sock, quic::SocketAddress());
+  batchWriter->reset();
   EXPECT_TRUE(bufAccessor->buf()->empty());
 }
 
@@ -946,6 +1080,7 @@ TEST_F(QuicBatchWriterTest, TestBatchingSendmmsgGSOInplaceDifferentAddrs) {
       }));
 
   batchWriter->write(sock, quic::SocketAddress());
+  batchWriter->reset();
   EXPECT_TRUE(bufAccessor->buf()->empty());
 }
 
@@ -977,12 +1112,14 @@ TEST_F(QuicBatchWriterTest, TestBatchingSendmmsgGSOInplaceExternalDataWritten) {
   CHECK_EQ(batchWriter->size(), 0);
   size_t size = 0;
   for (size_t j = 0; j < batchSize - 1; j++) {
+    memset(bufAccessor->buf()->writableTail(), 'a' + j, packetSize);
     bufAccessor->append(packetSize);
     EXPECT_FALSE(batchWriter->append(
         nullptr, packetSize, quic::SocketAddress(), nullptr));
     size += packetSize;
     EXPECT_EQ(batchWriter->size(), size);
   }
+  memset(bufAccessor->buf()->writableTail(), 'e', packetSize);
   bufAccessor->append(packetSize);
   EXPECT_TRUE(
       batchWriter->append(nullptr, packetSize, quic::SocketAddress(), nullptr));
@@ -990,23 +1127,28 @@ TEST_F(QuicBatchWriterTest, TestBatchingSendmmsgGSOInplaceExternalDataWritten) {
   EXPECT_EQ(batchWriter->size(), size);
 
   EXPECT_CALL(sock, writeGSO(_, _, _, _))
-      .Times(1)
-      .WillOnce(Invoke([&](const quic::SocketAddress&,
-                           const struct iovec* iovecs,
-                           size_t iovec_len,
-                           QuicAsyncUDPSocket::WriteOptions writeOptions) {
-        EXPECT_EQ(iovec_len, 5);
-        EXPECT_EQ(writeOptions.gso, packetSize);
+      .Times(2)
+      .WillRepeatedly(
+          Invoke([&](const quic::SocketAddress&,
+                     const struct iovec* iovecs,
+                     size_t iovec_len,
+                     QuicAsyncUDPSocket::WriteOptions writeOptions) {
+            EXPECT_EQ(iovec_len, 5);
+            EXPECT_EQ(writeOptions.gso, packetSize);
 
-        for (uint32_t i = 0; i < 5; i++) {
-          EXPECT_EQ(
-              iovecs[i].iov_base,
-              (uint8_t*)bufAccessor->buf()->buffer() + packetSize * i);
-          EXPECT_EQ(iovecs[i].iov_len, packetSize);
-        }
+            for (uint32_t i = 0; i < 5; i++) {
+              EXPECT_EQ(
+                  iovecs[i].iov_base,
+                  (uint8_t*)bufAccessor->buf()->buffer() + packetSize * i);
+              EXPECT_EQ(iovecs[i].iov_len, packetSize);
+              EXPECT_EQ(
+                  std::string(
+                      static_cast<const char*>(iovecs[i].iov_base), packetSize),
+                  std::string(packetSize, 'a' + i));
+            }
 
-        return 1;
-      }));
+            return 1;
+          }));
   std::string externalData = "external data";
   memcpy(
       bufAccessor->buf()->writableTail(),
@@ -1014,6 +1156,9 @@ TEST_F(QuicBatchWriterTest, TestBatchingSendmmsgGSOInplaceExternalDataWritten) {
       externalData.size());
   bufAccessor->buf()->append(externalData.size());
   batchWriter->write(sock, quic::SocketAddress());
+  batchWriter->write(sock, quic::SocketAddress());
+  batchWriter->reset();
+  batchWriter->reset();
   EXPECT_EQ(bufAccessor->buf()->length(), externalData.size());
   EXPECT_EQ(
       memcmp(
@@ -1146,6 +1291,7 @@ TEST_F(QuicBatchWriterTest, InplaceWriterWriteAll) {
         return 1000 * 5 + 700;
       }));
   EXPECT_EQ(1000 * 5 + 700, batchWriter->write(sock, quic::SocketAddress()));
+  batchWriter->reset();
 
   EXPECT_TRUE(bufAccessor->ownsBuffer());
   buf = bufAccessor->obtain();
@@ -1185,6 +1331,7 @@ TEST_F(QuicBatchWriterTest, InplaceWriterWriteOne) {
             return 1000;
           }));
   EXPECT_EQ(1000, batchWriter->write(sock, quic::SocketAddress()));
+  batchWriter->reset();
 
   EXPECT_TRUE(bufAccessor->ownsBuffer());
   buf = bufAccessor->obtain();
@@ -1230,6 +1377,7 @@ TEST_F(QuicBatchWriterTest, InplaceWriterLastOneTooBig) {
         return 700 * 5;
       }));
   EXPECT_EQ(5 * 700, batchWriter->write(sock, quic::SocketAddress()));
+  batchWriter->reset();
 
   EXPECT_TRUE(bufAccessor->ownsBuffer());
   buf = bufAccessor->obtain();
@@ -1276,6 +1424,7 @@ TEST_F(QuicBatchWriterTest, InplaceWriterBufResidueCheck) {
           }));
   // No crash:
   EXPECT_EQ(700, batchWriter->write(sock, quic::SocketAddress()));
+  batchWriter->reset();
   EXPECT_EQ(1009, Buf->length());
   EXPECT_EQ(0, Buf->headroom());
 }
@@ -1329,12 +1478,12 @@ TEST_F(SinglePacketInplaceBatchWriterTest, TestFactoryNoTransportSetting) {
       nullptr);
 }
 
-TEST_F(SinglePacketInplaceBatchWriterTest, TestFactoryNoTransportSetting2) {
+TEST_F(SinglePacketInplaceBatchWriterTest, TestFactoryWithLargerBatchSize) {
   conn_.transportSettings.maxBatchSize = 16;
   conn_.transportSettings.dataPathType = DataPathType::ContinuousMemory;
   auto batchWriter = makeBatchWriter();
   CHECK(batchWriter);
-  EXPECT_EQ(
+  EXPECT_NE(
       dynamic_cast<quic::SinglePacketInplaceBatchWriter*>(batchWriter.get()),
       nullptr);
 }
@@ -1426,6 +1575,7 @@ TEST_F(SinglePacketInplaceBatchWriterTest, TestWrite) {
             return appendSize;
           }));
   EXPECT_EQ(appendSize, batchWriter->write(sock, quic::SocketAddress()));
+  batchWriter->reset();
   EXPECT_TRUE(batchWriter->empty());
 }
 

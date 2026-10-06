@@ -68,6 +68,7 @@ TEST_F(TransportSettingsFunctionsTest, FullConfig) {
       "\"probeRttDisabledIfAppLimited\": 2, "
       "\"drainToTarget\": \"1\", "
       "\"leaveHeadroomForCwndLimited\": \"1\", "
+      "\"enableSpuriousLossRecovery\": true, "
       "\"ackFrequencyConfig\": {"
       "\"ackElicitingThreshold\": 99, "
       "\"reorderingThreshold\": \"88\", "
@@ -80,6 +81,7 @@ TEST_F(TransportSettingsFunctionsTest, FullConfig) {
       "\"enableRecoveryInStartup\": false, "
       "\"enableRecoveryInProbeStates\": false, "
       "\"enableRenoCoexistence\": true, "
+      "\"enablePrecautionaryBandwidthProbing\": true, "
       "\"paceInitCwnd\": false, "
       "\"overrideCruisePacingGain\": 7.9, "
       "\"overrideCruiseCwndGain\": 1.5, "
@@ -95,12 +97,14 @@ TEST_F(TransportSettingsFunctionsTest, FullConfig) {
   EXPECT_EQ(config.additiveIncreaseAfterHystart, true);
   EXPECT_EQ(config.onlyGrowCwndWhenLimited, true);
   EXPECT_EQ(config.leaveHeadroomForCwndLimited, true);
+  EXPECT_EQ(config.enableSpuriousLossRecovery, true);
   EXPECT_EQ(config.ignoreInflightLongTerm, true);
   EXPECT_EQ(config.ignoreShortTerm, true);
   EXPECT_EQ(config.exitStartupOnLoss, false);
   EXPECT_EQ(config.enableRecoveryInStartup, false);
   EXPECT_EQ(config.enableRecoveryInProbeStates, false);
   EXPECT_EQ(config.enableRenoCoexistence, true);
+  EXPECT_EQ(config.enablePrecautionaryBandwidthProbing, true);
   EXPECT_EQ(config.paceInitCwnd, false);
   EXPECT_EQ(config.overrideCruisePacingGain, 7.9f);
   EXPECT_EQ(config.overrideCruiseCwndGain, 1.5f);
@@ -128,12 +132,14 @@ TEST_F(TransportSettingsFunctionsTest, UnspecifiedFieldsAreDefaulted) {
   EXPECT_EQ(config.enableAckAggregationInStartup, false);
   EXPECT_EQ(config.probeRttDisabledIfAppLimited, false);
   EXPECT_EQ(config.drainToTarget, false);
+  EXPECT_EQ(config.enableSpuriousLossRecovery, false);
   EXPECT_EQ(config.ignoreInflightLongTerm, false);
   EXPECT_EQ(config.ignoreShortTerm, false);
   EXPECT_EQ(config.exitStartupOnLoss, true);
   EXPECT_EQ(config.enableRecoveryInStartup, true);
   EXPECT_EQ(config.enableRecoveryInProbeStates, true);
   EXPECT_EQ(config.enableRenoCoexistence, false);
+  EXPECT_EQ(config.enablePrecautionaryBandwidthProbing, false);
   EXPECT_EQ(config.overrideCruisePacingGain, -1.0f);
   EXPECT_EQ(config.overrideCruiseCwndGain, -1.0f);
   EXPECT_EQ(config.overrideStartupPacingGain, -1.0f);
@@ -147,6 +153,29 @@ TEST_F(TransportSettingsFunctionsTest, UnspecifiedFieldsAreDefaulted) {
       config.ackFrequencyConfig->reorderingThreshold, kReorderingThreshold);
   EXPECT_EQ(config.ackFrequencyConfig->minRttDivisor, 77);
   EXPECT_EQ(config.ackFrequencyConfig->useSmallThresholdDuringStartup, true);
+}
+
+TEST_F(TransportSettingsFunctionsTest, RejectZeroAckFrequencyMinRttDivisor) {
+  std::string testString =
+      "{"
+      "\"ackFrequencyConfig\": {"
+      "\"minRttDivisor\": 0"
+      "}"
+      "}";
+  EXPECT_THROW(parseCongestionControlConfig(testString), std::range_error);
+  EXPECT_FALSE(tryParseCongestionControlConfig(testString).has_value());
+}
+
+TEST_F(TransportSettingsFunctionsTest, AcceptOneAckFrequencyMinRttDivisor) {
+  std::string testString =
+      "{"
+      "\"ackFrequencyConfig\": {"
+      "\"minRttDivisor\": 1"
+      "}"
+      "}";
+  auto config = parseCongestionControlConfig(testString);
+  ASSERT_TRUE(config.ackFrequencyConfig.has_value());
+  EXPECT_EQ(config.ackFrequencyConfig->minRttDivisor, 1);
 }
 
 TEST_F(TransportSettingsFunctionsTest, ThrowOnWrongType) {

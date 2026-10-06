@@ -13,14 +13,34 @@
 #include <quic/state/ConnectionOopsFields.h>
 #include <quic/state/QuicStreamFunctions.h>
 
+#include <limits>
+
 namespace quic {
+namespace {
+
+bool cryptoStreamHasWritableData(const QuicCryptoStream& stream) {
+  if (stream.streamSendBuffer) {
+    return stream.streamSendBuffer->hasPendingLoss() ||
+        stream.streamSendBuffer
+            ->nextNewData(std::numeric_limits<uint64_t>::max())
+            .has_value();
+  }
+  return !stream.pendingWrites.empty() || !stream.lossBuffer.empty();
+}
+
+bool cryptoStreamHasPtoData(const QuicCryptoStream& stream) {
+  return stream.streamSendBuffer ? cryptoStreamHasWritableData(stream)
+                                 : !stream.lossBuffer.empty();
+}
+
+} // namespace
 
 std::chrono::microseconds calculatePTO(const QuicConnectionStateBase& conn) {
   if (conn.lossState.srtt == 0us) {
     return 2 * conn.transportSettings.initialRtt;
   }
   return conn.lossState.srtt + 4 * conn.lossState.rttvar +
-      conn.lossState.maxAckDelay;
+      std::min(conn.lossState.maxAckDelay, conn.peerMaxAckDelay);
 }
 
 bool isPersistentCongestion(
@@ -110,7 +130,7 @@ quic::Expected<void, QuicError> onPTOAlarm(QuicConnectionStateBase& conn) {
   numProbePackets = {};
   if (conn.initialWriteCipher) {
     numProbePackets[PacketNumberSpace::Initial] = kPacketToSendForPTO;
-    if (conn.cryptoState->initialStream.lossBuffer.empty() &&
+    if (!cryptoStreamHasPtoData(conn.cryptoState->initialStream) &&
         packetCount[PacketNumberSpace::Initial] < kPacketToSendForPTO) {
       numProbePackets[PacketNumberSpace::Initial] =
           packetCount[PacketNumberSpace::Initial];
@@ -118,7 +138,7 @@ quic::Expected<void, QuicError> onPTOAlarm(QuicConnectionStateBase& conn) {
   }
   if (conn.handshakeWriteCipher) {
     numProbePackets[PacketNumberSpace::Handshake] = kPacketToSendForPTO;
-    if (conn.cryptoState->handshakeStream.lossBuffer.empty() &&
+    if (!cryptoStreamHasPtoData(conn.cryptoState->handshakeStream) &&
         packetCount[PacketNumberSpace::Handshake] < kPacketToSendForPTO) {
       numProbePackets[PacketNumberSpace::Handshake] =
           packetCount[PacketNumberSpace::Handshake];
@@ -126,7 +146,7 @@ quic::Expected<void, QuicError> onPTOAlarm(QuicConnectionStateBase& conn) {
   }
   if (conn.oneRttWriteCipher) {
     numProbePackets[PacketNumberSpace::AppData] = kPacketToSendForPTO;
-    if (conn.cryptoState->oneRttStream.lossBuffer.empty() &&
+    if (!cryptoStreamHasPtoData(conn.cryptoState->oneRttStream) &&
         !conn.streamManager->hasLoss() &&
         packetCount[PacketNumberSpace::AppData] < kPacketToSendForPTO) {
       numProbePackets[PacketNumberSpace::AppData] =
@@ -144,8 +164,7 @@ quic::Expected<void, QuicError> onPTOAlarm(QuicConnectionStateBase& conn) {
         ? conn.cryptoState->handshakeStream
         : conn.cryptoState->initialStream;
     if (conn.outstandings.numOutstanding() == 0 &&
-        antiDeadlockStream.pendingWrites.empty() &&
-        antiDeadlockStream.lossBuffer.empty()) {
+        !cryptoStreamHasWritableData(antiDeadlockStream)) {
       numProbePackets[antiDeadlockSpace] = 1;
     }
   }
@@ -215,6 +234,30 @@ quic::Expected<void, QuicError> markPacketLoss(
           break;
         }
 
+        if (stream->streamSendBuffer) {
+          const StreamSendBuffer::SendRange range{
+              .offset = frame.offset, .len = frame.len, .fin = frame.fin};
+          bool addedLoss = false;
+          if (streamRetransmissionDisabled(conn, *stream)) {
+            const auto abandonResult = stream->streamSendBuffer->abandon(range);
+            if (!abandonResult.has_value()) {
+              return quic::make_unexpected(QuicError(
+                  TransportErrorCode::INTERNAL_ERROR,
+                  "Failed to abandon unified stream send buffer range"));
+            }
+          } else {
+            addedLoss = stream->streamSendBuffer->markLoss(range);
+          }
+          if (addedLoss &&
+              streamsWithAddedStreamLossForPacket.find(frame.streamId) ==
+                  streamsWithAddedStreamLossForPacket.end()) {
+            stream->streamLossCount++;
+            streamsWithAddedStreamLossForPacket.insert(frame.streamId);
+          }
+          conn.streamManager->updateWritableStreams(*stream);
+          break;
+        }
+
         auto bufferItr = stream->retransmissionBuffer.find(frame.offset);
         if (bufferItr == stream->retransmissionBuffer.end()) {
           break;
@@ -239,6 +282,12 @@ quic::Expected<void, QuicError> markPacketLoss(
         auto protectionType = packet.header.getProtectionType();
         auto encryptionLevel = protectionTypeToEncryptionLevel(protectionType);
         auto cryptoStream = getCryptoStream(*conn.cryptoState, encryptionLevel);
+
+        if (cryptoStream->streamSendBuffer) {
+          (void)cryptoStream->streamSendBuffer->markLoss(
+              {.offset = frame.offset, .len = frame.len, .fin = false});
+          break;
+        }
 
         auto bufferItr = cryptoStream->retransmissionBuffer.find(frame.offset);
         if (bufferItr == cryptoStream->retransmissionBuffer.end()) {
@@ -419,11 +468,13 @@ quic::Expected<bool, QuicError> processOutstandingsForLoss(
     conn.lossState.totalPacketsMarkedLost++;
     if (lostByTimeout && rttSample.count() > 0) {
       conn.lossState.totalPacketsMarkedLostByTimeout++;
+      QUIC_STATS(conn.statsCallback, onPacketLossByTimeout);
       pkt.metadata.lossTimeoutDividend = (lossTime - pkt.metadata.time) *
           conn.transportSettings.timeReorderingThreshDivisor / rttSample;
     }
     if (lostByReorder) {
       conn.lossState.totalPacketsMarkedLostByReorderingThreshold++;
+      QUIC_STATS(conn.statsCallback, onPacketLossByReorderingThreshold);
       iter->metadata.lossReorderDistance = reorderDistance;
     }
     lossEvent.addLostPacket(pkt);

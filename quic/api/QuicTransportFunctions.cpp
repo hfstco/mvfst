@@ -32,19 +32,68 @@
 
 namespace {
 
+bool cryptoStreamHasWritableData(const quic::QuicCryptoStream& stream) {
+  if (stream.streamSendBuffer) {
+    return stream.streamSendBuffer->hasPendingLoss() ||
+        stream.streamSendBuffer
+            ->nextNewData(std::numeric_limits<uint64_t>::max())
+            .has_value();
+  }
+  return !stream.pendingWrites.empty() || !stream.lossBuffer.empty();
+}
+
+bool cryptoStreamHasOutstandingData(const quic::QuicCryptoStream& stream) {
+  return stream.streamSendBuffer
+      ? stream.streamSendBuffer->outstandingBytes() > 0
+      : !stream.retransmissionBuffer.empty();
+}
+
+bool hasLegacySendState(const quic::QuicStreamLike& stream) {
+  return !stream.pendingWrites.empty() || !stream.writeBuffer.empty() ||
+      !stream.retransmissionBuffer.empty() || !stream.lossBuffer.empty();
+}
+
+bool cryptoStreamHasLegacySendState(const quic::QuicCryptoStream& stream) {
+  return !stream.streamSendBuffer && hasLegacySendState(stream);
+}
+
+bool canUseNonCloningPto(
+    quic::QuicConnectionStateBase& conn,
+    quic::EncryptionLevel encryptionLevel) {
+  if (!conn.transportSettings.useUnifiedAppStreamSendBuffer ||
+      !conn.transportSettings.useNonCloningPto ||
+      encryptionLevel == quic::EncryptionLevel::EarlyData) {
+    return false;
+  }
+
+  if (encryptionLevel != quic::EncryptionLevel::AppData) {
+    return !cryptoStreamHasLegacySendState(
+        *quic::getCryptoStream(*conn.cryptoState, encryptionLevel));
+  }
+
+  if (cryptoStreamHasLegacySendState(conn.cryptoState->oneRttStream)) {
+    return false;
+  }
+  bool hasLegacyAppSendState = false;
+  conn.streamManager->streamStateForEach(
+      [&](const quic::QuicStreamState& stream) {
+        if (!stream.streamSendBuffer && hasLegacySendState(stream)) {
+          hasLegacyAppSendState = true;
+        }
+      });
+  return !hasLegacyAppSendState;
+}
+
 /*
  *  Check whether crypto has pending data.
  */
 bool cryptoHasWritableData(const quic::QuicConnectionStateBase& conn) {
   return (conn.initialWriteCipher &&
-          (!conn.cryptoState->initialStream.pendingWrites.empty() ||
-           !conn.cryptoState->initialStream.lossBuffer.empty())) ||
+          cryptoStreamHasWritableData(conn.cryptoState->initialStream)) ||
       (conn.handshakeWriteCipher &&
-       (!conn.cryptoState->handshakeStream.pendingWrites.empty() ||
-        !conn.cryptoState->handshakeStream.lossBuffer.empty())) ||
+       cryptoStreamHasWritableData(conn.cryptoState->handshakeStream)) ||
       (conn.oneRttWriteCipher &&
-       (!conn.cryptoState->oneRttStream.pendingWrites.empty() ||
-        !conn.cryptoState->oneRttStream.lossBuffer.empty()));
+       cryptoStreamHasWritableData(conn.cryptoState->oneRttStream));
 }
 
 std::string optionalToString(const quic::Optional<quic::PacketNum>& packetNum) {
@@ -157,7 +206,8 @@ quic::Expected<WriteQuicDataResult, QuicError> writeQuicDataToSocketImpl(
             .resetFrames()
             .streamFrames()
             .pingFrames()
-            .immediateAckFrames();
+            .immediateAckFrames()
+            .timestampFrames();
     if (!exceptCryptoStream) {
       probeSchedulerBuilder.cryptoFrames();
     }
@@ -200,6 +250,7 @@ quic::Expected<WriteQuicDataResult, QuicError> writeQuicDataToSocketImpl(
           .pingFrames()
           .datagramFrames()
           .immediateAckFrames()
+          .timestampFrames()
           .ackFrames();
   if (!exceptCryptoStream) {
     schedulerBuilder.cryptoFrames();
@@ -308,44 +359,15 @@ uint64_t writeSconePacketIfNeeded(
       buildSconePacket(sconeRateSignal, sconeDstCid, sconeSrcCid);
   uint64_t sconeSize = sconePacket.computeChainDataLength();
 
-  if (connection.udpSendPacketLen <= (sconeSize + kMinInitialPacketSize)) {
+  if (connection.udpSendPacketLen <= sconeSize) {
     VLOG(3) << "SCONE: Not enough space for SCONE packet in continuous buffer";
     return 0;
   }
 
   memcpy(connection.bufAccessor->writableTail(), sconePacket.data(), sconeSize);
   connection.bufAccessor->append(sconeSize);
-  connection.scone->lastSconeSentTime = sendTime;
-  QUIC_STATS(connection.statsCallback, onSconePacketSent);
-
-  VLOG(4) << "SCONE: Wrote " << sconeSize << " bytes to continuous buffer";
-  if (connection.qLogger) {
-    connection.qLogger->addTransportStateUpdate(
-        fmt::format("scone_sent:rate={}", static_cast<int>(sconeRateSignal)));
-  }
 
   return sconeSize;
-}
-
-bool shouldPolicerDropPacket(
-    QuicConnectionStateBase& connection,
-    size_t encodedSize) {
-  if (connection.nodeType != QuicNodeType::Server) {
-    return false;
-  }
-  if (!connection.egressPolicer) {
-    return false;
-  }
-  if (connection.egressPolicerActivationTime.has_value() &&
-      Clock::now() < *connection.egressPolicerActivationTime) {
-    return false;
-  }
-  auto wireBytes = static_cast<double>(encodedSize);
-  if (!connection.egressPolicer->consume(wireBytes)) {
-    QUIC_STATS(connection.statsCallback, onPacketDroppedByEgressPolicer);
-    return true;
-  }
-  return false;
 }
 
 [[nodiscard]] quic::Expected<DataPathResult, QuicError>
@@ -361,6 +383,18 @@ continuousMemoryBuildScheduleEncrypt(
     const Aead& aead,
     const PacketNumberCipher& headerCipher,
     TimePoint sendTime) {
+  if (connection.bufAccessor->tailroom() < connection.udpSendPacketLen) {
+    return quic::make_unexpected(QuicError(
+        QuicErrorCode(TransportErrorCode::INTERNAL_ERROR),
+        "Insufficient ContinuousMemory buffer tailroom"));
+  }
+
+  const auto rollbackSize = connection.bufAccessor->length();
+  auto rollbackBuf = [&]() {
+    connection.bufAccessor->trimEnd(
+        connection.bufAccessor->length() - rollbackSize);
+  };
+
   // SCONE: If needed, build the SCONE packet and write it to the buffer first.
   uint64_t sconePacketSize =
       writeSconePacketIfNeeded(connection, header, pnSpace, sendTime);
@@ -371,35 +405,35 @@ continuousMemoryBuildScheduleEncrypt(
 
   // Defensive check: ensure we have enough space for the regular packet
   if (connection.udpSendPacketLen < sconePacketSize + flowIndSize) {
+    rollbackBuf();
     return quic::make_unexpected(QuicError(
         QuicErrorCode(TransportErrorCode::INTERNAL_ERROR),
         "Insufficient space after SCONE packet"));
   }
 
-  auto prevSize = connection.bufAccessor->length();
+  const auto packetStart = connection.bufAccessor->length();
 
-  auto rollbackBuf = [&]() {
-    connection.bufAccessor->trimEnd(
-        connection.bufAccessor->length() - prevSize);
-  };
-
-  // It's the scheduler's job to invoke encode header
-  InplaceQuicPacketBuilder pktBuilder(
-      *connection.bufAccessor,
-      connection.udpSendPacketLen - sconePacketSize - flowIndSize,
-      std::move(header),
-      getAckState(connection, pnSpace).largestAckedByPeer.value_or(0));
-  pktBuilder.accountForCipherOverhead(cipherOverhead);
-  PROTO_OOPS_LOG_BUILDER_IF(
-      connection.nodeType == QuicNodeType::Server && !scheduler.hasData(),
-      connection.oopsLogger,
-      proto_oops::makeConnectionSpecificOopsFieldsBuilder(connection),
-      "quic_transport_functions",
-      "invariant_violation: packet scheduler selected with no data");
-  MVCHECK(scheduler.hasData());
-  auto result =
-      scheduler.scheduleFramesForPacket(std::move(pktBuilder), writableBytes);
+  // The builder must return the buffer before rollback can trim it.
+  auto result = [&]() {
+    // It's the scheduler's job to invoke encode header
+    InplaceQuicPacketBuilder pktBuilder(
+        *connection.bufAccessor,
+        connection.udpSendPacketLen - sconePacketSize - flowIndSize,
+        std::move(header),
+        getAckState(connection, pnSpace).largestAckedByPeer.value_or(0));
+    pktBuilder.accountForCipherOverhead(cipherOverhead);
+    PROTO_OOPS_LOG_BUILDER_IF(
+        connection.nodeType == QuicNodeType::Server && !scheduler.hasData(),
+        connection.oopsLogger,
+        proto_oops::makeConnectionSpecificOopsFieldsBuilder(connection),
+        "quic_transport_functions",
+        "invariant_violation: packet scheduler selected with no data");
+    MVCHECK(scheduler.hasData());
+    return scheduler.scheduleFramesForPacket(
+        std::move(pktBuilder), writableBytes);
+  }();
   if (!result.has_value()) {
+    rollbackBuf();
     return quic::make_unexpected(result.error());
   }
   MVCHECK(connection.bufAccessor->ownsBuffer());
@@ -439,7 +473,7 @@ continuousMemoryBuildScheduleEncrypt(
       packet->header.tail() < connection.bufAccessor->tail());
   // Trim off everything before the current packet, and the header length, so
   // buf's data starts from the body part of buf.
-  connection.bufAccessor->trimStart(prevSize + headerLen);
+  connection.bufAccessor->trimStart(packetStart + headerLen);
   // buf and packetBuf is actually the same.
   auto buf = connection.bufAccessor->obtain();
   auto encryptResult =
@@ -448,7 +482,7 @@ continuousMemoryBuildScheduleEncrypt(
     return quic::make_unexpected(encryptResult.error());
   }
   auto packetBuf = std::move(encryptResult.value());
-  MVCHECK(packetBuf->headroom() == headerLen + prevSize);
+  MVCHECK(packetBuf->headroom() == headerLen + packetStart);
   // Include header back.
   packetBuf->prepend(headerLen);
 
@@ -469,8 +503,19 @@ continuousMemoryBuildScheduleEncrypt(
   MVCHECK(!packetBuf->isChained());
   auto encodedSize = packetBuf->length();
   auto encodedBodySize = encodedSize - headerLen;
+  encodedSize += sconePacketSize;
+  if (sconePacketSize) {
+    connection.scone->lastSconeSentTime = sendTime;
+    QUIC_STATS(connection.statsCallback, onSconePacketSent);
+    if (connection.qLogger) {
+      connection.qLogger->addTransportStateUpdate(
+          fmt::format(
+              "scone_sent:rate={}",
+              static_cast<int>(connection.scone->configuredRateSignal)));
+    }
+  }
   // Include previous packets back.
-  packetBuf->prepend(prevSize);
+  packetBuf->prepend(packetStart);
   if (connection.transportSettings.isPriming && packetBuf) {
     packetBuf->coalesce();
     connection.bufAccessor->release(BufHelpers::create(packetBuf->capacity()));
@@ -491,12 +536,6 @@ continuousMemoryBuildScheduleEncrypt(
   if (encodedSize > connection.udpSendPacketLen) {
     MVVLOG(3) << "Quic sending pkt larger than limit, encodedSize="
               << encodedSize;
-  }
-  // Egress policer: drop packet if rate exceeded (treat as network loss).
-  if (shouldPolicerDropPacket(connection, encodedSize)) {
-    connection.bufAccessor->trimEnd(encodedSize);
-    return DataPathResult::makeWriteResult(
-        true, std::move(result.value()), encodedSize, encodedBodySize);
   }
   // TODO: I think we should add an API that doesn't need a buffer.
   auto writeResult =
@@ -672,11 +711,6 @@ iobufChainBasedBuildScheduleEncrypt(
     MVVLOG(3) << "Quic sending pkt larger than limit, encodedSize="
               << encodedSize << " encodedBodySize=" << encodedBodySize;
   }
-  // Egress policer: drop packet if rate exceeded (treat as network loss).
-  if (shouldPolicerDropPacket(connection, encodedSize)) {
-    return DataPathResult::makeWriteResult(
-        true, std::move(result.value()), encodedSize, encodedBodySize);
-  }
   auto writeResult = ioBufBatch.write(std::move(packetBuf), encodedSize);
   if (!writeResult.has_value()) {
     return quic::make_unexpected(writeResult.error());
@@ -825,6 +859,133 @@ quic::Expected<bool, QuicError> handleStreamWritten(
   return false;
 }
 
+static quic::Expected<bool, QuicError> handleUnifiedStreamWritten(
+    QuicConnectionStateBase& conn,
+    QuicStreamState& stream,
+    uint64_t frameOffset,
+    uint64_t frameLen,
+    bool frameFin,
+    PacketNum packetNum,
+    PacketNumberSpace packetNumberSpace,
+    bool isClone,
+    bool isPtoRetransmission) {
+  auto& sendBuffer = *stream.streamSendBuffer;
+  const StreamSendBuffer::SendRange frameRange{
+      .offset = frameOffset, .len = frameLen, .fin = frameFin};
+
+  if (isClone) {
+    conn.lossState.totalStreamBytesCloned += frameLen;
+    return false;
+  }
+
+  if (isPtoRetransmission) {
+    if (!sendBuffer.isOutstanding(frameRange)) {
+      return quic::make_unexpected(QuicError(
+          TransportErrorCode::INTERNAL_ERROR,
+          fmt::format(
+              "PTO stream retransmission offset={}, len={}, fin={} is not "
+              "outstanding",
+              frameOffset,
+              frameLen,
+              frameFin)));
+    }
+    return false;
+  }
+
+  if (frameOffset >= sendBuffer.nextUnsentOffset()) {
+    const auto newData = sendBuffer.nextNewData(frameLen);
+    if (newData && *newData == frameRange &&
+        sendBuffer.markNewDataSent(frameRange)) {
+      stream.currentWriteOffset = sendBuffer.nextUnsentOffset() +
+          static_cast<uint64_t>(sendBuffer.finSent());
+      ++stream.numPacketsTxWithNewData;
+      MVVLOG(10) << nodeToString(conn.nodeType) << " sent"
+                 << " packetNum=" << packetNum << " space=" << packetNumberSpace
+                 << " " << conn;
+      return true;
+    }
+  }
+
+  const auto pendingLoss = sendBuffer.nextLoss(frameLen);
+  if (pendingLoss && *pendingLoss == frameRange) {
+    sendBuffer.markRetransmissionSent(frameRange);
+    conn.lossState.totalBytesRetransmitted += frameLen;
+    MVVLOG(10) << nodeToString(conn.nodeType) << " sent retransmission"
+               << " packetNum=" << packetNum << " " << conn;
+    QUIC_STATS(conn.statsCallback, onPacketRetransmission);
+    return false;
+  }
+
+  return quic::make_unexpected(QuicError(
+      TransportErrorCode::INTERNAL_ERROR,
+      fmt::format(
+          "Written stream frame offset={}, len={}, fin={} does not match "
+          "pending unified stream send state",
+          frameOffset,
+          frameLen,
+          frameFin)));
+}
+
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+static quic::Expected<bool, QuicError> handleUnifiedCryptoWritten(
+    QuicConnectionStateBase& conn,
+    QuicCryptoStream& stream,
+    uint64_t frameOffset,
+    uint64_t frameLen,
+    PacketNum packetNum,
+    bool isClone,
+    bool isPtoRetransmission) {
+  auto& sendBuffer = *stream.streamSendBuffer;
+  const StreamSendBuffer::SendRange frameRange{
+      .offset = frameOffset, .len = frameLen, .fin = false};
+
+  if (isClone) {
+    conn.lossState.totalStreamBytesCloned += frameLen;
+    return false;
+  }
+
+  if (isPtoRetransmission) {
+    if (!sendBuffer.isOutstanding(frameRange)) {
+      return quic::make_unexpected(QuicError(
+          TransportErrorCode::INTERNAL_ERROR,
+          fmt::format(
+              "PTO crypto retransmission offset={}, len={} is not "
+              "outstanding",
+              frameOffset,
+              frameLen)));
+    }
+    return false;
+  }
+
+  if (frameOffset >= sendBuffer.nextUnsentOffset()) {
+    const auto newData = sendBuffer.nextNewData(frameLen);
+    if (newData && *newData == frameRange &&
+        sendBuffer.markNewDataSent(frameRange)) {
+      stream.currentWriteOffset = sendBuffer.nextUnsentOffset();
+      return true;
+    }
+  }
+
+  const auto pendingLoss = sendBuffer.nextLoss(frameLen);
+  if (pendingLoss && *pendingLoss == frameRange) {
+    sendBuffer.markRetransmissionSent(frameRange);
+    conn.lossState.totalBytesRetransmitted += frameLen;
+    MVVLOG(10) << nodeToString(conn.nodeType)
+               << " sent crypto retransmission packetNum=" << packetNum << " "
+               << conn;
+    QUIC_STATS(conn.statsCallback, onPacketRetransmission);
+    return false;
+  }
+
+  return quic::make_unexpected(QuicError(
+      TransportErrorCode::INTERNAL_ERROR,
+      fmt::format(
+          "Written crypto frame offset={}, len={} does not match pending "
+          "send state",
+          frameOffset,
+          frameLen)));
+}
+
 quic::Expected<void, QuicError> updateConnection(
     QuicConnectionStateBase& conn,
     const PathInfo& pathInfo,
@@ -832,7 +993,9 @@ quic::Expected<void, QuicError> updateConnection(
     RegularQuicWritePacket packet,
     TimePoint sentTime,
     uint32_t encodedSize,
-    uint32_t encodedBodySize) {
+    uint32_t encodedBodySize,
+    PacketTransmissionReason transmissionReason,
+    bool isPtoRetransmission) {
   auto packetNum = packet.header.getPacketSequenceNum();
   // AckFrame, PaddingFrame and Datagrams are not retx-able.
   bool retransmittable = false;
@@ -861,14 +1024,25 @@ quic::Expected<void, QuicError> updateConnection(
         }
         auto stream = streamResult.value();
         bool newStreamDataWritten = false;
-        auto streamWrittenResult = handleStreamWritten(
-            conn,
-            *stream,
-            writeStreamFrame.offset,
-            writeStreamFrame.len,
-            writeStreamFrame.fin,
-            packetNum,
-            packetNumberSpace);
+        auto streamWrittenResult = stream->streamSendBuffer
+            ? handleUnifiedStreamWritten(
+                  conn,
+                  *stream,
+                  writeStreamFrame.offset,
+                  writeStreamFrame.len,
+                  writeStreamFrame.fin,
+                  packetNum,
+                  packetNumberSpace,
+                  clonedPacketIdentifier.has_value(),
+                  isPtoRetransmission)
+            : handleStreamWritten(
+                  conn,
+                  *stream,
+                  writeStreamFrame.offset,
+                  writeStreamFrame.len,
+                  writeStreamFrame.fin,
+                  packetNum,
+                  packetNumberSpace);
         if (!streamWrittenResult.has_value()) {
           return quic::make_unexpected(streamWrittenResult.error());
         }
@@ -899,14 +1073,25 @@ quic::Expected<void, QuicError> updateConnection(
         // NewSessionTicket is sent in crypto frame encrypted with 1-rtt key,
         // however, it is not part of handshake
         auto encryptionLevel = protectionTypeToEncryptionLevel(protectionType);
-        auto cryptoWritten = handleStreamWritten(
-            conn,
-            *getCryptoStream(*conn.cryptoState, encryptionLevel),
-            writeCryptoFrame.offset,
-            writeCryptoFrame.len,
-            false /* fin */,
-            packetNum,
-            packetNumberSpace);
+        auto* cryptoStream =
+            getCryptoStream(*conn.cryptoState, encryptionLevel);
+        auto cryptoWritten = cryptoStream->streamSendBuffer
+            ? handleUnifiedCryptoWritten(
+                  conn,
+                  *cryptoStream,
+                  writeCryptoFrame.offset,
+                  writeCryptoFrame.len,
+                  packetNum,
+                  clonedPacketIdentifier.has_value(),
+                  isPtoRetransmission)
+            : handleStreamWritten(
+                  conn,
+                  *cryptoStream,
+                  writeCryptoFrame.offset,
+                  writeCryptoFrame.len,
+                  false /* fin */,
+                  packetNum,
+                  packetNumberSpace);
         if (!cryptoWritten.has_value()) {
           return quic::make_unexpected(cryptoWritten.error());
         }
@@ -1029,6 +1214,8 @@ quic::Expected<void, QuicError> updateConnection(
         }
         break;
       }
+      case QuicWriteFrame::Type::TimestampFrame:
+        break;
       case QuicWriteFrame::Type::PaddingFrame: {
         // do not mark padding as retransmittable. There are several reasons
         // for this:
@@ -1165,7 +1352,13 @@ quic::Expected<void, QuicError> updateConnection(
     MVDCHECK(conn.outstandings.clonedPacketIdentifiers.count(
         *clonedPacketIdentifier));
     pkt.maybeClonedPacketIdentifier = std::move(clonedPacketIdentifier);
+    pkt.metadata.transmissionReason =
+        transmissionReason == PacketTransmissionReason::ImmediateInitialProbe
+        ? transmissionReason
+        : PacketTransmissionReason::Clone;
     conn.lossState.totalBytesCloned += encodedSize;
+  } else {
+    pkt.metadata.transmissionReason = transmissionReason;
   }
 
   if (conn.congestionController) {
@@ -1331,7 +1524,7 @@ quic::Expected<WriteQuicDataResult, QuicError> writeCryptoAndAckDataToSocket(
   // During the handshake, probe with no data to retransmit so a PING is sent
   // (RFC 9002 6.2.2.1).
   if (numProbePackets &&
-      (cryptoStream.retransmissionBuffer.size() || scheduler.hasData() ||
+      (cryptoStreamHasOutstandingData(cryptoStream) || scheduler.hasData() ||
        needsAntiDeadlockPTO(connection))) {
     auto probeResult = writeProbingDataToSocket(
         sock,
@@ -1397,7 +1590,8 @@ quic::Expected<WriteQuicDataResult, QuicError> writeCryptoAndAckDataToSocket(
         cleartextCipher,
         headerCipher,
         version,
-        token);
+        token,
+        PacketTransmissionReason::ImmediateInitialProbe);
     if (!cloneResult.has_value()) {
       return quic::make_unexpected(cloneResult.error());
     }
@@ -2036,7 +2230,9 @@ quic::Expected<WriteQuicDataResult, QuicError> writeConnectionDataToSocket(
         std::move(result->packet->packet),
         sentTime,
         static_cast<uint32_t>(ret->encodedSize),
-        static_cast<uint32_t>(ret->encodedBodySize));
+        static_cast<uint32_t>(ret->encodedBodySize),
+        result->transmissionReason,
+        result->isPtoRetransmission);
     if (!updateConnResult.has_value()) {
       return quic::make_unexpected(updateConnResult.error());
     }
@@ -2052,20 +2248,6 @@ quic::Expected<WriteQuicDataResult, QuicError> writeConnectionDataToSocket(
             NoWriteReason::SOCKET_FAILURE;
       }
       return WriteQuicDataResult{ioBufBatch.getPktSent(), 0, bytesWritten};
-    }
-
-    if ((connection.transportSettings.batchingMode ==
-         QuicBatchingMode::BATCHING_MODE_NONE) &&
-        useSinglePacketInplaceBatchWriter(
-            connection.transportSettings.maxBatchSize,
-            connection.transportSettings.dataPathType)) {
-      // With SinglePacketInplaceBatchWriter we always write one packet, and so
-      // ioBufBatch needs a flush.
-      auto flushResult = ioBufBatch.flush();
-      if (!flushResult.has_value()) {
-        return quic::make_unexpected(flushResult.error());
-      }
-      updateErrnoCount(connection, ioBufBatch);
     }
   }
 
@@ -2099,11 +2281,10 @@ quic::Expected<WriteQuicDataResult, QuicError> writeProbingDataToSocket(
     const Aead& aead,
     const PacketNumberCipher& headerCipher,
     QuicVersion version,
-    const std::string& token) {
+    const std::string& token,
+    PacketTransmissionReason transmissionReason) {
   // Skip a packet number for probing packets to elicit acks
   increaseNextPacketNum(connection, pnSpace);
-  CloningScheduler cloningScheduler(
-      scheduler, connection, "CloningScheduler", aead.getCipherOverhead());
   auto writeLoopBeginTime = Clock::now();
 
   // If we have the ability to draw an ACK for AppData, let's send a probe that
@@ -2114,29 +2295,88 @@ quic::Expected<WriteQuicDataResult, QuicError> writeProbingDataToSocket(
     probesToSend = std::max<uint8_t>(probesToSend, kPacketToSendForPTO);
     dataProbesToSend = probesToSend - 1;
   }
-  auto cloningResult = writeConnectionDataToSocket(
-      sock,
-      connection,
-      connection.currentPathId,
-      srcConnId,
-      dstConnId,
-      builder,
-      pnSpace,
-      cloningScheduler,
-      connection.transportSettings.enableWritableBytesLimit
-          ? probePacketWritableBytes
-          : unlimitedWritableBytes,
-      dataProbesToSend,
-      aead,
-      headerCipher,
-      version,
-      writeLoopBeginTime,
-      token);
-  if (!cloningResult.has_value()) {
-    return quic::make_unexpected(cloningResult.error());
+  const bool useNonCloningPto =
+      canUseNonCloningPto(connection, encryptionLevel);
+  auto probeWriteResult = [&]() {
+    if (useNonCloningPto) {
+      if (pnSpace == PacketNumberSpace::AppData &&
+          encryptionLevel == EncryptionLevel::AppData) {
+        AppDataPtoScheduler ptoScheduler(
+            scheduler, connection, "AppDataPtoScheduler", transmissionReason);
+        return writeConnectionDataToSocket(
+            sock,
+            connection,
+            connection.currentPathId,
+            srcConnId,
+            dstConnId,
+            builder,
+            pnSpace,
+            ptoScheduler,
+            connection.transportSettings.enableWritableBytesLimit
+                ? probePacketWritableBytes
+                : unlimitedWritableBytes,
+            dataProbesToSend,
+            aead,
+            headerCipher,
+            version,
+            writeLoopBeginTime,
+            token);
+      }
+      CryptoPtoScheduler ptoScheduler(
+          scheduler,
+          connection,
+          encryptionLevel,
+          "CryptoPtoScheduler",
+          transmissionReason);
+      return writeConnectionDataToSocket(
+          sock,
+          connection,
+          connection.currentPathId,
+          srcConnId,
+          dstConnId,
+          builder,
+          pnSpace,
+          ptoScheduler,
+          connection.transportSettings.enableWritableBytesLimit
+              ? probePacketWritableBytes
+              : unlimitedWritableBytes,
+          dataProbesToSend,
+          aead,
+          headerCipher,
+          version,
+          writeLoopBeginTime,
+          token);
+    }
+    CloningScheduler cloningScheduler(
+        scheduler,
+        connection,
+        "CloningScheduler",
+        aead.getCipherOverhead(),
+        transmissionReason);
+    return writeConnectionDataToSocket(
+        sock,
+        connection,
+        connection.currentPathId,
+        srcConnId,
+        dstConnId,
+        builder,
+        pnSpace,
+        cloningScheduler,
+        connection.transportSettings.enableWritableBytesLimit
+            ? probePacketWritableBytes
+            : unlimitedWritableBytes,
+        dataProbesToSend,
+        aead,
+        headerCipher,
+        version,
+        writeLoopBeginTime,
+        token);
+  }();
+  if (!probeWriteResult.has_value()) {
+    return quic::make_unexpected(probeWriteResult.error());
   }
-  auto probesWritten = cloningResult->packetsWritten;
-  auto bytesWritten = cloningResult->bytesWritten;
+  auto probesWritten = probeWriteResult->packetsWritten;
+  auto bytesWritten = probeWriteResult->bytesWritten;
   if (probesWritten < probesToSend) {
     // If we can use an IMMEDIATE_ACK, that's better than a PING.
     auto probeSchedulerBuilder = FrameScheduler::Builder(
@@ -2152,6 +2392,7 @@ quic::Expected<WriteQuicDataResult, QuicError> writeProbingDataToSocket(
       probeSchedulerBuilder.pingFrames();
     }
     auto probeScheduler = std::move(probeSchedulerBuilder).build();
+    probeScheduler.setTransmissionReason(transmissionReason);
     auto probingResult = writeConnectionDataToSocket(
         sock,
         connection,
@@ -2176,8 +2417,9 @@ quic::Expected<WriteQuicDataResult, QuicError> writeProbingDataToSocket(
     bytesWritten += probingResult->bytesWritten;
   }
   MVVLOG_IF(10, probesWritten > 0)
-      << nodeToString(connection.nodeType)
-      << " writing probes using scheduler=CloningScheduler " << connection;
+      << nodeToString(connection.nodeType) << " writing probes using scheduler="
+      << (useNonCloningPto ? "non-cloning PTO" : "CloningScheduler") << " "
+      << connection;
   return WriteQuicDataResult{0, probesWritten, bytesWritten};
 }
 
@@ -2331,6 +2573,16 @@ void maybeSendStreamLimitUpdates(QuicConnectionStateBase& conn) {
 void implicitAckCryptoStream(
     QuicConnectionStateBase& conn,
     EncryptionLevel encryptionLevel) {
+  auto* cryptoStream = getCryptoStream(*conn.cryptoState, encryptionLevel);
+  const auto clearCryptoWriteState = [&] {
+    if (cryptoStream->streamSendBuffer) {
+      cryptoStream->streamSendBuffer->cancelAll();
+      return;
+    }
+    cryptoStream->lossBuffer.clear();
+    MVCHECK(cryptoStream->retransmissionBuffer.empty());
+    MVCHECK(cryptoStream->pendingWrites.empty());
+  };
   auto implicitAckTime = Clock::now();
   auto packetNumSpace = encryptionLevel == EncryptionLevel::Handshake
       ? PacketNumberSpace::Handshake
@@ -2354,6 +2606,9 @@ void implicitAckCryptoStream(
     }
   }
   if (ackBlocks.empty()) {
+    if (cryptoStream->streamSendBuffer) {
+      clearCryptoWriteState();
+    }
     return;
   }
   // Construct an implicit ack covering the entire range of packets.
@@ -2383,10 +2638,10 @@ void implicitAckCryptoStream(
         switch (packetFrame.type()) {
           case QuicWriteFrame::Type::WriteCryptoFrame: {
             const WriteCryptoFrame& frame = *packetFrame.asWriteCryptoFrame();
-            auto cryptoStream =
+            auto* ackedCryptoStream =
                 getCryptoStream(*conn.cryptoState, encryptionLevel);
-            processCryptoStreamAck(*cryptoStream, frame.offset, frame.len);
-            break;
+            return processCryptoStreamAck(
+                *ackedCryptoStream, frame.offset, frame.len);
           }
           case QuicWriteFrame::Type::WriteAckFrame: {
             const WriteAckFrame& frame = *packetFrame.asWriteAckFrame();
@@ -2411,11 +2666,7 @@ void implicitAckCryptoStream(
   MVCHECK(result.has_value(), result.error().message);
   // Clear our the loss buffer explicitly. The implicit ACK itself will not
   // remove data already in the loss buffer.
-  auto cryptoStream = getCryptoStream(*conn.cryptoState, encryptionLevel);
-  cryptoStream->lossBuffer.clear();
-  MVCHECK(cryptoStream->retransmissionBuffer.empty());
-  // The write buffer should be empty, there's no optional crypto data.
-  MVCHECK(cryptoStream->pendingWrites.empty());
+  clearCryptoWriteState();
 }
 
 void handshakeConfirmed(QuicConnectionStateBase& conn) {

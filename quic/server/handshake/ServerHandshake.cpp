@@ -220,6 +220,9 @@ bool ServerHandshake::hasReportedHandshakeSuccess() const {
 
 Optional<ClientTransportParameters>
 ServerHandshake::getClientTransportParams() {
+  if (!transportParams_) {
+    return std::nullopt;
+  }
   return transportParams_->getClientTransportParams();
 }
 
@@ -297,7 +300,7 @@ void ServerHandshake::onWriteData(fizz::WriteToSocket& write) {
       continue;
     }
     auto cryptoStream = getCryptoStream(cryptoState_, encryptionLevel);
-    writeDataToQuicStream(*cryptoStream, std::move(content.data));
+    writeDataToQuicStream(*conn_, *cryptoStream, std::move(content.data));
   }
   handshakeEventAvailable_ = true;
 }

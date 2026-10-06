@@ -400,7 +400,7 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacketData(
           fmt::format("scone_received:rate={}", static_cast<int>(sp->rate)));
     }
 
-    if (conn_->scone && sp->rate != kSconeNoAdvice) {
+    if (conn_->scone) {
       pendingSconeRateSignal_ = QuicConnectionStateBase::SconeRateSignal{
           .rate = sp->rate, .version = static_cast<QuicVersion>(sp->version)};
     }
@@ -601,8 +601,7 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacketData(
         auto cryptoStream = getCryptoStream(
             *conn_->cryptoState,
             protectionTypeToEncryptionLevel(outstandingProtectionType));
-        processCryptoStreamAck(*cryptoStream, frame.offset, frame.len);
-        break;
+        return processCryptoStreamAck(*cryptoStream, frame.offset, frame.len);
       }
       case QuicWriteFrame::Type::PingFrame:
         conn_->pendingEvents.cancelPingTimeout = true;
@@ -840,6 +839,13 @@ quic::Expected<void, QuicError> QuicClientTransportLite::processUdpPacketData(
         }
         break;
       }
+      case QuicFrame::Type::TimestampFrame:
+        if (pnSpace != PacketNumberSpace::AppData) {
+          return quic::make_unexpected(QuicError(
+              TransportErrorCode::PROTOCOL_VIOLATION,
+              "Received TIMESTAMP frame outside 1-RTT"));
+        }
+        break;
       case QuicFrame::Type::DatagramFrame: {
         DatagramFrame& frame = *quicFrame.asDatagramFrame();
         MVVLOG(10) << "Client received datagram data: " << "len="
@@ -1729,6 +1735,7 @@ void QuicClientTransportLite::onNotifyDataAvailable(
     QuicAsyncUDPSocket& sock) noexcept {
   auto self = this->shared_from_this();
   MVCHECK(conn_, "trying to receive packets without a connection");
+  recordNetworkReadCallbackStart();
   auto readBufferSize = std::max(
                             conn_->transportSettings.maxRecvPacketSize,
                             uint64_t(kDefaultUDPReadBufferSize)) *
@@ -1738,6 +1745,10 @@ void QuicClientTransportLite::onNotifyDataAvailable(
   if (!result.has_value()) {
     asyncClose(result.error());
   }
+}
+
+void QuicClientTransportLite::recordNetworkReadCallbackStart() {
+  networkReadCallbackStartTime_ = Clock::now();
 }
 
 void QuicClientTransportLite::
@@ -1984,6 +1995,14 @@ quic::Expected<PathIdType, QuicError> QuicClientTransportLite::startPathProbe(
         LocalErrorCode::INTERNAL_ERROR,
         "Cannot initiate probe before handshake is complete"));
   }
+  // RFC 9000 Section 9: no migration before the handshake is confirmed. The
+  // peer closes the connection if Initial or Handshake packets arrive from a
+  // new address.
+  if (hasInitialOrHandshakeCiphers(*conn_)) {
+    return quic::make_unexpected(QuicError(
+        LocalErrorCode::INTERNAL_ERROR,
+        "Cannot initiate probe before handshake is confirmed"));
+  }
 
   if (!socket_) {
     return quic::make_unexpected(QuicError(
@@ -2042,6 +2061,19 @@ quic::Expected<PathIdType, QuicError> QuicClientTransportLite::startPathProbe(
   }
   auto pathId = pathIdRes.value();
 
+  // Assign the new path a connection id before registering callbacks or
+  // scheduling work for it.
+  auto connIdRes = conn_->pathManager->assignDestinationCidForPath(pathId);
+  if (connIdRes.hasError()) {
+    auto removeRes = conn_->pathManager->removePath(pathId);
+    if (removeRes.hasError()) {
+      MVLOG_WARNING << "Failed to remove path " << pathId
+                    << " after connection id assignment failed: "
+                    << removeRes.error();
+    }
+    return quic::make_unexpected(connIdRes.error());
+  }
+
   // Set the callback
   if (probeResultCallback) {
     pathValidationCallbacks_[pathId] = probeResultCallback;
@@ -2050,14 +2082,6 @@ quic::Expected<PathIdType, QuicError> QuicClientTransportLite::startPathProbe(
   // Schedule a path challenge for the new path. The actual payload is minted
   // at write time by the path manager.
   conn_->pendingEvents.pathChallenges.insert(pathId);
-
-  // Assign it a new connection id to use. This is done as the last step to
-  // avoid assigning a connection id then returning an error leaving a
-  // connection id mistakenly marked as in use.
-  auto connIdRes = conn_->pathManager->assignDestinationCidForPath(pathId);
-  if (connIdRes.hasError()) {
-    return quic::make_unexpected(connIdRes.error());
-  }
 
   // Schedule a write.
   updateWriteLooper(true);
@@ -2107,6 +2131,10 @@ quic::Expected<void, QuicError> QuicClientTransportLite::migrateConnection(
   if (newSocket) {
     // The new path has an associated socket.
 
+    if (socket_ && socket_->isWritableCallbackSet()) {
+      socket_->pauseWrite();
+    }
+
     // Cache the socket for the old path in case we need to switch to it later.
     // The oldPathId is no longer the current path. So this cannot fail.
     auto addSocketResult =
@@ -2125,10 +2153,12 @@ quic::Expected<void, QuicError> QuicClientTransportLite::migrateConnection(
 
   QUIC_STATS(conn_->statsCallback, onConnectionMigration);
 
-  // If there's already a previous path from an earlier migration, remove it
-  // now. We only keep track of one old path at a time.
+  // Path validation can synchronously migrate from the read loop, which still
+  // uses the previous path's socket until it unwinds.
   if (previousPathId_.has_value()) {
-    (void)conn_->pathManager->removePath(*previousPathId_);
+    runOnEvbAsyncOp(
+        {.type = AsyncOpType::RemoveNonCurrentPathClient,
+         .pathId = *previousPathId_});
   }
   previousPathId_ = oldPathId;
 
@@ -2156,10 +2186,13 @@ void QuicClientTransportLite::maybeQlogDatagram(size_t len) {
 }
 
 void QuicClientTransportLite::trackDatagramsReceived(
-    uint32_t totalPackets,
-    uint32_t totalPacketLen) {
-  QUIC_STATS(statsCallback_, onPacketsReceived, totalPackets);
-  QUIC_STATS(statsCallback_, onRead, totalPacketLen);
+    uint32_t totalDatagrams,
+    uint32_t totalDataLen) {
+  // NetworkData has one ReceivedUdpPacket per UDP datagram, including each
+  // datagram split from a GRO read; these are not parsed QUIC packets.
+  receivedUdpDatagramCount_ += totalDatagrams;
+  QUIC_STATS(statsCallback_, onPacketsReceived, totalDatagrams);
+  QUIC_STATS(statsCallback_, onRead, totalDataLen);
 }
 
 quic::Expected<void, QuicError>
@@ -2265,8 +2298,47 @@ uint64_t QuicClientTransportLite::getEnobufsCount() const {
   return conn_->enobufsCount;
 }
 
+std::chrono::milliseconds QuicClientTransportLite::getConnectionIdleDuration()
+    const {
+  auto lastReceivedPacketTime = conn_->connectionTime;
+  const auto updateLastReceivedPacketTime =
+      [&lastReceivedPacketTime](const AckState* ackState) {
+        if (ackState && ackState->largestRecvdPacketTime &&
+            *ackState->largestRecvdPacketTime > lastReceivedPacketTime) {
+          lastReceivedPacketTime = *ackState->largestRecvdPacketTime;
+        }
+      };
+  updateLastReceivedPacketTime(conn_->ackStates.initialAckState.get());
+  updateLastReceivedPacketTime(conn_->ackStates.handshakeAckState.get());
+  updateLastReceivedPacketTime(&conn_->ackStates.appDataAckState);
+
+  const auto now = Clock::now();
+  if (lastReceivedPacketTime >= now) {
+    return std::chrono::milliseconds::zero();
+  }
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+      now - lastReceivedPacketTime);
+}
+
+int64_t QuicClientTransportLite::getNetworkReadCallbackStartTimeMs() const {
+  if (networkReadCallbackStartTime_ == TimePoint{}) {
+    return -1;
+  }
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             networkReadCallbackStartTime_.time_since_epoch())
+      .count();
+}
+
+uint64_t QuicClientTransportLite::getReceivedUdpDatagramCount() const {
+  return receivedUdpDatagramCount_;
+}
+
 uint64_t QuicClientTransportLite::getPtoCount() const {
   return conn_->lossState.ptoCount;
+}
+
+uint64_t QuicClientTransportLite::getTotalPtoCount() const {
+  return conn_->lossState.totalPTOCount;
 }
 
 uint64_t QuicClientTransportLite::getPacketsSentCount() const {

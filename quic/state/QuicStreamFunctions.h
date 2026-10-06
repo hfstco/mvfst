@@ -29,6 +29,15 @@ writeDataToQuicStream(QuicStreamState& stream, BufPtr data, bool eof);
 void writeDataToQuicStream(QuicCryptoStream& stream, BufPtr data);
 
 /**
+ * Adds data to the crypto stream using the connection's configured send
+ * buffer path.
+ */
+void writeDataToQuicStream(
+    QuicConnectionStateBase& conn,
+    QuicCryptoStream& stream,
+    BufPtr data);
+
+/**
  * Process data received from the network to add it to the QUIC stream.
  * appendDataToReadBuffer handles any reordered or non contiguous data.
  *
@@ -135,7 +144,8 @@ uint64_t getNumPacketsTxWithNewData(const QuicStreamState& stream);
     QuicStreamLike& stream,
     StreamBuffer buffer,
     uint32_t coalescingSize,
-    FunctionRef<void(uint64_t, uint64_t)> connFlowControlVisitor);
+    FunctionRef<quic::Expected<void, QuicError>(uint64_t, uint64_t)>
+        connFlowControlVisitor);
 
 /**
  * Common function to read data from the read buffer in order. Returns a pair of
@@ -154,7 +164,7 @@ QuicCryptoStream* getCryptoStream(
     QuicCryptoState& cryptoState,
     EncryptionLevel encryptionLevel);
 
-void processCryptoStreamAck(
+quic::Expected<void, QuicError> processCryptoStreamAck(
     QuicCryptoStream& cryptoStream,
     uint64_t offset,
     uint64_t len);

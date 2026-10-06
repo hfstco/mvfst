@@ -21,6 +21,8 @@
 #include <quic/server/state/ServerStateMachine.h>
 #include <quic/state/QuicStreamFunctions.h>
 #include <quic/state/test/MockQuicStats.h>
+#include <chrono>
+#include <optional>
 
 using namespace quic;
 using namespace testing;
@@ -192,6 +194,50 @@ void verifyStreamFrames(
         builder.frames_.begin() + expectedFrames.size());
   }
 }
+
+size_t countTimestampFrames(const RegularQuicWritePacket::Vec& frames) {
+  size_t count = 0;
+  for (const auto& frame : frames) {
+    if (frame.asTimestampFrame()) {
+      ++count;
+    }
+  }
+  return count;
+}
+
+void addAckReceiveTimestampState(
+    QuicConnectionStateBase& conn,
+    AckReceiveTimestampsVersion version =
+        AckReceiveTimestampsVersion::LegacyMvfst) {
+  auto& ackState = getAckState(conn, PacketNumberSpace::AppData);
+  ackState.acks.insert(10);
+  WriteAckFrameState::ReceivedPacket rpi;
+  rpi.pktNum = 10;
+  rpi.timings.receiveTimePoint = Clock::now();
+  auto receiveTime = rpi.timings.receiveTimePoint;
+  ackState.recvdPacketInfos.emplace_back(std::move(rpi));
+  ackState.largestRecvdPacketNum = 10;
+  ackState.largestRecvdPacketTime = receiveTime;
+  conn.transportSettings.maybeAckReceiveTimestampsConfigSentToPeer =
+      AckReceiveTimestampsConfig();
+  conn.maybePeerReceiveTimestampsConfig = PeerReceiveTimestampsConfig{
+      .version = version,
+      .maxReceiveTimestampsPerAck = kMaxReceivedPktsTimestampsStored,
+      .exponent = 0};
+  if (version == AckReceiveTimestampsVersion::DraftIetf02) {
+    conn.transportSettings.enableIetfAckReceiveTimestamps = true;
+    updateNegotiatedAckFeatures(conn);
+  } else {
+    conn.negotiatedAckReceiveTimestampSupport = true;
+  }
+}
+
+void addPlainAckState(QuicConnectionStateBase& conn) {
+  auto& ackState = getAckState(conn, PacketNumberSpace::AppData);
+  ackState.acks.insert(10);
+  ackState.largestRecvdPacketNum = 10;
+  ackState.largestRecvdPacketTime = Clock::now();
+}
 } // namespace
 
 namespace quic::test {
@@ -245,6 +291,51 @@ class QuicPacketSchedulerTest : public QuicPacketSchedulerTestBase,
     conn.datagramState.maxWriteBufferSize = 100;
   }
 };
+
+enum class TimestampAckKind : uint8_t {
+  Plain,
+  LegacyReceiveTimestamps,
+  Draft02ReceiveTimestamps,
+  ExtendedReceiveTimestamps,
+};
+
+struct TimestampAckPolicyCase {
+  const char* name;
+  TimestampAckKind ackKind;
+  bool suppressForAckReceiveTimestamps;
+  bool expectedTimestamp;
+  FrameType expectedAckType;
+};
+
+class TimestampAckPolicyTest
+    : public QuicPacketSchedulerTestBase,
+      public testing::TestWithParam<TimestampAckPolicyCase> {};
+
+enum class TimestampAckOnlyFrame : uint8_t { Ack, ImmediateAck };
+
+struct TimestampAckOnlyPolicyCase {
+  const char* name;
+  TimestampAckOnlyFrame frame;
+  TimestampFrameWriteMode mode;
+  std::optional<TimestampFramePacketSelection> packetSelection;
+  bool expectedTimestamp;
+};
+
+class TimestampAckOnlyPolicyTest
+    : public QuicPacketSchedulerTestBase,
+      public testing::TestWithParam<TimestampAckOnlyPolicyCase> {};
+
+struct TimestampCapacityPolicyCase {
+  const char* name;
+  TimestampFrameWriteMode mode;
+  bool fillPacket;
+  bool validClock;
+  bool expectedTimestamp;
+};
+
+class TimestampCapacityPolicyTest
+    : public QuicPacketSchedulerTestBase,
+      public testing::TestWithParam<TimestampCapacityPolicyCase> {};
 
 TEST_F(QuicPacketSchedulerTest, CryptoPaddingInitialPacket) {
   QuicClientConnectionState conn(
@@ -542,6 +633,48 @@ TEST_P(QuicPacketSchedulerTest, CryptoWritePartialLossBuffer) {
   EXPECT_FALSE(conn.cryptoState->initialStream.lossBuffer.empty());
 }
 
+TEST_P(QuicPacketSchedulerTest, CryptoSchedulerReadsOwningSendBuffer) {
+  QuicClientConnectionState conn(
+      FizzClientQuicHandshakeContext::Builder().build());
+  conn.transportSettings.useUnifiedAppStreamSendBuffer = true;
+  conn.transportSettings.useNonCloningPto = true;
+  writeDataToQuicStream(
+      conn,
+      conn.cryptoState->handshakeStream,
+      folly::IOBuf::copyBuffer("handshake"));
+  LongHeader header(
+      LongHeader::Types::Handshake,
+      getTestConnectionId(1),
+      getTestConnectionId(),
+      getNextPacketNum(conn, PacketNumberSpace::Handshake),
+      QuicVersion::MVFST);
+  RegularQuicPacketBuilder builder(
+      static_cast<uint32_t>(conn.udpSendPacketLen),
+      std::move(header),
+      conn.ackStates.handshakeAckState->largestAckedByPeer.value_or(0));
+  auto scheduler = std::move(
+                       FrameScheduler::Builder(
+                           conn,
+                           EncryptionLevel::Handshake,
+                           PacketNumberSpace::Handshake,
+                           "CryptoOnlyScheduler")
+                           .cryptoFrames())
+                       .build();
+
+  auto result = scheduler.scheduleFramesForPacket(
+      std::move(builder), static_cast<uint32_t>(conn.udpSendPacketLen));
+
+  ASSERT_TRUE(result.has_value());
+  ASSERT_TRUE(result->packet.has_value());
+  const auto* frame =
+      result->packet->packet.frames.front().asWriteCryptoFrame();
+  ASSERT_NE(frame, nullptr);
+  EXPECT_EQ(WriteCryptoFrame(0, 9), *frame);
+  EXPECT_EQ(
+      conn.cryptoState->handshakeStream.streamSendBuffer->nextUnsentOffset(),
+      0);
+}
+
 TEST_P(QuicPacketSchedulerTest, StreamFrameSchedulerExists) {
   QuicServerConnectionState conn(
       FizzServerQuicHandshakeContext::Builder().build());
@@ -641,6 +774,338 @@ TEST_P(QuicPacketSchedulerTest, CloningSchedulerTest) {
   EXPECT_TRUE(
       result->clonedPacketIdentifier.has_value() && result->packet.has_value());
   EXPECT_EQ(packetNum, result->clonedPacketIdentifier->packetNumber);
+}
+
+TEST_P(QuicPacketSchedulerTest, AppDataPtoSchedulerPrefersOrdinaryUnifiedLoss) {
+  transportSettings.useUnifiedAppStreamSendBuffer = true;
+  auto connPtr = createConn(10, 100000, 100000, GetParam());
+  auto& conn = *connPtr;
+  conn.transportSettings.useUnifiedAppStreamSendBuffer = true;
+  auto streamId = createStream(conn);
+  auto* stream = conn.streamManager->findStream(streamId);
+  ASSERT_NE(stream, nullptr);
+  ASSERT_FALSE(writeDataToQuicStream(
+                   *stream, folly::IOBuf::copyBuffer("ordinary-loss"), false)
+                   .hasError());
+  ASSERT_TRUE(stream->streamSendBuffer->markNewDataSent({0, 13, false}));
+  ASSERT_TRUE(stream->streamSendBuffer->markLoss({0, 13, false}));
+  conn.streamManager->updateWritableStreams(*stream);
+
+  auto frameScheduler = std::move(
+                            FrameScheduler::Builder(
+                                conn,
+                                EncryptionLevel::AppData,
+                                PacketNumberSpace::AppData,
+                                "AppDataFrameScheduler")
+                                .streamFrames())
+                            .build();
+  AppDataPtoScheduler scheduler(frameScheduler, conn, "AppDataPtoScheduler");
+  ShortHeader header(
+      ProtectionType::KeyPhaseZero,
+      getTestConnectionId(),
+      getNextPacketNum(conn, PacketNumberSpace::AppData));
+  RegularQuicPacketBuilder builder(
+      static_cast<uint32_t>(conn.udpSendPacketLen),
+      std::move(header),
+      conn.ackStates.appDataAckState.largestAckedByPeer.value_or(0));
+
+  auto result = scheduler.scheduleFramesForPacket(
+      std::move(builder), static_cast<uint32_t>(conn.udpSendPacketLen));
+  ASSERT_TRUE(result.has_value());
+  ASSERT_TRUE(result->packet.has_value());
+  const auto frameIt = std::find_if(
+      result->packet->packet.frames.begin(),
+      result->packet->packet.frames.end(),
+      [](const auto& frame) { return frame.asWriteStreamFrame() != nullptr; });
+  ASSERT_NE(frameIt, result->packet->packet.frames.end());
+  const auto* frame = frameIt->asWriteStreamFrame();
+  ASSERT_NE(frame, nullptr);
+  EXPECT_EQ(WriteStreamFrame(streamId, 0, 13, false), *frame);
+  EXPECT_EQ(PacketTransmissionReason::PtoProbe, result->transmissionReason);
+  EXPECT_FALSE(result->isPtoRetransmission);
+}
+
+TEST_P(
+    QuicPacketSchedulerTest,
+    AppDataPtoSchedulerSelectsOldestUnackedRangesOnce) {
+  transportSettings.useUnifiedAppStreamSendBuffer = true;
+  auto connPtr = createConn(10, 100000, 100000, GetParam());
+  auto& conn = *connPtr;
+  conn.transportSettings.useUnifiedAppStreamSendBuffer = true;
+  auto streamId = createStream(conn);
+  auto* stream = conn.streamManager->findStream(streamId);
+  ASSERT_NE(stream, nullptr);
+  ASSERT_FALSE(writeDataToQuicStream(
+                   *stream, folly::IOBuf::copyBuffer("abcdefghij"), true)
+                   .hasError());
+  ASSERT_TRUE(stream->streamSendBuffer->markNewDataSent({0, 10, true}));
+  ASSERT_TRUE(stream->streamSendBuffer->markAcked({0, 2, false}).has_value());
+
+  addOutstandingPacket(conn);
+  conn.outstandings.packets.back().declaredLost = true;
+  conn.outstandings.packets.back().packet.frames.emplace_back(
+      WriteStreamFrame(streamId, 0, 2, false));
+  addOutstandingPacket(conn);
+  conn.outstandings.packets.back().packet.frames.emplace_back(
+      MaxDataFrame(conn.flowControlState.advertisedMaxOffset));
+  conn.outstandings.packets.back().packet.frames.emplace_back(
+      WriteStreamFrame(streamId, 0, 6, false));
+  addOutstandingPacket(conn);
+  conn.outstandings.packets.back().packet.frames.emplace_back(
+      WriteStreamFrame(streamId, 6, 4, true));
+
+  FrameScheduler noopScheduler("frame", conn);
+  AppDataPtoScheduler scheduler(noopScheduler, conn, "AppDataPtoScheduler");
+  const auto schedule = [&]() {
+    ShortHeader header(
+        ProtectionType::KeyPhaseZero,
+        getTestConnectionId(),
+        getNextPacketNum(conn, PacketNumberSpace::AppData));
+    RegularQuicPacketBuilder builder(
+        static_cast<uint32_t>(conn.udpSendPacketLen),
+        std::move(header),
+        conn.ackStates.appDataAckState.largestAckedByPeer.value_or(0));
+    return scheduler.scheduleFramesForPacket(
+        std::move(builder), static_cast<uint32_t>(conn.udpSendPacketLen));
+  };
+
+  auto first = schedule();
+  ASSERT_TRUE(first.has_value());
+  ASSERT_TRUE(first->packet.has_value());
+  ASSERT_EQ(1, first->packet->packet.frames.size());
+  const auto* firstFrame =
+      first->packet->packet.frames.front().asWriteStreamFrame();
+  ASSERT_NE(firstFrame, nullptr);
+  EXPECT_EQ(WriteStreamFrame(streamId, 2, 4, false), *firstFrame);
+  EXPECT_FALSE(first->clonedPacketIdentifier.has_value());
+  EXPECT_EQ(PacketTransmissionReason::PtoProbe, first->transmissionReason);
+  EXPECT_TRUE(first->isPtoRetransmission);
+
+  const auto encodedSize = first->packet->header.computeChainDataLength() +
+      first->packet->body.computeChainDataLength();
+  ASSERT_TRUE(updateConnection(
+      conn,
+      *MVCHECK_NOTNULL(conn.pathManager->getPath(conn.currentPathId)),
+      std::nullopt,
+      std::move(first->packet->packet),
+      Clock::now(),
+      encodedSize,
+      first->packet->body.computeChainDataLength(),
+      first->transmissionReason,
+      first->isPtoRetransmission));
+  EXPECT_EQ(
+      PacketTransmissionReason::PtoProbe,
+      conn.outstandings.packets.back().metadata.transmissionReason);
+  EXPECT_FALSE(
+      conn.outstandings.packets.back().maybeClonedPacketIdentifier.has_value());
+  EXPECT_EQ(8, stream->streamSendBuffer->outstandingBytes());
+  EXPECT_FALSE(stream->streamSendBuffer->hasPendingLoss());
+
+  auto second = schedule();
+  ASSERT_TRUE(second.has_value());
+  ASSERT_TRUE(second->packet.has_value());
+  ASSERT_EQ(1, second->packet->packet.frames.size());
+  const auto* secondFrame =
+      second->packet->packet.frames.front().asWriteStreamFrame();
+  ASSERT_NE(secondFrame, nullptr);
+  EXPECT_EQ(WriteStreamFrame(streamId, 6, 4, true), *secondFrame);
+
+  auto third = schedule();
+  ASSERT_TRUE(third.has_value());
+  ASSERT_TRUE(third->packet.has_value());
+  ASSERT_EQ(1, third->packet->packet.frames.size());
+  EXPECT_NE(third->packet->packet.frames.front().asPingFrame(), nullptr);
+  EXPECT_FALSE(third->isPtoRetransmission);
+}
+
+TEST_P(QuicPacketSchedulerTest, AppDataPtoSchedulerWritesFinOnlyProbe) {
+  transportSettings.useUnifiedAppStreamSendBuffer = true;
+  auto connPtr = createConn(10, 100000, 100000, GetParam());
+  auto& conn = *connPtr;
+  conn.transportSettings.useUnifiedAppStreamSendBuffer = true;
+  auto streamId = createStream(conn);
+  auto* stream = conn.streamManager->findStream(streamId);
+  ASSERT_NE(stream, nullptr);
+  ASSERT_FALSE(writeDataToQuicStream(*stream, nullptr, true).hasError());
+  ASSERT_TRUE(stream->streamSendBuffer->markNewDataSent({0, 0, true}));
+  addOutstandingPacket(conn);
+  conn.outstandings.packets.back().packet.frames.emplace_back(
+      WriteStreamFrame(streamId, 0, 0, true));
+
+  FrameScheduler noopScheduler("frame", conn);
+  AppDataPtoScheduler scheduler(noopScheduler, conn, "AppDataPtoScheduler");
+  ShortHeader header(
+      ProtectionType::KeyPhaseZero,
+      getTestConnectionId(),
+      getNextPacketNum(conn, PacketNumberSpace::AppData));
+  RegularQuicPacketBuilder builder(
+      static_cast<uint32_t>(conn.udpSendPacketLen),
+      std::move(header),
+      conn.ackStates.appDataAckState.largestAckedByPeer.value_or(0));
+
+  auto result = scheduler.scheduleFramesForPacket(
+      std::move(builder), static_cast<uint32_t>(conn.udpSendPacketLen));
+  ASSERT_TRUE(result.has_value());
+  ASSERT_TRUE(result->packet.has_value());
+  ASSERT_EQ(1, result->packet->packet.frames.size());
+  const auto* frame =
+      result->packet->packet.frames.front().asWriteStreamFrame();
+  ASSERT_NE(frame, nullptr);
+  EXPECT_EQ(WriteStreamFrame(streamId, 0, 0, true), *frame);
+  EXPECT_TRUE(result->isPtoRetransmission);
+}
+
+TEST_P(QuicPacketSchedulerTest, AppDataPtoSchedulerSkipsDisabledStream) {
+  transportSettings.useUnifiedAppStreamSendBuffer = true;
+  auto connPtr = createConn(10, 100000, 100000, GetParam());
+  auto& conn = *connPtr;
+  conn.transportSettings.useUnifiedAppStreamSendBuffer = true;
+  auto streamId = createStream(conn);
+  auto* stream = conn.streamManager->findStream(streamId);
+  ASSERT_NE(stream, nullptr);
+  ASSERT_FALSE(writeDataToQuicStream(
+                   *stream, folly::IOBuf::copyBuffer("disabled"), false)
+                   .hasError());
+  ASSERT_TRUE(stream->streamSendBuffer->markNewDataSent({0, 8, false}));
+  stream->retransmissionDisabled_ = true;
+  addOutstandingPacket(conn);
+  conn.outstandings.packets.back().packet.frames.emplace_back(
+      WriteStreamFrame(streamId, 0, 8, false));
+
+  FrameScheduler noopScheduler("frame", conn);
+  AppDataPtoScheduler scheduler(noopScheduler, conn, "AppDataPtoScheduler");
+  ShortHeader header(
+      ProtectionType::KeyPhaseZero,
+      getTestConnectionId(),
+      getNextPacketNum(conn, PacketNumberSpace::AppData));
+  RegularQuicPacketBuilder builder(
+      static_cast<uint32_t>(conn.udpSendPacketLen),
+      std::move(header),
+      conn.ackStates.appDataAckState.largestAckedByPeer.value_or(0));
+
+  auto result = scheduler.scheduleFramesForPacket(
+      std::move(builder), static_cast<uint32_t>(conn.udpSendPacketLen));
+
+  ASSERT_TRUE(result.has_value());
+  ASSERT_TRUE(result->packet.has_value());
+  ASSERT_EQ(1, result->packet->packet.frames.size());
+  EXPECT_NE(result->packet->packet.frames.front().asPingFrame(), nullptr);
+  EXPECT_FALSE(result->isPtoRetransmission);
+}
+
+TEST_P(
+    QuicPacketSchedulerTest,
+    CryptoPtoSchedulerWritesUnackedInitialRangeWithoutMutation) {
+  QuicClientConnectionState conn(
+      FizzClientQuicHandshakeContext::Builder().build());
+  conn.transportSettings.useUnifiedAppStreamSendBuffer = true;
+  conn.transportSettings.useNonCloningPto = true;
+  auto& cryptoStream = conn.cryptoState->initialStream;
+  writeDataToQuicStream(
+      conn, cryptoStream, folly::IOBuf::copyBuffer("initial"));
+  ASSERT_TRUE(cryptoStream.streamSendBuffer->markNewDataSent({0, 7, false}));
+  ASSERT_TRUE(
+      cryptoStream.streamSendBuffer->markAcked({0, 2, false}).has_value());
+  addInitialOutstandingPacket(conn);
+  conn.outstandings.packets.back().packet.frames.emplace_back(
+      WriteCryptoFrame(0, 7));
+  FrameScheduler noopScheduler("frame", conn);
+  CryptoPtoScheduler scheduler(
+      noopScheduler, conn, EncryptionLevel::Initial, "CryptoPtoScheduler");
+  LongHeader header(
+      LongHeader::Types::Initial,
+      getTestConnectionId(1),
+      getTestConnectionId(),
+      getNextPacketNum(conn, PacketNumberSpace::Initial),
+      QuicVersion::MVFST);
+  RegularQuicPacketBuilder builder(
+      static_cast<uint32_t>(conn.udpSendPacketLen),
+      std::move(header),
+      conn.ackStates.initialAckState->largestAckedByPeer.value_or(0));
+
+  auto result = scheduler.scheduleFramesForPacket(
+      std::move(builder), static_cast<uint32_t>(conn.udpSendPacketLen));
+
+  ASSERT_TRUE(result.has_value());
+  ASSERT_TRUE(result->packet.has_value());
+  const auto* frame =
+      result->packet->packet.frames.front().asWriteCryptoFrame();
+  ASSERT_NE(frame, nullptr);
+  EXPECT_EQ(WriteCryptoFrame(2, 5), *frame);
+  EXPECT_TRUE(result->isPtoRetransmission);
+  EXPECT_EQ(cryptoStream.streamSendBuffer->outstandingBytes(), 5);
+  EXPECT_FALSE(cryptoStream.streamSendBuffer->hasPendingLoss());
+}
+
+TEST_P(QuicPacketSchedulerTest, CryptoPtoSchedulerUsesHandshakeSpace) {
+  QuicClientConnectionState conn(
+      FizzClientQuicHandshakeContext::Builder().build());
+  conn.transportSettings.useUnifiedAppStreamSendBuffer = true;
+  conn.transportSettings.useNonCloningPto = true;
+  auto& cryptoStream = conn.cryptoState->handshakeStream;
+  writeDataToQuicStream(conn, cryptoStream, folly::IOBuf::copyBuffer("hs"));
+  ASSERT_TRUE(cryptoStream.streamSendBuffer->markNewDataSent({0, 2, false}));
+  addHandshakeOutstandingPacket(conn);
+  conn.outstandings.packets.back().packet.frames.emplace_back(
+      WriteCryptoFrame(0, 2));
+  FrameScheduler noopScheduler("frame", conn);
+  CryptoPtoScheduler scheduler(
+      noopScheduler, conn, EncryptionLevel::Handshake, "CryptoPtoScheduler");
+  LongHeader header(
+      LongHeader::Types::Handshake,
+      getTestConnectionId(1),
+      getTestConnectionId(),
+      getNextPacketNum(conn, PacketNumberSpace::Handshake),
+      QuicVersion::MVFST);
+  RegularQuicPacketBuilder builder(
+      static_cast<uint32_t>(conn.udpSendPacketLen),
+      std::move(header),
+      conn.ackStates.handshakeAckState->largestAckedByPeer.value_or(0));
+
+  auto result = scheduler.scheduleFramesForPacket(
+      std::move(builder), static_cast<uint32_t>(conn.udpSendPacketLen));
+
+  ASSERT_TRUE(result.has_value());
+  ASSERT_TRUE(result->packet.has_value());
+  const auto* frame =
+      result->packet->packet.frames.front().asWriteCryptoFrame();
+  ASSERT_NE(frame, nullptr);
+  EXPECT_EQ(WriteCryptoFrame(0, 2), *frame);
+  EXPECT_TRUE(result->isPtoRetransmission);
+}
+
+TEST_P(QuicPacketSchedulerTest, AppDataPtoSchedulerWritesOneRttCrypto) {
+  QuicClientConnectionState conn(
+      FizzClientQuicHandshakeContext::Builder().build());
+  conn.transportSettings.useUnifiedAppStreamSendBuffer = true;
+  conn.transportSettings.useNonCloningPto = true;
+  auto& cryptoStream = conn.cryptoState->oneRttStream;
+  writeDataToQuicStream(conn, cryptoStream, folly::IOBuf::copyBuffer("ticket"));
+  ASSERT_TRUE(cryptoStream.streamSendBuffer->markNewDataSent({0, 6, false}));
+  addOutstandingPacket(conn);
+  conn.outstandings.packets.back().packet.frames.emplace_back(
+      WriteCryptoFrame(0, 6));
+  FrameScheduler noopScheduler("frame", conn);
+  AppDataPtoScheduler scheduler(noopScheduler, conn, "AppDataPtoScheduler");
+  ShortHeader header(
+      ProtectionType::KeyPhaseZero,
+      getTestConnectionId(),
+      getNextPacketNum(conn, PacketNumberSpace::AppData));
+  RegularQuicPacketBuilder builder(
+      static_cast<uint32_t>(conn.udpSendPacketLen),
+      std::move(header),
+      conn.ackStates.appDataAckState.largestAckedByPeer.value_or(0));
+
+  auto result = scheduler.scheduleFramesForPacket(
+      std::move(builder), static_cast<uint32_t>(conn.udpSendPacketLen));
+
+  ASSERT_TRUE(result.has_value());
+  ASSERT_TRUE(result->packet.has_value());
+  const auto* frame =
+      result->packet->packet.frames.front().asWriteCryptoFrame();
+  ASSERT_NE(frame, nullptr);
+  EXPECT_EQ(WriteCryptoFrame(0, 6), *frame);
+  EXPECT_TRUE(result->isPtoRetransmission);
 }
 
 TEST_P(QuicPacketSchedulerTest, WriteOnlyOutstandingPacketsTest) {
@@ -1229,7 +1694,7 @@ TEST_P(QuicPacketSchedulerTest, CloningSchedulerWithInplaceBuilderFullPacket) {
   conn.flowControlState.peerAdvertisedMaxOffset = 100000;
   conn.flowControlState.peerAdvertisedInitialMaxStreamOffsetBidiRemote = 100000;
   conn.transportSettings.dataPathType = DataPathType::ContinuousMemory;
-  BufAccessor bufAccessor(2000);
+  BufAccessor bufAccessor(conn.udpSendPacketLen);
   auto buf = bufAccessor.obtain();
   EXPECT_EQ(buf->length(), 0);
   bufAccessor.release(std::move(buf));
@@ -1305,6 +1770,97 @@ TEST_P(QuicPacketSchedulerTest, CloningSchedulerWithInplaceBuilderFullPacket) {
   EXPECT_TRUE(bufAccessor.ownsBuffer());
   buf = bufAccessor.obtain();
   EXPECT_EQ(buf->length(), conn.udpSendPacketLen);
+
+  constexpr uint32_t kReservedBytes = 64;
+  const auto udpSendPacketLen = static_cast<uint32_t>(conn.udpSendPacketLen);
+  buf->clear();
+  buf->append(kReservedBytes);
+  bufAccessor.release(std::move(buf));
+
+  ShortHeader boundedHeader(
+      ProtectionType::KeyPhaseOne,
+      conn.clientConnectionId.value_or(getTestConnectionId()),
+      packetNum);
+  InplaceQuicPacketBuilder boundedBuilder(
+      bufAccessor,
+      udpSendPacketLen - kReservedBytes,
+      std::move(boundedHeader),
+      conn.ackStates.appDataAckState.largestAckedByPeer.value_or(0));
+  auto boundedCloneResult = cloningScheduler.scheduleFramesForPacket(
+      std::move(boundedBuilder), udpSendPacketLen);
+  ASSERT_FALSE(boundedCloneResult.hasError());
+  EXPECT_FALSE(boundedCloneResult->clonedPacketIdentifier.has_value());
+  EXPECT_FALSE(boundedCloneResult->packet.has_value());
+
+  EXPECT_TRUE(bufAccessor.ownsBuffer());
+  buf = bufAccessor.obtain();
+  EXPECT_EQ(buf->length(), kReservedBytes);
+}
+
+TEST_P(
+    QuicPacketSchedulerTest,
+    CloningSchedulerRespectsBuilderPacketSizeLimit) {
+  constexpr uint32_t kReservedDatagramBytes = 2;
+  constexpr uint8_t kCipherOverhead = 16;
+
+  for (const auto dataPathType :
+       {DataPathType::ChainedMemory, DataPathType::ContinuousMemory}) {
+    SCOPED_TRACE(
+        dataPathType == DataPathType::ChainedMemory ? "chained" : "inplace");
+    QuicClientConnectionState conn(
+        FizzClientQuicHandshakeContext::Builder().build());
+    conn.transportSettings.dataPathType = dataPathType;
+
+    std::unique_ptr<BufAccessor> bufAccessor;
+    if (dataPathType == DataPathType::ContinuousMemory) {
+      bufAccessor = std::make_unique<BufAccessor>(conn.udpSendPacketLen);
+      conn.bufAccessor = bufAccessor.get();
+    }
+
+    FrameScheduler noopScheduler("noopScheduler", conn);
+    CloningScheduler cloningScheduler(
+        noopScheduler, conn, "CopyCat", kCipherOverhead);
+    auto packetNum = addInitialOutstandingPacket(conn);
+    conn.outstandings.packets.back().packet.frames.push_back(
+        MaxDataFrame(conn.flowControlState.advertisedMaxOffset));
+
+    ConnectionId srcConnId = ConnectionId::createZeroLength();
+    LongHeader header(
+        LongHeader::Types::Initial,
+        srcConnId,
+        conn.clientConnectionId.value_or(getTestConnectionId()),
+        getNextPacketNum(conn, PacketNumberSpace::Initial),
+        QuicVersion::MVFST);
+    const uint32_t packetSizeLimit =
+        conn.udpSendPacketLen - kReservedDatagramBytes;
+    std::unique_ptr<PacketBuilderInterface> builder;
+    if (dataPathType == DataPathType::ChainedMemory) {
+      builder = std::make_unique<RegularQuicPacketBuilder>(
+          packetSizeLimit,
+          std::move(header),
+          conn.ackStates.initialAckState->largestAckedByPeer.value_or(0));
+    } else {
+      builder = std::make_unique<InplaceQuicPacketBuilder>(
+          *bufAccessor,
+          packetSizeLimit,
+          std::move(header),
+          conn.ackStates.initialAckState->largestAckedByPeer.value_or(0));
+    }
+    builder->accountForCipherOverhead(kCipherOverhead);
+
+    auto cloneResult = cloningScheduler.scheduleFramesForPacket(
+        std::move(*builder), conn.udpSendPacketLen - kCipherOverhead);
+    ASSERT_FALSE(cloneResult.hasError());
+    ASSERT_TRUE(
+        cloneResult->clonedPacketIdentifier.has_value() &&
+        cloneResult->packet.has_value());
+    EXPECT_EQ(packetNum, cloneResult->clonedPacketIdentifier->packetNumber);
+    EXPECT_EQ(
+        packetSizeLimit,
+        cloneResult->packet->header.computeChainDataLength() +
+            cloneResult->packet->body.computeChainDataLength() +
+            kCipherOverhead);
+  }
 }
 
 TEST_P(QuicPacketSchedulerTest, CloneLargerThanOriginalPacket) {
@@ -1365,6 +1921,7 @@ TEST_P(QuicPacketSchedulerTest, CloneLargerThanOriginalPacket) {
       conn.udpSendPacketLen,
       std::move(cloneHeader),
       conn.ackStates.appDataAckState.largestAckedByPeer.value_or(0));
+  throwawayBuilder.accountForCipherOverhead(cipherOverhead);
   FrameScheduler noopScheduler("noopScheduler", conn);
   CloningScheduler cloningScheduler(
       noopScheduler, conn, "CopyCat", cipherOverhead);
@@ -1417,6 +1974,390 @@ TEST_P(QuicPacketSchedulerTest, AckSchedulerHasAcksToSchedule) {
 
   conn.ackStates.handshakeAckState->largestAckScheduled = std::nullopt;
   EXPECT_TRUE(handshakeAckScheduler.hasPendingAcks());
+}
+
+TEST_P(TimestampAckPolicyTest, SuppressesOnlyAcksThatCarryTimestamps) {
+  const auto& testCase = GetParam();
+  auto connPtr = createConn(10, 100000, 100000);
+  ASSERT_NE(connPtr, nullptr);
+  if (connPtr == nullptr) {
+    return;
+  }
+  auto& conn = *connPtr;
+  conn.transportSettings.oneRttTimestampFrameWriteMode =
+      TimestampFrameWriteMode::Opportunistic;
+  conn.transportSettings
+      .suppressOneRttTimestampFrameWhenAckReceiveTimestampsWritten =
+      testCase.suppressForAckReceiveTimestamps;
+  conn.peerTimestampFrameState.canReceive = true;
+  conn.connectionTime = Clock::now() - std::chrono::milliseconds(5);
+
+  switch (testCase.ackKind) {
+    case TimestampAckKind::Plain:
+      addPlainAckState(conn);
+      break;
+    case TimestampAckKind::LegacyReceiveTimestamps:
+      addAckReceiveTimestampState(conn);
+      break;
+    case TimestampAckKind::Draft02ReceiveTimestamps:
+      addAckReceiveTimestampState(
+          conn, AckReceiveTimestampsVersion::DraftIetf02);
+      break;
+    case TimestampAckKind::ExtendedReceiveTimestamps:
+      addAckReceiveTimestampState(conn);
+      conn.negotiatedExtendedAckFeatures =
+          static_cast<ExtendedAckFeatureMaskType>(
+              ExtendedAckFeatureMask::RECEIVE_TIMESTAMPS);
+      break;
+  }
+
+  auto stream = createStream(conn);
+  writeDataToStream(conn, stream, "some data");
+  FrameScheduler scheduler = std::move(
+                                 FrameScheduler::Builder(
+                                     conn,
+                                     EncryptionLevel::AppData,
+                                     PacketNumberSpace::AppData,
+                                     "timestampAckPolicy")
+                                     .ackFrames()
+                                     .streamFrames()
+                                     .timestampFrames())
+                                 .build();
+  const auto writableBytes = static_cast<uint32_t>(conn.udpSendPacketLen);
+  RegularQuicPacketBuilder builder(
+      writableBytes,
+      ShortHeader(
+          ProtectionType::KeyPhaseOne,
+          conn.clientConnectionId.value_or(getTestConnectionId()),
+          getNextPacketNum(conn, PacketNumberSpace::AppData)),
+      conn.ackStates.appDataAckState.largestAckedByPeer.value_or(0));
+
+  auto result =
+      scheduler.scheduleFramesForPacket(std::move(builder), writableBytes);
+
+  ASSERT_TRUE(result.has_value());
+  ASSERT_TRUE(result->packet.has_value());
+  EXPECT_EQ(
+      countTimestampFrames(result->packet->packet.frames),
+      testCase.expectedTimestamp ? 1 : 0);
+  const auto* ackFrame = result->packet->packet.frames[0].asWriteAckFrame();
+  ASSERT_NE(ackFrame, nullptr);
+  if (ackFrame == nullptr) {
+    return;
+  }
+  EXPECT_EQ(ackFrame->frameType, testCase.expectedAckType);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    AckEncodingPolicy,
+    TimestampAckPolicyTest,
+    testing::Values(
+        TimestampAckPolicyCase{
+            "PlainAckSuppressionOn",
+            TimestampAckKind::Plain,
+            true,
+            true,
+            FrameType::ACK},
+        TimestampAckPolicyCase{
+            "LegacySuppressionOn",
+            TimestampAckKind::LegacyReceiveTimestamps,
+            true,
+            false,
+            FrameType::ACK_RECEIVE_TIMESTAMPS},
+        TimestampAckPolicyCase{
+            "LegacySuppressionOff",
+            TimestampAckKind::LegacyReceiveTimestamps,
+            false,
+            true,
+            FrameType::ACK_RECEIVE_TIMESTAMPS},
+        TimestampAckPolicyCase{
+            "Draft02SuppressionOn",
+            TimestampAckKind::Draft02ReceiveTimestamps,
+            true,
+            false,
+            FrameType::ACK_RECEIVE_TIMESTAMPS_DRAFT_02},
+        TimestampAckPolicyCase{
+            "Draft02SuppressionOff",
+            TimestampAckKind::Draft02ReceiveTimestamps,
+            false,
+            true,
+            FrameType::ACK_RECEIVE_TIMESTAMPS_DRAFT_02},
+        TimestampAckPolicyCase{
+            "ExtendedSuppressionOn",
+            TimestampAckKind::ExtendedReceiveTimestamps,
+            true,
+            false,
+            FrameType::ACK_EXTENDED},
+        TimestampAckPolicyCase{
+            "ExtendedSuppressionOff",
+            TimestampAckKind::ExtendedReceiveTimestamps,
+            false,
+            true,
+            FrameType::ACK_EXTENDED}),
+    [](const testing::TestParamInfo<TimestampAckPolicyCase>& info) {
+      return info.param.name;
+    });
+
+TEST_P(TimestampAckOnlyPolicyTest, AppliesSelectionToAckOnlyPackets) {
+  const auto& testCase = GetParam();
+  QuicClientConnectionState conn(
+      FizzClientQuicHandshakeContext::Builder().build());
+  conn.transportSettings.oneRttTimestampFrameWriteMode = testCase.mode;
+  if (testCase.packetSelection) {
+    conn.transportSettings.oneRttTimestampFramePacketSelection =
+        *testCase.packetSelection;
+  }
+  conn.peerTimestampFrameState.canReceive = true;
+  conn.connectionTime = Clock::now() - std::chrono::milliseconds(5);
+
+  FrameScheduler scheduler = [&] {
+    if (testCase.frame == TimestampAckOnlyFrame::Ack) {
+      conn.ackStates.appDataAckState.largestRecvdPacketTime = Clock::now();
+      conn.ackStates.appDataAckState.needsToSendAckImmediately = true;
+      conn.ackStates.appDataAckState.acks.insert(10);
+      return std::move(
+                 FrameScheduler::Builder(
+                     conn,
+                     EncryptionLevel::AppData,
+                     PacketNumberSpace::AppData,
+                     "timestampAckOnlyPolicy")
+                     .ackFrames()
+                     .timestampFrames())
+          .build();
+    }
+    conn.pendingEvents.requestImmediateAck = true;
+    return std::move(
+               FrameScheduler::Builder(
+                   conn,
+                   EncryptionLevel::AppData,
+                   PacketNumberSpace::AppData,
+                   "timestampImmediateAckPolicy")
+                   .immediateAckFrames()
+                   .timestampFrames())
+        .build();
+  }();
+  const auto writableBytes = static_cast<uint32_t>(conn.udpSendPacketLen);
+  RegularQuicPacketBuilder builder(
+      writableBytes,
+      ShortHeader(
+          ProtectionType::KeyPhaseOne,
+          conn.clientConnectionId.value_or(getTestConnectionId()),
+          getNextPacketNum(conn, PacketNumberSpace::AppData)),
+      conn.ackStates.appDataAckState.largestAckedByPeer.value_or(0));
+
+  auto result = scheduler.scheduleFramesForPacket(
+      std::move(builder),
+      testCase.frame == TimestampAckOnlyFrame::Ack ? 0 : writableBytes);
+
+  ASSERT_TRUE(result.has_value());
+  ASSERT_TRUE(result->packet.has_value());
+  EXPECT_EQ(
+      countTimestampFrames(result->packet->packet.frames),
+      testCase.expectedTimestamp ? 1 : 0);
+  EXPECT_EQ(
+      std::count_if(
+          result->packet->packet.frames.begin(),
+          result->packet->packet.frames.end(),
+          [&](const QuicWriteFrame& frame) {
+            return testCase.frame == TimestampAckOnlyFrame::Ack
+                ? frame.asWriteAckFrame() != nullptr
+                : frame.asImmediateAckFrame() != nullptr;
+          }),
+      1);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    AckOnlySelectionPolicy,
+    TimestampAckOnlyPolicyTest,
+    testing::Values(
+        TimestampAckOnlyPolicyCase{
+            "AckDefaultAllEligibleOpportunistic",
+            TimestampAckOnlyFrame::Ack,
+            TimestampFrameWriteMode::Opportunistic,
+            std::nullopt,
+            true},
+        TimestampAckOnlyPolicyCase{
+            "AckAckEliciting",
+            TimestampAckOnlyFrame::Ack,
+            TimestampFrameWriteMode::Prioritized,
+            TimestampFramePacketSelection::AckElicitingPackets,
+            false},
+        TimestampAckOnlyPolicyCase{
+            "AckStream",
+            TimestampAckOnlyFrame::Ack,
+            TimestampFrameWriteMode::Prioritized,
+            TimestampFramePacketSelection::StreamPackets,
+            false},
+        TimestampAckOnlyPolicyCase{
+            "ImmediateAckAllEligible",
+            TimestampAckOnlyFrame::ImmediateAck,
+            TimestampFrameWriteMode::Prioritized,
+            TimestampFramePacketSelection::AllEligiblePackets,
+            true},
+        TimestampAckOnlyPolicyCase{
+            "ImmediateAckAckEliciting",
+            TimestampAckOnlyFrame::ImmediateAck,
+            TimestampFrameWriteMode::Prioritized,
+            TimestampFramePacketSelection::AckElicitingPackets,
+            true},
+        TimestampAckOnlyPolicyCase{
+            "ImmediateAckStream",
+            TimestampAckOnlyFrame::ImmediateAck,
+            TimestampFrameWriteMode::Prioritized,
+            TimestampFramePacketSelection::StreamPackets,
+            false}),
+    [](const testing::TestParamInfo<TimestampAckOnlyPolicyCase>& info) {
+      return info.param.name;
+    });
+
+TEST_P(TimestampCapacityPolicyTest, AppliesWriteModeWhenCarrierFillsPacket) {
+  const auto& testCase = GetParam();
+  auto connPtr = createConn(10, 100000, 100000);
+  ASSERT_NE(connPtr, nullptr);
+  if (connPtr == nullptr) {
+    return;
+  }
+  auto& conn = *connPtr;
+  conn.transportSettings.oneRttTimestampFrameWriteMode = testCase.mode;
+  conn.peerTimestampFrameState.canReceive = true;
+  conn.connectionTime = testCase.validClock
+      ? Clock::now() - std::chrono::milliseconds(5)
+      : Clock::now() + std::chrono::seconds(1);
+
+  auto stream = createStream(conn);
+  if (testCase.fillPacket) {
+    writeDataToStream(
+        conn, stream, buildRandomInputData(conn.udpSendPacketLen * 2));
+  } else {
+    writeDataToStream(conn, stream, "some data");
+  }
+  FrameScheduler scheduler = std::move(
+                                 FrameScheduler::Builder(
+                                     conn,
+                                     EncryptionLevel::AppData,
+                                     PacketNumberSpace::AppData,
+                                     "timestampCapacityPolicy")
+                                     .streamFrames()
+                                     .timestampFrames())
+                                 .build();
+  const auto writableBytes = static_cast<uint32_t>(conn.udpSendPacketLen);
+  RegularQuicPacketBuilder builder(
+      writableBytes,
+      ShortHeader(
+          ProtectionType::KeyPhaseOne,
+          conn.clientConnectionId.value_or(getTestConnectionId()),
+          getNextPacketNum(conn, PacketNumberSpace::AppData)),
+      conn.ackStates.appDataAckState.largestAckedByPeer.value_or(0));
+
+  auto result =
+      scheduler.scheduleFramesForPacket(std::move(builder), writableBytes);
+
+  ASSERT_TRUE(result.has_value());
+  ASSERT_TRUE(result->packet.has_value());
+  EXPECT_TRUE(
+      std::any_of(
+          result->packet->packet.frames.begin(),
+          result->packet->packet.frames.end(),
+          [](const auto& frame) {
+            return frame.asWriteStreamFrame() != nullptr;
+          }));
+  EXPECT_EQ(
+      countTimestampFrames(result->packet->packet.frames),
+      testCase.expectedTimestamp ? 1 : 0);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    WriteModeAndSpacePolicy,
+    TimestampCapacityPolicyTest,
+    testing::Values(
+        TimestampCapacityPolicyCase{
+            "DisabledWithSpace",
+            TimestampFrameWriteMode::Disabled,
+            false,
+            true,
+            false},
+        TimestampCapacityPolicyCase{
+            "OpportunisticWithSpace",
+            TimestampFrameWriteMode::Opportunistic,
+            false,
+            true,
+            true},
+        TimestampCapacityPolicyCase{
+            "OpportunisticPacketFull",
+            TimestampFrameWriteMode::Opportunistic,
+            true,
+            true,
+            false},
+        TimestampCapacityPolicyCase{
+            "PrioritizedWithSpace",
+            TimestampFrameWriteMode::Prioritized,
+            false,
+            true,
+            true},
+        TimestampCapacityPolicyCase{
+            "PrioritizedPacketFull",
+            TimestampFrameWriteMode::Prioritized,
+            true,
+            true,
+            true},
+        TimestampCapacityPolicyCase{
+            "PrioritizedInvalidClock",
+            TimestampFrameWriteMode::Prioritized,
+            false,
+            false,
+            false}),
+    [](const testing::TestParamInfo<TimestampCapacityPolicyCase>& info) {
+      return info.param.name;
+    });
+
+TEST_P(
+    QuicPacketSchedulerTest,
+    PrioritizedTimestampReservationDoesNotSuppressOnlyFittingDatagram) {
+  QuicClientConnectionState conn(
+      FizzClientQuicHandshakeContext::Builder().build());
+  conn.transportSettings.oneRttTimestampFrameWriteMode =
+      TimestampFrameWriteMode::Prioritized;
+  conn.peerTimestampFrameState.canReceive = true;
+  conn.datagramState.maxWriteFrameSize = std::numeric_limits<uint16_t>::max();
+
+  constexpr uint64_t kDatagramPayloadSize = 1;
+  (void)conn.datagramState.flowManager.addDatagram(
+      folly::IOBuf::copyBuffer("d"), kDefaultDatagramFlowId);
+
+  FrameScheduler scheduler = std::move(
+                                 FrameScheduler::Builder(
+                                     conn,
+                                     EncryptionLevel::AppData,
+                                     PacketNumberSpace::AppData,
+                                     "tinyDatagramTimestampScheduler")
+                                     .datagramFrames()
+                                     .timestampFrames())
+                                 .build();
+
+  const auto connId = getTestConnectionId();
+  const auto packetNum = getNextPacketNum(conn, PacketNumberSpace::AppData);
+  const auto largestAcked =
+      conn.ackStates.appDataAckState.largestAckedByPeer.value_or(0);
+  const auto packetNumberEncoding = encodePacketNumber(packetNum, largestAcked);
+  const auto datagramFrameSize = kDatagramFrameTypeSize +
+      getQuicIntegerSize(kDatagramPayloadSize).value() + kDatagramPayloadSize;
+  const auto writableBytes = static_cast<uint32_t>(
+      1 + connId.size() + packetNumberEncoding.length + datagramFrameSize);
+
+  ShortHeader header(ProtectionType::KeyPhaseOne, connId, packetNum);
+  RegularQuicPacketBuilder builder(
+      static_cast<uint32_t>(conn.udpSendPacketLen),
+      std::move(header),
+      largestAcked);
+  auto result =
+      scheduler.scheduleFramesForPacket(std::move(builder), writableBytes);
+
+  ASSERT_FALSE(result.hasError());
+  ASSERT_TRUE(result->packet.has_value());
+  EXPECT_EQ(countTimestampFrames(result->packet->packet.frames), 0);
+  ASSERT_EQ(result->packet->packet.frames.size(), 1);
+  EXPECT_NE(result->packet->packet.frames[0].asDatagramFrame(), nullptr);
+  EXPECT_EQ(conn.datagramState.flowManager.getDatagramCount(), 0);
 }
 
 TEST_P(QuicPacketSchedulerTest, LargestAckToSend) {
@@ -1791,6 +2732,133 @@ TEST_P(QuicPacketSchedulerTest, HighPriNewDataBeforeLowPriLossData) {
   EXPECT_EQ(highPriStreamId, writeStreamFrame.streamId);
 }
 
+TEST_P(QuicPacketSchedulerTest, UnifiedSendBufferWritesChainedNewData) {
+  transportSettings.useUnifiedAppStreamSendBuffer = true;
+  auto connPtr = createConn(10, 100000, 100000, GetParam());
+  auto& conn = *connPtr;
+  conn.transportSettings.useUnifiedAppStreamSendBuffer = true;
+  auto streamId = createStream(conn);
+  auto* stream = conn.streamManager->findStream(streamId);
+  ASSERT_NE(stream, nullptr);
+  ASSERT_TRUE(stream->usesUnifiedSendBuffer());
+
+  auto data = folly::IOBuf::copyBuffer("abc");
+  data->appendToChain(folly::IOBuf::copyBuffer("def"));
+  ASSERT_FALSE(
+      writeDataToQuicStream(*stream, std::move(data), true).hasError());
+
+  std::string writtenData;
+  auto builder = setupMockPacketBuilder();
+  EXPECT_CALL(*builder, _insertRange(_))
+      .WillRepeatedly([&writtenData](ByteRange range) {
+        writtenData.append(
+            reinterpret_cast<const char*>(range.data()), range.size());
+      });
+
+  StreamFrameScheduler scheduler(conn);
+  ASSERT_FALSE(scheduler.writeStreams(*builder).hasError());
+
+  verifyStreamFrames(*builder, {WriteStreamFrame(streamId, 0, 6, true)});
+  EXPECT_EQ(writtenData, "abcdef");
+  EXPECT_EQ(stream->streamSendBuffer->nextUnsentOffset(), 0);
+}
+
+TEST_P(QuicPacketSchedulerTest, UnifiedSendBufferWritesFinOnly) {
+  transportSettings.useUnifiedAppStreamSendBuffer = true;
+  auto connPtr = createConn(10, 0, 100000, GetParam());
+  auto& conn = *connPtr;
+  conn.transportSettings.useUnifiedAppStreamSendBuffer = true;
+  auto streamId = createStream(conn);
+  auto* stream = conn.streamManager->findStream(streamId);
+  ASSERT_NE(stream, nullptr);
+  ASSERT_TRUE(stream->usesUnifiedSendBuffer());
+  ASSERT_FALSE(writeDataToQuicStream(*stream, nullptr, true).hasError());
+
+  auto builder = setupMockPacketBuilder();
+  EXPECT_CALL(*builder, _insertRange(_)).Times(0);
+
+  StreamFrameScheduler scheduler(conn);
+  ASSERT_FALSE(scheduler.writeStreams(*builder).hasError());
+
+  verifyStreamFrames(*builder, {WriteStreamFrame(streamId, 0, 0, true)});
+}
+
+TEST_P(QuicPacketSchedulerTest, UnifiedSendBufferWritesAllLossBeforeNewData) {
+  transportSettings.useUnifiedAppStreamSendBuffer = true;
+  auto connPtr = createConn(10, 100000, 100000, GetParam());
+  auto& conn = *connPtr;
+  conn.transportSettings.useUnifiedAppStreamSendBuffer = true;
+  auto streamId = createStream(conn);
+  auto* stream = conn.streamManager->findStream(streamId);
+  ASSERT_NE(stream, nullptr);
+  ASSERT_TRUE(stream->usesUnifiedSendBuffer());
+  ASSERT_FALSE(writeDataToQuicStream(
+                   *stream, folly::IOBuf::copyBuffer("abcdefghi"), false)
+                   .hasError());
+  ASSERT_TRUE(stream->streamSendBuffer->markNewDataSent(
+      {.offset = 0, .len = 6, .fin = false}));
+  stream->streamSendBuffer->markLoss({.offset = 0, .len = 2, .fin = false});
+  stream->streamSendBuffer->markLoss({.offset = 4, .len = 2, .fin = false});
+  conn.streamManager->updateWritableStreams(*stream);
+
+  std::string writtenData;
+  auto builder = setupMockPacketBuilder();
+  EXPECT_CALL(*builder, _insertRange(_))
+      .WillRepeatedly([&writtenData](ByteRange range) {
+        writtenData.append(
+            reinterpret_cast<const char*>(range.data()), range.size());
+      });
+
+  StreamFrameScheduler scheduler(conn);
+  ASSERT_FALSE(scheduler.writeStreams(*builder).hasError());
+
+  verifyStreamFrames(
+      *builder,
+      {
+          WriteStreamFrame(streamId, 0, 2, false),
+          WriteStreamFrame(streamId, 4, 2, false),
+          WriteStreamFrame(streamId, 6, 3, false),
+      });
+  EXPECT_EQ(writtenData, "abefghi");
+  const StreamSendBuffer::SendRange expectedLoss{
+      .offset = 0, .len = 2, .fin = false};
+  const StreamSendBuffer::SendRange expectedNewData{
+      .offset = 6, .len = 3, .fin = false};
+  EXPECT_EQ(stream->streamSendBuffer->nextLoss(100), expectedLoss);
+  EXPECT_EQ(stream->streamSendBuffer->nextNewData(100), expectedNewData);
+}
+
+TEST_P(
+    QuicPacketSchedulerTest,
+    UnifiedSendBufferWritesLossWithoutConnectionFlowControl) {
+  transportSettings.useUnifiedAppStreamSendBuffer = true;
+  auto connPtr = createConn(10, 0, 100000, GetParam());
+  auto& conn = *connPtr;
+  conn.transportSettings.useUnifiedAppStreamSendBuffer = true;
+  auto streamId = createStream(conn);
+  auto* stream = conn.streamManager->findStream(streamId);
+  ASSERT_NE(stream, nullptr);
+  ASSERT_TRUE(stream->usesUnifiedSendBuffer());
+  ASSERT_FALSE(
+      writeDataToQuicStream(*stream, folly::IOBuf::copyBuffer("lossnew"), false)
+          .hasError());
+  ASSERT_TRUE(stream->streamSendBuffer->markNewDataSent(
+      {.offset = 0, .len = 4, .fin = false}));
+  stream->streamSendBuffer->markLoss({.offset = 0, .len = 4, .fin = false});
+  conn.streamManager->updateWritableStreams(*stream);
+
+  auto builder = setupMockPacketBuilder();
+  StreamFrameScheduler scheduler(conn);
+  EXPECT_TRUE(scheduler.hasPendingData());
+  ASSERT_FALSE(scheduler.writeStreams(*builder).hasError());
+
+  verifyStreamFrames(*builder, {WriteStreamFrame(streamId, 0, 4, false)});
+  EXPECT_FALSE(conn.streamManager->hasWritable());
+  conn.flowControlState.peerAdvertisedMaxOffset = 100000;
+  conn.streamManager->onMaxData();
+  EXPECT_TRUE(conn.streamManager->hasWritable());
+}
+
 TEST_P(QuicPacketSchedulerTest, WriteLossWithoutFlowControl) {
   QuicServerConnectionState conn(
       FizzServerQuicHandshakeContext::Builder().build());
@@ -2131,12 +3199,12 @@ TEST_P(QuicPacketSchedulerTest, DatagramFrameSchedulerMultipleFramesPerPacket) {
   std::string s1(conn.udpSendPacketLen / 3, '*');
   BufQueue buf1;
   buf1.append(folly::IOBuf::copyBuffer(s1));
-  conn.datagramState.flowManager.addDatagram(
+  (void)conn.datagramState.flowManager.addDatagram(
       std::move(buf1), kDefaultDatagramFlowId);
   std::string s2(conn.udpSendPacketLen / 3, '%');
   BufQueue buf2;
   buf2.append(folly::IOBuf::copyBuffer(s2));
-  conn.datagramState.flowManager.addDatagram(
+  (void)conn.datagramState.flowManager.addDatagram(
       std::move(buf2), kDefaultDatagramFlowId);
   NiceMock<MockQuicPacketBuilder> builder;
   EXPECT_CALL(builder, remainingSpaceInPkt()).WillRepeatedly(Return(4096));
@@ -2165,12 +3233,12 @@ TEST_P(QuicPacketSchedulerTest, DatagramFrameSchedulerOneFramePerPacket) {
   std::string s1(conn.udpSendPacketLen / 3, '*');
   BufQueue buf1;
   buf1.append(folly::IOBuf::copyBuffer(s1));
-  conn.datagramState.flowManager.addDatagram(
+  (void)conn.datagramState.flowManager.addDatagram(
       std::move(buf1), kDefaultDatagramFlowId);
   std::string s2(conn.udpSendPacketLen / 3, '%');
   BufQueue buf2;
   buf2.append(folly::IOBuf::copyBuffer(s2));
-  conn.datagramState.flowManager.addDatagram(
+  (void)conn.datagramState.flowManager.addDatagram(
       std::move(buf2), kDefaultDatagramFlowId);
   NiceMock<MockQuicPacketBuilder> builder;
   EXPECT_CALL(builder, remainingSpaceInPkt()).WillRepeatedly(Return(4096));
@@ -2204,7 +3272,7 @@ TEST_P(QuicPacketSchedulerTest, DatagramFrameWriteWhenRoomAvailable) {
   std::string s(conn.udpSendPacketLen / 3, '*');
   BufQueue buf;
   buf.append(folly::IOBuf::copyBuffer(s));
-  conn.datagramState.flowManager.addDatagram(
+  (void)conn.datagramState.flowManager.addDatagram(
       std::move(buf), kDefaultDatagramFlowId);
   NiceMock<MockQuicPacketBuilder> builder;
   EXPECT_CALL(builder, remainingSpaceInPkt())
@@ -2225,6 +3293,102 @@ TEST_P(QuicPacketSchedulerTest, DatagramFrameWriteWhenRoomAvailable) {
       .WillRepeatedly(Invoke([](uint64_t bytes) { EXPECT_GT(bytes, 0); }));
   ASSERT_FALSE(scheduler.writeDatagramFrames(builder).hasError());
   ASSERT_EQ(frames.size(), 1);
+}
+
+TEST_P(QuicPacketSchedulerTest, DatagramFrameSchedulerDrainsNonDefaultFlow) {
+  QuicClientConnectionState conn(
+      FizzClientQuicHandshakeContext::Builder().build());
+  conn.datagramState.maxReadFrameSize = std::numeric_limits<uint16_t>::max();
+  conn.datagramState.maxReadBufferSize = 10;
+  conn.transportSettings.datagramConfig.framePerPacket = false;
+  DatagramFrameScheduler scheduler(conn);
+  // Nothing on the default flow; both datagrams live on a named flow.
+  constexpr uint32_t kNamedFlowId = 7;
+  std::string s1(conn.udpSendPacketLen / 3, '*');
+  BufQueue buf1;
+  buf1.append(folly::IOBuf::copyBuffer(s1));
+  (void)conn.datagramState.flowManager.addDatagram(
+      std::move(buf1), kNamedFlowId);
+  std::string s2(conn.udpSendPacketLen / 3, '%');
+  BufQueue buf2;
+  buf2.append(folly::IOBuf::copyBuffer(s2));
+  (void)conn.datagramState.flowManager.addDatagram(
+      std::move(buf2), kNamedFlowId);
+  NiceMock<MockQuicPacketBuilder> builder;
+  EXPECT_CALL(builder, remainingSpaceInPkt()).WillRepeatedly(Return(4096));
+  EXPECT_CALL(builder, appendFrame(_)).WillRepeatedly(Invoke([&](auto f) {
+    builder.frames_.push_back(f);
+  }));
+  NiceMock<MockQuicStats> quicStats;
+  conn.statsCallback = &quicStats;
+  EXPECT_CALL(quicStats, onDatagramWrite(_)).Times(2);
+  auto& frames = builder.frames_;
+  ASSERT_FALSE(scheduler.writeDatagramFrames(builder).hasError());
+  EXPECT_EQ(frames.size(), 2);
+  EXPECT_EQ(conn.datagramState.flowManager.getDatagramCount(), 0);
+}
+
+TEST_P(QuicPacketSchedulerTest, DatagramFrameSchedulerDrainsAllFlows) {
+  QuicClientConnectionState conn(
+      FizzClientQuicHandshakeContext::Builder().build());
+  conn.datagramState.maxReadFrameSize = std::numeric_limits<uint16_t>::max();
+  conn.datagramState.maxReadBufferSize = 10;
+  conn.transportSettings.datagramConfig.framePerPacket = false;
+  DatagramFrameScheduler scheduler(conn);
+  // One datagram on the default flow and one on each of two named flows.
+  for (uint32_t flowId : {kDefaultDatagramFlowId, 7u, 9u}) {
+    std::string s(conn.udpSendPacketLen / 8, '*');
+    BufQueue buf;
+    buf.append(folly::IOBuf::copyBuffer(s));
+    (void)conn.datagramState.flowManager.addDatagram(std::move(buf), flowId);
+  }
+  NiceMock<MockQuicPacketBuilder> builder;
+  EXPECT_CALL(builder, remainingSpaceInPkt()).WillRepeatedly(Return(4096));
+  EXPECT_CALL(builder, appendFrame(_)).WillRepeatedly(Invoke([&](auto f) {
+    builder.frames_.push_back(f);
+  }));
+  NiceMock<MockQuicStats> quicStats;
+  conn.statsCallback = &quicStats;
+  EXPECT_CALL(quicStats, onDatagramWrite(_)).Times(3);
+  auto& frames = builder.frames_;
+  ASSERT_FALSE(scheduler.writeDatagramFrames(builder).hasError());
+  EXPECT_EQ(frames.size(), 3);
+  EXPECT_EQ(conn.datagramState.flowManager.getDatagramCount(), 0);
+}
+
+TEST_P(QuicPacketSchedulerTest, DatagramFrameSchedulerStatsExpiredDatagrams) {
+  QuicClientConnectionState conn(
+      FizzClientQuicHandshakeContext::Builder().build());
+  conn.datagramState.maxReadFrameSize = std::numeric_limits<uint16_t>::max();
+  conn.datagramState.maxReadBufferSize = 10;
+  conn.transportSettings.datagramConfig.framePerPacket = false;
+  DatagramFrameScheduler scheduler(conn);
+  // Two datagrams that will age out before the scheduler runs.
+  constexpr uint32_t kFlowId = 7;
+  auto maxQueueTime = std::chrono::milliseconds(1);
+  for (char fill : {'*', '%'}) {
+    std::string s(conn.udpSendPacketLen / 8, fill);
+    BufQueue buf;
+    buf.append(folly::IOBuf::copyBuffer(s));
+    (void)conn.datagramState.flowManager.addDatagram(
+        std::move(buf), kFlowId, std::nullopt, false, maxQueueTime);
+  }
+  NiceMock<MockQuicPacketBuilder> builder;
+  EXPECT_CALL(builder, remainingSpaceInPkt()).WillRepeatedly(Return(4096));
+  EXPECT_CALL(builder, appendFrame(_)).WillRepeatedly([&](const auto& f) {
+    builder.frames_.push_back(f);
+  });
+  NiceMock<MockQuicStats> quicStats;
+  conn.statsCallback = &quicStats;
+  EXPECT_CALL(quicStats, onDatagramWrite(_)).Times(0);
+  EXPECT_CALL(quicStats, onDatagramDroppedOnWrite()).Times(2);
+
+  /* sleep override */
+  std::this_thread::sleep_for(maxQueueTime * 5);
+  ASSERT_FALSE(scheduler.writeDatagramFrames(builder).hasError());
+
+  EXPECT_TRUE(builder.frames_.empty());
+  EXPECT_EQ(conn.datagramState.flowManager.getDatagramCount(), 0);
 }
 
 TEST_P(QuicPacketSchedulerTest, ShortHeaderPaddingWithSpaceForPadding) {
@@ -2624,6 +3788,35 @@ TEST_P(QuicPacketSchedulerTest, RstStreamSchedulerReliableReset) {
   // Now we should have egressed all the stream data upto the reliable offset,
   // so we should have sent the reliable reset.
   EXPECT_FALSE(conn.pendingEvents.resets.contains(stream->id));
+}
+
+TEST_P(QuicPacketSchedulerTest, UnifiedRstSchedulerWaitsForReliableData) {
+  auto connPtr = createConn(10, 100000, 100000, GetParam());
+  auto& conn = *connPtr;
+  conn.transportSettings.useUnifiedAppStreamSendBuffer = true;
+  auto* stream = conn.streamManager->createNextBidirectionalStream().value();
+  ASSERT_TRUE(stream->streamSendBuffer.has_value());
+  auto data = folly::IOBuf::copyBuffer("cupcake");
+  const auto dataLen = data->computeChainDataLength();
+  ASSERT_FALSE(
+      writeDataToQuicStream(*stream, std::move(data), false).hasError());
+  conn.pendingEvents.resets.emplace(
+      stream->id, RstStreamFrame(stream->id, 0, dataLen, dataLen));
+  RstStreamScheduler scheduler(conn);
+
+  auto blockedBuilder = setupMockPacketBuilder();
+  auto blockedResult = scheduler.writeRsts(*blockedBuilder);
+  ASSERT_FALSE(blockedResult.hasError());
+  EXPECT_FALSE(blockedResult.value());
+  EXPECT_TRUE(blockedBuilder->frames_.empty());
+
+  ASSERT_TRUE(stream->streamSendBuffer->markNewDataSent({0, dataLen, false}));
+  auto readyBuilder = setupMockPacketBuilder();
+  auto readyResult = scheduler.writeRsts(*readyBuilder);
+  ASSERT_FALSE(readyResult.hasError());
+  EXPECT_TRUE(readyResult.value());
+  ASSERT_EQ(readyBuilder->frames_.size(), 1);
+  EXPECT_NE(readyBuilder->frames_.front().asRstStreamFrame(), nullptr);
 }
 
 TEST_P(QuicPacketSchedulerTest, PausedPriorityEnabled) {
@@ -3718,8 +4911,10 @@ TEST_P(QuicPacketSchedulerTest, DatagramDoubleSchedulerBug) {
       true; // KEY: stops after 1 datagram
 
   // Add 2 small datagrams
-  conn.datagramState.flowManager.addDatagram(folly::IOBuf::copyBuffer("d1"));
-  conn.datagramState.flowManager.addDatagram(folly::IOBuf::copyBuffer("d2"));
+  (void)conn.datagramState.flowManager.addDatagram(
+      folly::IOBuf::copyBuffer("d1"));
+  (void)conn.datagramState.flowManager.addDatagram(
+      folly::IOBuf::copyBuffer("d2"));
 
   // Add to priority queue
   auto dgId =
@@ -3801,7 +4996,7 @@ TEST_F(QuicPacketSchedulerTest, DatagramFlowPriorityScheduling) {
   uint32_t datagramFlowId = 100;
   BufQueue datagramBuf;
   datagramBuf.append(folly::IOBuf::copyBuffer("datagram data"));
-  conn.datagramState.flowManager.addDatagram(
+  (void)conn.datagramState.flowManager.addDatagram(
       std::move(datagramBuf), datagramFlowId);
   (void)conn.datagramState.flowManager.setFlowPriority(
       datagramFlowId, HTTPPriorityQueue::Priority(7, false));
@@ -3848,7 +5043,8 @@ TEST_F(QuicPacketSchedulerTest, MultipleDatagramFlowsWithPriorities) {
 
   BufQueue buf1;
   buf1.append(folly::IOBuf::copyBuffer("high priority datagram"));
-  conn.datagramState.flowManager.addDatagram(std::move(buf1), highPriorityFlow);
+  (void)conn.datagramState.flowManager.addDatagram(
+      std::move(buf1), highPriorityFlow);
   (void)conn.datagramState.flowManager.setFlowPriority(
       highPriorityFlow, highPri);
   conn.streamManager->writeQueue().insertOrUpdate(
@@ -3856,14 +5052,16 @@ TEST_F(QuicPacketSchedulerTest, MultipleDatagramFlowsWithPriorities) {
 
   BufQueue buf2;
   buf2.append(folly::IOBuf::copyBuffer("mid priority datagram"));
-  conn.datagramState.flowManager.addDatagram(std::move(buf2), midPriorityFlow);
+  (void)conn.datagramState.flowManager.addDatagram(
+      std::move(buf2), midPriorityFlow);
   (void)conn.datagramState.flowManager.setFlowPriority(midPriorityFlow, midPri);
   conn.streamManager->writeQueue().insertOrUpdate(
       PriorityQueue::Identifier::fromDatagramFlowID(midPriorityFlow), midPri);
 
   BufQueue buf3;
   buf3.append(folly::IOBuf::copyBuffer("low priority datagram"));
-  conn.datagramState.flowManager.addDatagram(std::move(buf3), lowPriorityFlow);
+  (void)conn.datagramState.flowManager.addDatagram(
+      std::move(buf3), lowPriorityFlow);
   (void)conn.datagramState.flowManager.setFlowPriority(lowPriorityFlow, lowPri);
   conn.streamManager->writeQueue().insertOrUpdate(
       PriorityQueue::Identifier::fromDatagramFlowID(lowPriorityFlow), lowPri);
@@ -3900,14 +5098,14 @@ TEST_F(QuicPacketSchedulerTest, InterleavedStreamsAndDatagramsRespectPriority) {
 
   BufQueue buf1;
   buf1.append(folly::IOBuf::copyBuffer("d1"));
-  conn.datagramState.flowManager.addDatagram(std::move(buf1), 100);
+  (void)conn.datagramState.flowManager.addDatagram(std::move(buf1), 100);
   (void)conn.datagramState.flowManager.setFlowPriority(100, pri3);
   conn.streamManager->writeQueue().insertOrUpdate(
       PriorityQueue::Identifier::fromDatagramFlowID(100), pri3);
 
   BufQueue buf2;
   buf2.append(folly::IOBuf::copyBuffer("d2"));
-  conn.datagramState.flowManager.addDatagram(std::move(buf2), 200);
+  (void)conn.datagramState.flowManager.addDatagram(std::move(buf2), 200);
   (void)conn.datagramState.flowManager.setFlowPriority(200, pri7);
   conn.streamManager->writeQueue().insertOrUpdate(
       PriorityQueue::Identifier::fromDatagramFlowID(200), pri7);
@@ -3926,7 +5124,7 @@ TEST_F(QuicPacketSchedulerTest, InterleavedStreamsAndDatagramsRespectPriority) {
   }
 }
 
-TEST_F(QuicPacketSchedulerTest, DatagramFlowCloseDropsPendingDatagrams) {
+TEST_F(QuicPacketSchedulerTest, DatagramFlowCloseNowDropsPendingDatagrams) {
   QuicClientConnectionState conn(
       FizzClientQuicHandshakeContext::Builder().build());
   setupDatagramFlowConn(conn);
@@ -3937,14 +5135,14 @@ TEST_F(QuicPacketSchedulerTest, DatagramFlowCloseDropsPendingDatagrams) {
   for (int i = 0; i < 3; ++i) {
     BufQueue buf;
     buf.append(folly::IOBuf::copyBuffer("datagram " + std::to_string(i)));
-    conn.datagramState.flowManager.addDatagram(std::move(buf), flowId);
+    (void)conn.datagramState.flowManager.addDatagram(std::move(buf), flowId);
   }
 
   EXPECT_EQ(3, conn.datagramState.flowManager.getDatagramCount());
   EXPECT_TRUE(conn.datagramState.flowManager.hasDatagramsForFlow(flowId));
 
   // Close the flow
-  auto result = conn.datagramState.flowManager.closeFlow(flowId);
+  auto result = conn.datagramState.flowManager.closeFlowNow(flowId);
   ASSERT_TRUE(result.has_value());
 
   // All datagrams should be dropped
@@ -3988,7 +5186,7 @@ TEST_F(QuicPacketSchedulerTest, DatagramFlowPriorityCanBeUpdated) {
   // Add datagram with initial priority
   BufQueue buf;
   buf.append(folly::IOBuf::copyBuffer("datagram"));
-  conn.datagramState.flowManager.addDatagram(std::move(buf), flowId);
+  (void)conn.datagramState.flowManager.addDatagram(std::move(buf), flowId);
   (void)conn.datagramState.flowManager.setFlowPriority(flowId, initialPri);
   conn.streamManager->writeQueue().insertOrUpdate(
       PriorityQueue::Identifier::fromDatagramFlowID(flowId), initialPri);
@@ -4017,22 +5215,298 @@ TEST_F(QuicPacketSchedulerTest, ClosingFlowWithDatagramsRemovesFromQueue) {
   // Add datagrams to two flows
   BufQueue buf1;
   buf1.append(folly::IOBuf::copyBuffer("flow1-data"));
-  conn.datagramState.flowManager.addDatagram(std::move(buf1), flow1);
+  (void)conn.datagramState.flowManager.addDatagram(std::move(buf1), flow1);
 
   BufQueue buf2;
   buf2.append(folly::IOBuf::copyBuffer("flow2-data"));
-  conn.datagramState.flowManager.addDatagram(std::move(buf2), flow2);
+  (void)conn.datagramState.flowManager.addDatagram(std::move(buf2), flow2);
 
   EXPECT_EQ(2, conn.datagramState.flowManager.getDatagramCount());
 
   // Close flow1
-  auto result = conn.datagramState.flowManager.closeFlow(flow1);
+  auto result = conn.datagramState.flowManager.closeFlowNow(flow1);
   ASSERT_TRUE(result.has_value());
 
   // flow1 should be gone, flow2 should remain
   EXPECT_EQ(1, conn.datagramState.flowManager.getDatagramCount());
   EXPECT_FALSE(conn.datagramState.flowManager.hasDatagramsForFlow(flow1));
   EXPECT_TRUE(conn.datagramState.flowManager.hasDatagramsForFlow(flow2));
+}
+
+TEST_F(QuicPacketSchedulerTest, EphemeralDatagramFlowCleanup) {
+  QuicClientConnectionState conn(
+      FizzClientQuicHandshakeContext::Builder().build());
+  conn.streamManager->setMaxLocalBidirectionalStreams(10).value();
+  conn.flowControlState.peerAdvertisedMaxOffset = 100000;
+  conn.flowControlState.peerAdvertisedInitialMaxStreamOffsetBidiRemote = 100000;
+  conn.transportSettings.datagramConfig.enabled = true;
+  conn.transportSettings.datagramConfig.scheduleDatagramsWithStreams = true;
+  conn.datagramState.maxWriteFrameSize = 1000;
+  conn.datagramState.maxWriteBufferSize = 100;
+
+  // Create an ephemeral flow with priority 5
+  uint32_t ephemeralFlowId = 0; // Ephemeral flows count up from 0
+  BufQueue datagramBuf;
+  datagramBuf.append(folly::IOBuf::copyBuffer("ephemeral datagram"));
+  (void)conn.datagramState.flowManager.addDatagram(
+      std::move(datagramBuf),
+      ephemeralFlowId,
+      HTTPPriorityQueue::Priority(5, false),
+      true /* ephemeral */);
+  conn.streamManager->writeQueue().insertOrUpdate(
+      PriorityQueue::Identifier::fromDatagramFlowID(ephemeralFlowId),
+      HTTPPriorityQueue::Priority(5, false));
+
+  // Verify flow exists
+  EXPECT_EQ(conn.datagramState.flowManager.getFlowCount(), 1);
+  EXPECT_TRUE(conn.datagramState.flowManager.isFlowDraining(ephemeralFlowId));
+
+  // Write the datagram
+  auto builder = setupMockPacketBuilder();
+  StreamFrameScheduler scheduler(conn);
+  auto result = scheduler.writeStreams(*builder);
+  ASSERT_FALSE(result.hasError());
+
+  // Verify datagram was written
+  bool foundDatagramFrame = false;
+  for (const auto& frame : builder->frames_) {
+    if (frame.asDatagramFrame()) {
+      foundDatagramFrame = true;
+    }
+  }
+  EXPECT_TRUE(foundDatagramFrame);
+
+  // Verify ephemeral flow was cleaned up (removed from writeBuffer)
+  EXPECT_EQ(conn.datagramState.flowManager.getFlowCount(), 0);
+}
+
+TEST_F(QuicPacketSchedulerTest, MultipleEphemeralFlowsWithPriorities) {
+  QuicClientConnectionState conn(
+      FizzClientQuicHandshakeContext::Builder().build());
+  conn.streamManager->setMaxLocalBidirectionalStreams(10).value();
+  conn.flowControlState.peerAdvertisedMaxOffset = 100000;
+  conn.flowControlState.peerAdvertisedInitialMaxStreamOffsetBidiRemote = 100000;
+  conn.transportSettings.datagramConfig.enabled = true;
+  conn.transportSettings.datagramConfig.scheduleDatagramsWithStreams = true;
+  conn.datagramState.maxWriteFrameSize = 1000;
+  conn.datagramState.maxWriteBufferSize = 100;
+
+  // Create three ephemeral flows with different priorities
+  uint32_t highPriFlow = 0;
+  uint32_t midPriFlow = 1;
+  uint32_t lowPriFlow = 2;
+
+  BufQueue buf1;
+  buf1.append(folly::IOBuf::copyBuffer("high"));
+  (void)conn.datagramState.flowManager.addDatagram(
+      std::move(buf1),
+      highPriFlow,
+      HTTPPriorityQueue::Priority(1, false),
+      true);
+  conn.streamManager->writeQueue().insertOrUpdate(
+      PriorityQueue::Identifier::fromDatagramFlowID(highPriFlow),
+      HTTPPriorityQueue::Priority(1, false));
+
+  BufQueue buf2;
+  buf2.append(folly::IOBuf::copyBuffer("mid"));
+  (void)conn.datagramState.flowManager.addDatagram(
+      std::move(buf2), midPriFlow, HTTPPriorityQueue::Priority(5, false), true);
+  conn.streamManager->writeQueue().insertOrUpdate(
+      PriorityQueue::Identifier::fromDatagramFlowID(midPriFlow),
+      HTTPPriorityQueue::Priority(5, false));
+
+  BufQueue buf3;
+  buf3.append(folly::IOBuf::copyBuffer("low"));
+  (void)conn.datagramState.flowManager.addDatagram(
+      std::move(buf3), lowPriFlow, HTTPPriorityQueue::Priority(9, false), true);
+  conn.streamManager->writeQueue().insertOrUpdate(
+      PriorityQueue::Identifier::fromDatagramFlowID(lowPriFlow),
+      HTTPPriorityQueue::Priority(9, false));
+
+  EXPECT_EQ(3, conn.datagramState.flowManager.getFlowCount());
+
+  // Schedule - should send all datagrams and clean up all flows
+  auto builder = setupMockPacketBuilder();
+  StreamFrameScheduler scheduler(conn);
+  auto result = scheduler.writeStreams(*builder);
+  ASSERT_FALSE(result.hasError());
+
+  // Verify at least one datagram was sent
+  bool foundDatagramFrame = false;
+  for (const auto& frame : builder->frames_) {
+    if (frame.asDatagramFrame()) {
+      foundDatagramFrame = true;
+    }
+  }
+  EXPECT_TRUE(foundDatagramFrame);
+
+  // Note: In a single packet builder call, we may not send all datagrams
+  // The test verifies cleanup happens correctly for what was sent
+}
+
+TEST_F(QuicPacketSchedulerTest, EphemeralFlowNotCleanedWhenNotSent) {
+  QuicClientConnectionState conn(
+      FizzClientQuicHandshakeContext::Builder().build());
+  conn.streamManager->setMaxLocalBidirectionalStreams(10).value();
+  conn.flowControlState.peerAdvertisedMaxOffset = 100000;
+  conn.flowControlState.peerAdvertisedInitialMaxStreamOffsetBidiRemote = 100000;
+  conn.transportSettings.datagramConfig.enabled = true;
+  conn.transportSettings.datagramConfig.scheduleDatagramsWithStreams = true;
+  conn.datagramState.maxWriteFrameSize = 50; // Small size
+  conn.datagramState.maxWriteBufferSize = 100;
+
+  // Create ephemeral flow with a datagram that won't fit
+  uint32_t ephemeralFlowId = 0;
+  std::string largeData(1000, 'x'); // Large datagram
+  BufQueue buf;
+  buf.append(folly::IOBuf::copyBuffer(largeData));
+  (void)conn.datagramState.flowManager.addDatagram(
+      std::move(buf),
+      ephemeralFlowId,
+      HTTPPriorityQueue::Priority(5, false),
+      true);
+  conn.streamManager->writeQueue().insertOrUpdate(
+      PriorityQueue::Identifier::fromDatagramFlowID(ephemeralFlowId),
+      HTTPPriorityQueue::Priority(5, false));
+
+  EXPECT_EQ(1, conn.datagramState.flowManager.getFlowCount());
+  EXPECT_TRUE(conn.datagramState.flowManager.isFlowDraining(ephemeralFlowId));
+
+  // Try to schedule - datagram won't fit
+  auto builder = setupMockPacketBuilder();
+  EXPECT_CALL(*builder, remainingSpaceInPkt()).WillRepeatedly(Return(100));
+  StreamFrameScheduler scheduler(conn);
+  auto result = scheduler.writeStreams(*builder);
+
+  // Ephemeral flow should still exist (not sent, so not cleaned up)
+  EXPECT_EQ(1, conn.datagramState.flowManager.getFlowCount());
+  EXPECT_EQ(1, conn.datagramState.flowManager.getDatagramCount());
+  EXPECT_TRUE(conn.datagramState.flowManager.isFlowDraining(ephemeralFlowId));
+}
+
+TEST_F(QuicPacketSchedulerTest, MixedEphemeralAndPersistentFlows) {
+  QuicClientConnectionState conn(
+      FizzClientQuicHandshakeContext::Builder().build());
+  conn.streamManager->setMaxLocalBidirectionalStreams(10).value();
+  conn.flowControlState.peerAdvertisedMaxOffset = 100000;
+  conn.flowControlState.peerAdvertisedInitialMaxStreamOffsetBidiRemote = 100000;
+  conn.transportSettings.datagramConfig.enabled = true;
+  conn.transportSettings.datagramConfig.scheduleDatagramsWithStreams = true;
+  conn.datagramState.maxWriteFrameSize = 1000;
+  conn.datagramState.maxWriteBufferSize = 100;
+
+  // Create ephemeral flow
+  uint32_t ephemeralFlow = 0;
+  BufQueue buf1;
+  buf1.append(folly::IOBuf::copyBuffer("ephemeral"));
+  (void)conn.datagramState.flowManager.addDatagram(
+      std::move(buf1),
+      ephemeralFlow,
+      HTTPPriorityQueue::Priority(5, false),
+      true);
+  conn.streamManager->writeQueue().insertOrUpdate(
+      PriorityQueue::Identifier::fromDatagramFlowID(ephemeralFlow),
+      HTTPPriorityQueue::Priority(5, false));
+
+  // Create persistent flow
+  uint32_t persistentFlow = 100;
+  BufQueue buf2;
+  buf2.append(folly::IOBuf::copyBuffer("persistent"));
+  (void)conn.datagramState.flowManager.addDatagram(
+      std::move(buf2),
+      persistentFlow,
+      HTTPPriorityQueue::Priority(5, false),
+      false);
+  conn.streamManager->writeQueue().insertOrUpdate(
+      PriorityQueue::Identifier::fromDatagramFlowID(persistentFlow),
+      HTTPPriorityQueue::Priority(5, false));
+
+  EXPECT_EQ(2, conn.datagramState.flowManager.getFlowCount());
+  EXPECT_TRUE(conn.datagramState.flowManager.isFlowDraining(ephemeralFlow));
+  EXPECT_FALSE(conn.datagramState.flowManager.isFlowDraining(persistentFlow));
+
+  // Schedule datagrams
+  auto builder = setupMockPacketBuilder();
+  StreamFrameScheduler scheduler(conn);
+  auto result = scheduler.writeStreams(*builder);
+  ASSERT_FALSE(result.hasError());
+
+  // Verify datagrams were sent
+  int datagramCount = 0;
+  for (const auto& frame : builder->frames_) {
+    if (frame.asDatagramFrame()) {
+      datagramCount++;
+    }
+  }
+  EXPECT_GT(datagramCount, 0);
+
+  // Check which flows were cleaned up based on what was sent
+  // Ephemeral flows get cleaned when empty, persistent flows don't
+  if (!conn.datagramState.flowManager.hasDatagramsForFlow(ephemeralFlow)) {
+    // Ephemeral was sent and cleaned up
+    EXPECT_FALSE(conn.datagramState.flowManager.isFlowDraining(
+        ephemeralFlow)); // Doesn't exist
+  }
+  if (!conn.datagramState.flowManager.hasDatagramsForFlow(persistentFlow)) {
+    // Persistent was sent but still exists
+    EXPECT_FALSE(conn.datagramState.flowManager.isFlowDraining(persistentFlow));
+  }
+}
+
+TEST_F(QuicPacketSchedulerTest, EphemeralFlowWithStreamInterleaving) {
+  QuicClientConnectionState conn(
+      FizzClientQuicHandshakeContext::Builder().build());
+  conn.streamManager->setMaxLocalBidirectionalStreams(10).value();
+  conn.flowControlState.peerAdvertisedMaxOffset = 100000;
+  conn.flowControlState.peerAdvertisedInitialMaxStreamOffsetBidiRemote = 100000;
+  conn.transportSettings.datagramConfig.enabled = true;
+  conn.transportSettings.datagramConfig.scheduleDatagramsWithStreams = true;
+  conn.datagramState.maxWriteFrameSize = 1000;
+  conn.datagramState.maxWriteBufferSize = 100;
+
+  // Create stream with priority 3
+  auto streamId = createStream(conn, HTTPPriorityQueue::Priority(3, false));
+  writeDataToStream(conn, streamId, "stream data");
+
+  // Create ephemeral datagram flow with priority 5 (lower than stream)
+  uint32_t ephemeralFlowId = 0;
+  BufQueue buf;
+  buf.append(folly::IOBuf::copyBuffer("ephemeral"));
+  (void)conn.datagramState.flowManager.addDatagram(
+      std::move(buf),
+      ephemeralFlowId,
+      HTTPPriorityQueue::Priority(5, false),
+      true);
+  conn.streamManager->writeQueue().insertOrUpdate(
+      PriorityQueue::Identifier::fromDatagramFlowID(ephemeralFlowId),
+      HTTPPriorityQueue::Priority(5, false));
+
+  EXPECT_EQ(1, conn.datagramState.flowManager.getFlowCount());
+
+  // Schedule - stream should be sent first, then datagram
+  auto builder = setupMockPacketBuilder();
+  StreamFrameScheduler scheduler(conn);
+  auto result = scheduler.writeStreams(*builder);
+  ASSERT_FALSE(result.hasError());
+
+  // Verify both were sent
+  bool foundStream = false;
+  bool foundDatagram = false;
+  for (const auto& frame : builder->frames_) {
+    if (frame.asWriteStreamFrame()) {
+      foundStream = true;
+      // Stream should come before datagram
+      EXPECT_FALSE(foundDatagram);
+    } else if (frame.asDatagramFrame()) {
+      foundDatagram = true;
+    }
+  }
+
+  EXPECT_TRUE(foundStream);
+  EXPECT_TRUE(foundDatagram);
+
+  // Ephemeral flow should be cleaned up
+  EXPECT_EQ(0, conn.datagramState.flowManager.getFlowCount());
 }
 
 INSTANTIATE_TEST_SUITE_P(

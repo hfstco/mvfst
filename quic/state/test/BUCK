@@ -2,6 +2,17 @@ load("@fbcode//quic:defs.bzl", "mvfst_cpp_library", "mvfst_cpp_test")
 
 oncall("traffic_protocols")
 
+mvfst_cpp_test(
+    name = "stream_send_buffer_test",
+    srcs = [
+        "StreamSendBufferTest.cpp",
+    ],
+    deps = [
+        "//folly/portability:gtest",
+        "//quic/state:stream_send_buffer",
+    ],
+)
+
 mvfst_cpp_library(
     name = "mocks",
     headers = [
@@ -52,12 +63,13 @@ mvfst_cpp_test(
     supports_static_listing = False,
     deps = [
         "fbsource//third-party/googletest:gmock",
+        ":mocks",
         "//quic/client:state_and_handshake",
         "//quic/common/test:test_utils",
         "//quic/fizz/client/handshake:fizz_client_handshake",
         "//quic/fizz/server/handshake:fizz_server_handshake",
         "//quic/server/state:server",
-        "//quic/state:quic_state_machine",
+        "//quic/state:quic_stream_utilities",
         "//quic/state:stream_functions",
     ],
 )
@@ -101,6 +113,7 @@ mvfst_cpp_test(
         "//quic/common/test:test_utils",
         "//quic/fizz/server/handshake:fizz_server_handshake",
         "//quic/server/state:server",
+        "//quic/state:ack_frequency_functions",
         "//quic/state:outstanding_packet",
         "//quic/state:state_functions",
         "//quic/state/stream:stream",
@@ -115,6 +128,18 @@ mvfst_cpp_test(
     deps = [
         "//folly/portability:gtest",
         "//quic/state:pacing_functions",
+    ],
+)
+
+mvfst_cpp_test(
+    name = "TimestampFrameFunctionsTest",
+    srcs = [
+        "TimestampFrameFunctionsTest.cpp",
+    ],
+    supports_static_listing = False,
+    deps = [
+        "//quic:constants",
+        "//quic/state:timestamp_frame_functions",
     ],
 )
 

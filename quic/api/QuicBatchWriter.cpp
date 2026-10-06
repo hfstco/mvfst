@@ -60,9 +60,7 @@ ssize_t SinglePacketInplaceBatchWriter::write(
 
   iovec vec[kNumIovecBufferChains];
   size_t iovec_len = fillIovec(buf, vec);
-  auto ret = sock.write(address, vec, iovec_len);
-  conn_.bufAccessor->clear();
-  return ret;
+  return sock.write(address, vec, iovec_len);
 }
 
 bool SinglePacketInplaceBatchWriter::empty() const {
@@ -128,13 +126,14 @@ ssize_t SendmmsgPacketBatchWriter::write(
     iovec vec[kNumIovecBufferChains];
     size_t messageSizes[kNumIovecBufferChains];
     fillIovecAndMessageSizes(vec, messageSizes, kNumIovecBufferChains);
-    sock.writem(AddressRange(&address, 1), vec, messageSizes, bufs_.size());
+    ret =
+        sock.writem(AddressRange(&address, 1), vec, messageSizes, bufs_.size());
   } else {
     // We allocate the arrays on the heap
     std::unique_ptr<iovec[]> vec(new iovec[numChainedBuffers]);
     std::unique_ptr<size_t[]> messageSizes(new size_t[bufs_.size()]);
     fillIovecAndMessageSizes(vec.get(), messageSizes.get(), numChainedBuffers);
-    sock.writem(
+    ret = sock.writem(
         AddressRange(&address, 1), vec.get(), messageSizes.get(), bufs_.size());
   }
 
@@ -166,18 +165,11 @@ void SendmmsgPacketBatchWriter::fillIovecAndMessageSizes(
   }
 }
 
-bool useSinglePacketInplaceBatchWriter(
-    uint32_t maxBatchSize,
-    quic::DataPathType dataPathType) {
-  return maxBatchSize == 1 &&
-      dataPathType == quic::DataPathType::ContinuousMemory;
-}
-
 SendmmsgInplacePacketBatchWriter::SendmmsgInplacePacketBatchWriter(
     QuicConnectionStateBase& conn,
     size_t maxBufs)
     : conn_(conn), maxBufs_(maxBufs) {
-  MVCHECK_LT(maxBufs, kMaxIovecs, "maxBufs must be less than " << kMaxIovecs);
+  MVCHECK_LE(maxBufs, kMaxIovecs, "maxBufs must be at most " << kMaxIovecs);
 }
 
 bool SendmmsgInplacePacketBatchWriter::empty() const {
@@ -189,6 +181,9 @@ size_t SendmmsgInplacePacketBatchWriter::size() const {
 }
 
 void SendmmsgInplacePacketBatchWriter::reset() {
+  if (numPacketsBuffered_) {
+    conn_.bufAccessor->clear();
+  }
   currSize_ = 0;
   numPacketsBuffered_ = 0;
 }
@@ -222,9 +217,6 @@ ssize_t SendmmsgInplacePacketBatchWriter::write(
     const quic::SocketAddress& address) {
   MVCHECK_GT(numPacketsBuffered_, 0);
 
-  auto& buf = conn_.bufAccessor->buf();
-  buf->clear();
-
   if (numPacketsBuffered_ == 1) {
     return sock.write(address, &iovecs_[0], 1);
   }
@@ -236,7 +228,7 @@ ssize_t SendmmsgInplacePacketBatchWriter::write(
     messageSizes[i] = 1;
   }
 
-  sock.writem(
+  ret = sock.writem(
       AddressRange(&address, 1),
       &iovecs_[0],
       &messageSizes[0],

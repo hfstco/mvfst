@@ -3,7 +3,6 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-# pyre-unsafe
 
 import os
 import unittest
@@ -13,7 +12,6 @@ from .. import builder as builder_module
 from ..builder import CMakeBuilder
 from ..envfuncs import Env
 from ..manifest import ManifestContext, ManifestParser
-
 
 MINIMAL_MANIFEST = """
 [manifest]
@@ -42,6 +40,7 @@ def make_cmake_builder() -> CMakeBuilder:
                 "os": None,
                 "distro": None,
                 "distro_vers": None,
+                "distro_family": None,
                 "fb": "off",
                 "fbsource": "off",
                 "test": "off",
@@ -119,6 +118,7 @@ class CMakeBuilderCompilerCacheTest(unittest.TestCase):
         # On Windows, force MSVC embedded debug info (/Z7) so sccache can wrap
         # cl.exe without the shared-PDB C1041 race.
         builder = make_cmake_builder()
+        # pyrefly: ignore [missing-attribute]
         builder.build_opts.is_windows.return_value = True
         env = Env()
 
@@ -132,6 +132,7 @@ class CMakeBuilderCompilerCacheTest(unittest.TestCase):
         # On macOS, point OPENSSL_ROOT_DIR at the getdeps OpenSSL so CMake's
         # FindOpenSSL does not fall back to a wrong-arch Homebrew keg.
         builder = make_cmake_builder()
+        # pyrefly: ignore [missing-attribute]
         builder.build_opts.is_darwin.return_value = True
         openssl = MagicMock()
         openssl.name = "openssl"

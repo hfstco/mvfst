@@ -37,6 +37,8 @@ mvfst_cpp_test(
         "//quic/client:state_and_handshake",
         "//quic/common/events:folly_eventbase",
         "//quic/common/udpsocket:folly_async_udp_socket",
+        "//quic/congestion_control:congestion_controller_factory",
+        "//quic/congestion_control:pacer_factory",
         "//quic/fizz/client/handshake:fizz_client_handshake",
         "//quic/handshake:transport_parameters",
     ],
@@ -88,15 +90,18 @@ mvfst_cpp_test(
     srcs = [
         "QuicClientTransportLiteTest.cpp",
     ],
+    supports_static_listing = False,
     deps = [
         "//quic/api/test:api_mocks",
         "//quic/api/test:mocks",
         "//quic/client:client",
+        "//quic/client:state_and_handshake",
         "//quic/client/test:mocks",
         "//quic/common/events:folly_eventbase",
         "//quic/common/events/test:QuicEventBaseMock",
         "//quic/common/test:test_utils",
         "//quic/common/udpsocket/test:QuicAsyncUDPSocketMock",
+        "//quic/handshake:transport_parameters",
     ],
 )
 

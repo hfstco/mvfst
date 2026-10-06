@@ -43,6 +43,22 @@ struct RecvTimeDescComparator {
 } // namespace
 
 namespace quic {
+Optional<uint64_t> getStreamFrameDataLengthSize(uint64_t dataLen) {
+  if (dataLen <= kOneByteLimit - 1) {
+    return 1;
+  }
+  if (dataLen <= kTwoByteLimit - 2) {
+    return 2;
+  }
+  if (dataLen <= kFourByteLimit - 4) {
+    return 4;
+  }
+  if (dataLen <= kEightByteLimit - 8) {
+    return 8;
+  }
+  return std::nullopt;
+}
+
 quic::Expected<Optional<uint64_t>, QuicError> writeStreamFrameHeader(
     PacketBuilderInterface& builder,
     StreamId id,
@@ -106,19 +122,14 @@ quic::Expected<Optional<uint64_t>, QuicError> writeStreamFrameHeader(
   // builder allows us to write.
   dataLen = std::min(dataLen, builder.remainingSpaceInPkt() - headerSize);
   if (!shouldSkipLengthField) {
-    if (dataLen <= kOneByteLimit - 1) {
-      dataLenLen = 1;
-    } else if (dataLen <= kTwoByteLimit - 2) {
-      dataLenLen = 2;
-    } else if (dataLen <= kFourByteLimit - 4) {
-      dataLenLen = 4;
-    } else if (dataLen <= kEightByteLimit - 8) {
-      dataLenLen = 8;
-    } else {
+    const auto lengthFieldSize = getStreamFrameDataLengthSize(dataLen);
+    if (!lengthFieldSize) {
       // This should never really happen as dataLen is bounded by the remaining
       // space in the packet which should be << kEightByteLimit.
-      MVCHECK(false, "Stream frame length too large.");
+      return quic::make_unexpected(QuicError(
+          LocalErrorCode::INTERNAL_ERROR, "Stream frame length too large."));
     }
+    dataLenLen = *lengthFieldSize;
   }
   if (dataLenLen > 0) {
     if (dataLen != 0 &&
@@ -178,9 +189,10 @@ void writeStreamFrameData(
   }
 }
 
-quic::Expected<Optional<WriteCryptoFrame>, QuicError> writeCryptoFrame(
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+quic::Expected<Optional<WriteCryptoFrame>, QuicError> writeCryptoFrameHeader(
     uint64_t offsetIn,
-    const ChainedByteRangeHead& data,
+    uint64_t dataLen,
     PacketBuilderInterface& builder) {
   uint64_t spaceLeftInPkt = builder.remainingSpaceInPkt();
   QuicInteger intFrameType(static_cast<uint64_t>(FrameType::CRYPTO_FRAME));
@@ -205,8 +217,8 @@ quic::Expected<Optional<WriteCryptoFrame>, QuicError> writeCryptoFrame(
     return Optional<WriteCryptoFrame>(std::nullopt);
   }
   size_t spaceRemaining = spaceLeftInPkt - cryptoFrameHeaderSize;
-  size_t dataLength = data.chainLength();
-  size_t writableData = std::min(dataLength, spaceRemaining);
+  size_t writableData = static_cast<size_t>(
+      std::min<uint64_t>(dataLen, static_cast<uint64_t>(spaceRemaining)));
 
   QuicInteger lengthVarInt(writableData);
   auto lengthVarIntSizeRes = lengthVarInt.getSize();
@@ -220,10 +232,23 @@ quic::Expected<Optional<WriteCryptoFrame>, QuicError> writeCryptoFrame(
   builder.write(intFrameType);
   builder.write(offsetInteger);
   builder.write(lengthVarInt);
-  builder.insert(data, writableData);
   builder.appendFrame(WriteCryptoFrame(offsetIn, lengthVarInt.getValue()));
   return Optional<WriteCryptoFrame>(
       WriteCryptoFrame(offsetIn, lengthVarInt.getValue()));
+}
+
+quic::Expected<Optional<WriteCryptoFrame>, QuicError> writeCryptoFrame(
+    uint64_t offsetIn,
+    const ChainedByteRangeHead& data,
+    PacketBuilderInterface& builder) {
+  auto result = writeCryptoFrameHeader(offsetIn, data.chainLength(), builder);
+  if (!result.has_value()) {
+    return quic::make_unexpected(result.error());
+  }
+  if (*result) {
+    builder.insert(data, (*result)->len);
+  }
+  return result;
 }
 
 /*
@@ -1456,6 +1481,20 @@ quic::Expected<size_t, QuicError> writeSimpleFrame(
   folly::assume_unreachable();
 }
 
+quic::Expected<size_t, QuicError> getTimestampFrameEncodedSize(
+    const TimestampFrame& frame) {
+  auto frameTypeSize =
+      QuicInteger(static_cast<uint64_t>(FrameType::TIMESTAMP)).getSize();
+  if (frameTypeSize.hasError()) {
+    return quic::make_unexpected(frameTypeSize.error());
+  }
+  auto timestampSize = QuicInteger(frame.timestamp).getSize();
+  if (timestampSize.hasError()) {
+    return quic::make_unexpected(timestampSize.error());
+  }
+  return frameTypeSize.value() + timestampSize.value();
+}
+
 quic::Expected<size_t, QuicError> writeFrame(
     QuicWriteFrame&& frame,
     PacketBuilderInterface& builder) {
@@ -1765,6 +1804,24 @@ quic::Expected<size_t, QuicError> writeFrame(
         builder.insert(std::move(datagramFrame.data), datagramFrame.length);
         builder.appendFrame(datagramFrame);
         return datagramFrameLength;
+      }
+      return size_t(0);
+    }
+    case QuicWriteFrame::Type::TimestampFrame: {
+      TimestampFrame& timestampFrame = *frame.asTimestampFrame();
+      QuicInteger intFrameType(static_cast<uint64_t>(FrameType::TIMESTAMP));
+      QuicInteger intTimestamp(timestampFrame.timestamp);
+      auto timestampFrameLenResult =
+          getTimestampFrameEncodedSize(timestampFrame);
+      if (timestampFrameLenResult.hasError()) {
+        return quic::make_unexpected(timestampFrameLenResult.error());
+      }
+      const auto timestampFrameLen = timestampFrameLenResult.value();
+      if (packetSpaceCheck(spaceLeft, timestampFrameLen)) {
+        builder.write(intFrameType);
+        builder.write(intTimestamp);
+        builder.appendFrame(std::move(timestampFrame));
+        return timestampFrameLen;
       }
       return size_t(0);
     }

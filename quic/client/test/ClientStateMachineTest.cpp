@@ -16,6 +16,8 @@
 #include <quic/client/test/Mocks.h>
 #include <quic/common/events/FollyQuicEventBase.h>
 #include <quic/common/udpsocket/FollyQuicAsyncUDPSocket.h>
+#include <quic/congestion_control/CongestionControllerFactory.h>
+#include <quic/congestion_control/PacerFactory.h>
 #include <quic/fizz/client/handshake/FizzClientQuicHandshakeContext.h>
 #include <quic/handshake/TransportParameters.h>
 
@@ -146,6 +148,69 @@ TEST_F(ClientStateMachineTest, PreserveHappyeyabllsDuringUndo) {
   EXPECT_NE(nullptr, newConn->happyEyeballsState.secondSocket);
 }
 
+TEST_F(ClientStateMachineTest, PreservePacingStateDuringUndo) {
+  auto randomCid = ConnectionId::createRandom(8);
+  ASSERT_TRUE(randomCid.has_value());
+  client_->clientConnectionId = randomCid.value();
+  client_->transportSettings.pacingEnabled = true;
+  client_->transportSettings.defaultCongestionController =
+      CongestionControlType::BBR2Modular;
+  client_->canBePaced = true;
+  client_->pacer = createPacer(*client_, kMinCwndInMssForBbr);
+  client_->congestionControllerFactory =
+      std::make_shared<DefaultCongestionControllerFactory>();
+  client_->congestionController =
+      client_->congestionControllerFactory->makeCongestionController(
+          *client_, CongestionControlType::BBR2Modular);
+  const auto* originalPacer = client_->pacer.get();
+
+  auto newConn = undoAllClientStateForRetry(std::move(client_));
+
+  ASSERT_NE(nullptr, newConn->pacer);
+  EXPECT_NE(originalPacer, newConn->pacer.get());
+  EXPECT_TRUE(newConn->canBePaced);
+  ASSERT_NE(nullptr, newConn->congestionController);
+  EXPECT_EQ(
+      CongestionControlType::BBR2Modular,
+      newConn->congestionController->type());
+}
+
+TEST_F(ClientStateMachineTest, PreserveSconeReceiveStateDuringUndo) {
+  auto randomCid = ConnectionId::createRandom(8);
+  ASSERT_TRUE(randomCid.has_value());
+  client_->clientConnectionId = randomCid.value();
+  client_->transportSettings.advertiseSconeSupport = true;
+  client_->scone.emplace();
+  client_->scone->configuredRateSignal = 42;
+
+  auto newConn = undoAllClientStateForRetry(std::move(client_));
+
+  ASSERT_TRUE(newConn->scone.has_value());
+  EXPECT_EQ(newConn->scone->configuredRateSignal, kSconeNoAdvice);
+}
+
+TEST_F(ClientStateMachineTest, PreserveSconeSendStateDuringUndo) {
+  auto randomCid = ConnectionId::createRandom(8);
+  ASSERT_TRUE(randomCid.has_value());
+  client_->clientConnectionId = randomCid.value();
+  client_->transportSettings.enableSconeSend = true;
+  client_->scone.emplace();
+
+  auto newConn = undoAllClientStateForRetry(std::move(client_));
+
+  EXPECT_TRUE(newConn->scone.has_value());
+}
+
+TEST_F(ClientStateMachineTest, KeepSconeDisabledDuringUndo) {
+  auto randomCid = ConnectionId::createRandom(8);
+  ASSERT_TRUE(randomCid.has_value());
+  client_->clientConnectionId = randomCid.value();
+
+  auto newConn = undoAllClientStateForRetry(std::move(client_));
+
+  EXPECT_FALSE(newConn->scone.has_value());
+}
+
 TEST_F(ClientStateMachineTest, PreserveObserverContainer) {
   auto socket = std::make_shared<MockQuicSocket>();
   const auto observerContainer =
@@ -234,6 +299,36 @@ TEST_F(ClientStateMachineTest, TestProcessMaxDatagramSizeOk) {
   EXPECT_EQ(
       clientConn.datagramState.maxWriteFrameSize,
       kMaxDatagramPacketOverhead + 1);
+}
+
+TEST_F(ClientStateMachineTest, TestProcessMaxAckDelayBoundary) {
+  QuicClientConnectionState clientConn(
+      FizzClientQuicHandshakeContext::Builder().build());
+  auto encoded = encodeIntegerParameter(
+      TransportParameterId::max_ack_delay, kMaxAckDelay - 1);
+  ASSERT_FALSE(encoded.hasError());
+  ServerTransportParameters serverTransportParams = {
+      {std::move(encoded.value())}};
+
+  ASSERT_FALSE(processServerInitialParams(clientConn, serverTransportParams, 0)
+                   .hasError());
+  EXPECT_EQ(
+      std::chrono::milliseconds(kMaxAckDelay - 1), clientConn.peerMaxAckDelay);
+}
+
+TEST_F(ClientStateMachineTest, TestProcessMaxAckDelayRejectsProtocolLimit) {
+  QuicClientConnectionState clientConn(
+      FizzClientQuicHandshakeContext::Builder().build());
+  auto encoded =
+      encodeIntegerParameter(TransportParameterId::max_ack_delay, kMaxAckDelay);
+  ASSERT_FALSE(encoded.hasError());
+  ServerTransportParameters serverTransportParams = {
+      {std::move(encoded.value())}};
+
+  auto result =
+      processServerInitialParams(clientConn, serverTransportParams, 0);
+  ASSERT_TRUE(result.hasError());
+  EXPECT_EQ(TransportErrorCode::TRANSPORT_PARAMETER_ERROR, result.error().code);
 }
 
 TEST_F(ClientStateMachineTest, TestProcessKnobFramesSupportedParamEnabled) {

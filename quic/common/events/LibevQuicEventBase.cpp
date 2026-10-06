@@ -34,16 +34,15 @@ void libEvPrepareCallback(
 } // namespace
 
 namespace quic {
-LibevQuicEventBase::LibevQuicEventBase(std::unique_ptr<EvLoopWeak> loop)
-    : ev_loop_(loop->get()), loopWeak_(std::move(loop)) {
+LibevQuicEventBase::LibevQuicEventBase(std::unique_ptr<EvLoopHolder> loop)
+    : ev_loop_(loop->get()), loopHolder_(std::move(loop)) {
   ev_prepare_init(&prepareWatcher_, libEvPrepareCallback);
   prepareWatcher_.data = this;
-  ev_prepare_start(ev_loop_, &prepareWatcher_);
 }
 
 LibevQuicEventBase::~LibevQuicEventBase() {
   // If the loop has been destroyed, skip the ev loop operations.
-  if (loopWeak_->get()) {
+  if (loopHolder_->get()) {
     ev_prepare_stop(ev_loop_, &prepareWatcher_);
   }
 
@@ -69,6 +68,7 @@ void LibevQuicEventBase::runInLoop(
     QuicEventBaseLoopCallback* callback,
     bool thisIteration) {
   MVCHECK(isInEventBaseThread());
+  ensurePrepareWatcherStarted();
   auto wrapper = static_cast<LoopCallbackWrapper*>(getImplHandle(callback));
   if (!wrapper) {
     wrapper = new LoopCallbackWrapper(callback);
@@ -152,15 +152,24 @@ void LibevQuicEventBase::checkCallbacks() {
 
 void LibevQuicEventBase::setLoopCallbackPriority(int priority) {
   MVCHECK(isInEventBaseThread());
-  // prepareWatcher_ is started in the ctor, so it must be stopped before its
-  // priority can be changed and restarted afterwards for the change to apply.
-  ev_prepare_stop(ev_loop_, &prepareWatcher_);
+  const bool wasActive = ev_is_active(&prepareWatcher_) != 0;
+  if (wasActive) {
+    ev_prepare_stop(ev_loop_, &prepareWatcher_);
+  }
   ev_set_priority(&prepareWatcher_, priority);
-  ev_prepare_start(ev_loop_, &prepareWatcher_);
+  if (wasActive) {
+    ev_prepare_start(ev_loop_, &prepareWatcher_);
+  }
+}
+
+void LibevQuicEventBase::ensurePrepareWatcherStarted() {
+  if (!ev_is_active(&prepareWatcher_)) {
+    ev_prepare_start(ev_loop_, &prepareWatcher_);
+  }
 }
 
 bool LibevQuicEventBase::isInEventBaseThread() const {
-  auto eventLoopThread = loopWeak_->getEventLoopThread();
+  auto eventLoopThread = loopHolder_->getEventLoopThread();
   MVCHECK(eventLoopThread != std::nullopt);
   return pthread_self() == eventLoopThread;
 }

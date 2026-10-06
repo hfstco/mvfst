@@ -11,7 +11,6 @@
 #include <quic/congestion_control/ServerCongestionControllerFactory.h>
 #include <quic/fizz/server/handshake/FizzServerQuicHandshakeContext.h>
 #include <quic/logging/oops_logger/OopsLogger.h>
-#include <quic/priority/HTTPPriorityQueue.h>
 #include <quic/server/QuicServerTransport.h>
 #include <quic/server/handshake/AppToken.h>
 #include <quic/server/handshake/DefaultAppTokenValidator.h>
@@ -22,8 +21,6 @@
 #include <quic/common/TransportKnobs.h>
 #include <chrono>
 #include <memory>
-
-#include <folly/TokenBucket.h>
 
 namespace quic {
 
@@ -455,6 +452,11 @@ void QuicServerTransport::unbindConnection() {
   if (routingCb_) {
     auto routingCb = routingCb_;
     routingCb_ = nullptr;
+    // Drain CIDs removed from selfConnectionIds but still in the routing map.
+    for (const auto& connId : *conn_->connIdsRetiringSoon) {
+      routingCb->onConnectionIdRetired(*this, connId);
+    }
+    conn_->connIdsRetiringSoon->clear();
     PROTO_OOPS_LOG_BUILDER_IF(
         !conn_->clientChosenDestConnectionId,
         conn_->oopsLogger,
@@ -1133,49 +1135,6 @@ void QuicServerTransport::registerAllTransportKnobParamHandlers() {
         return {};
       });
   registerTransportKnobParamHandler(
-      static_cast<uint64_t>(TransportKnobParamId::CC_EXPERIMENTAL),
-      [](QuicServerTransport& serverTransport,
-         TransportKnobParam::Val val) -> quic::Expected<void, QuicError> {
-        auto server_conn = serverTransport.serverConn_;
-        if (server_conn->congestionController) {
-          auto enableExperimental = static_cast<bool>(std::get<uint64_t>(val));
-          server_conn->congestionController->setExperimental(
-              enableExperimental);
-          MVVLOG(3) << fmt::format(
-              "CC_EXPERIMENTAL KnobParam received, setting experimental={} "
-              "settings for congestion controller. Current congestion controller={}",
-              enableExperimental,
-              congestionControlTypeToString(
-                  server_conn->congestionController->type()));
-        }
-        return {};
-      });
-
-  registerTransportKnobParamHandler(
-      static_cast<uint64_t>(TransportKnobParamId::SHORT_HEADER_PADDING_KNOB),
-      [](QuicServerTransport& serverTransport,
-         TransportKnobParam::Val value) -> quic::Expected<void, QuicError> {
-        auto val = std::get<uint64_t>(value);
-        serverTransport.serverConn_->transportSettings.paddingModulo = val;
-        MVVLOG(3) << fmt::format(
-            "SHORT_HEADER_PADDING_KNOB KnobParam received, setting paddingModulo={}",
-            val);
-        return {};
-      });
-  registerTransportKnobParamHandler(
-      static_cast<uint64_t>(
-          TransportKnobParamId::FIXED_SHORT_HEADER_PADDING_KNOB),
-      [](QuicServerTransport& serverTransport,
-         TransportKnobParam::Val value) -> quic::Expected<void, QuicError> {
-        auto val = std::get<uint64_t>(value);
-        serverTransport.serverConn_->transportSettings.fixedShortHeaderPadding =
-            val;
-        MVVLOG(3) << fmt::format(
-            "FIXED_SHORT_HEADER_PADDING_KNOB KnobParam received, setting fixedShortHeaderPadding={}",
-            val);
-        return {};
-      });
-  registerTransportKnobParamHandler(
       static_cast<uint64_t>(TransportKnobParamId::KEEPALIVE_ENABLED),
       [](QuicServerTransport& serverTransport,
          TransportKnobParam::Val value) -> quic::Expected<void, QuicError> {
@@ -1190,62 +1149,6 @@ void QuicServerTransport::registerAllTransportKnobParamHandlers() {
         return {};
       });
   registerTransportKnobParamHandler(
-      static_cast<uint64_t>(TransportKnobParamId::ACK_FREQUENCY_POLICY),
-      [](QuicServerTransport& serverTransport,
-         TransportKnobParam::Val value) -> quic::Expected<void, QuicError> {
-        const std::string* valPtr = std::get_if<std::string>(&value);
-        if (!valPtr) {
-          auto errMsg =
-              "Received invalid type for ACK_FREQUENCY_POLICY KnobParam: expected string";
-          MVVLOG(3) << errMsg;
-          return quic::make_unexpected(
-              QuicError(TransportErrorCode::INTERNAL_ERROR, errMsg));
-        }
-
-        const std::string& val = *valPtr;
-        CongestionControlConfig::AckFrequencyConfig ackFrequencyConfig;
-        bool parseSuccess = false;
-        try {
-          parseSuccess = folly::split(
-              ',',
-              val,
-              ackFrequencyConfig.ackElicitingThreshold,
-              ackFrequencyConfig.reorderingThreshold,
-              ackFrequencyConfig.minRttDivisor,
-              ackFrequencyConfig.useSmallThresholdDuringStartup);
-          // Sanity check the values.
-          parseSuccess = parseSuccess &&
-              ackFrequencyConfig.ackElicitingThreshold > 1 &&
-              ackFrequencyConfig.reorderingThreshold > 1 &&
-              ackFrequencyConfig.minRttDivisor > 0;
-        } catch (std::exception&) {
-          parseSuccess = false;
-        }
-        if (parseSuccess) {
-          MVVLOG(3) << fmt::format(
-              "ACK_FREQUENCY_POLICY KnobParam received, "
-              "ackElicitingThreshold={}, "
-              "reorderingThreshold={}, "
-              "minRttDivisor={}, "
-              "useSmallThresholdDuringStartup={}, "
-              "raw knob={}",
-              ackFrequencyConfig.ackElicitingThreshold,
-              ackFrequencyConfig.reorderingThreshold,
-              ackFrequencyConfig.minRttDivisor,
-              ackFrequencyConfig.useSmallThresholdDuringStartup,
-              val);
-          serverTransport.conn_->transportSettings.ccaConfig
-              .ackFrequencyConfig = ackFrequencyConfig;
-        } else {
-          auto errMsg = fmt::format(
-              "Received invalid KnobParam for ACK_FREQUENCY_POLICY: {}", val);
-          MVVLOG(3) << errMsg;
-          return quic::make_unexpected(
-              QuicError(TransportErrorCode::INTERNAL_ERROR, std::move(errMsg)));
-        }
-        return {};
-      });
-  registerTransportKnobParamHandler(
       static_cast<uint64_t>(TransportKnobParamId::PACING_TIMER_TICK),
       [](QuicServerTransport& serverTransport,
          TransportKnobParam::Val value) -> quic::Expected<void, QuicError> {
@@ -1254,33 +1157,6 @@ void QuicServerTransport::registerAllTransportKnobParamHandlers() {
         serverConn->transportSettings.pacingTickInterval =
             std::chrono::microseconds(val);
         MVVLOG(3) << "PACING_TIMER_TICK KnobParam received: " << val;
-        return {};
-      });
-  registerTransportKnobParamHandler(
-      static_cast<uint64_t>(TransportKnobParamId::DEFAULT_STREAM_PRIORITY),
-      [](QuicServerTransport& serverTransport,
-         TransportKnobParam::Val value) -> quic::Expected<void, QuicError> {
-        auto val = std::get<std::string>(value);
-        auto serverConn = serverTransport.serverConn_;
-        uint8_t level;
-        bool incremental;
-        bool parseSuccess = false;
-        try {
-          parseSuccess = folly::split(',', val, level, incremental);
-        } catch (std::exception&) {
-          parseSuccess = false;
-        }
-        if (!parseSuccess || level > 7) {
-          auto errMsg = fmt::format(
-              "Received invalid KnobParam for DEFAULT_STREAM_PRIORITY: {}",
-              val);
-          MVVLOG(3) << errMsg;
-          return quic::make_unexpected(
-              QuicError(TransportErrorCode::INTERNAL_ERROR, std::move(errMsg)));
-        }
-        serverConn->transportSettings.defaultPriority =
-            HTTPPriorityQueue::Priority(level, incremental);
-        MVVLOG(3) << "DEFAULT_STREAM_PRIORITY KnobParam received: " << val;
         return {};
       });
   registerTransportKnobParamHandler(
@@ -1423,70 +1299,23 @@ void QuicServerTransport::registerAllTransportKnobParamHandlers() {
         return {};
       });
   registerTransportKnobParamHandler(
-      static_cast<uint64_t>(TransportKnobParamId::EGRESS_POLICER_CONFIG),
+      static_cast<uint64_t>(
+          TransportKnobParamId::ADAPTIVE_LOSS_REORDERING_THRESHOLDS),
       [](QuicServerTransport& serverTransport,
          TransportKnobParam::Val value) -> quic::Expected<void, QuicError> {
-        const std::string* valPtr = std::get_if<std::string>(&value);
-        if (!valPtr) {
-          auto errMsg =
-              "Received invalid type for EGRESS_POLICER_CONFIG KnobParam: expected string";
-          MVVLOG(3) << errMsg;
-          return quic::make_unexpected(
-              QuicError(TransportErrorCode::INTERNAL_ERROR, errMsg));
+        const auto* val = std::get_if<uint64_t>(&value);
+        if (!val || *val > 1) {
+          return quic::make_unexpected(QuicError(
+              TransportErrorCode::INTERNAL_ERROR,
+              "ADAPTIVE_LOSS_REORDERING_THRESHOLDS KnobParam expects 0 or 1"));
         }
-
         auto serverConn = serverTransport.serverConn_;
-        uint64_t rateBytesPerSec = 0;
-        uint32_t burstMs = 0;
-        uint32_t delayMs = 0;
-        bool parseSuccess = false;
-        try {
-          parseSuccess =
-              folly::split(',', *valPtr, rateBytesPerSec, burstMs, delayMs);
-        } catch (const std::exception&) {
-          parseSuccess = false;
-        }
-
-        if (!parseSuccess) {
-          auto errMsg = fmt::format(
-              "Received invalid KnobParam for EGRESS_POLICER_CONFIG: {}",
-              *valPtr);
-          MVVLOG(3) << errMsg;
-          return quic::make_unexpected(
-              QuicError(TransportErrorCode::INTERNAL_ERROR, std::move(errMsg)));
-        }
-
-        serverConn->transportSettings.egressPolicerConfig.rateBytesPerSec =
-            rateBytesPerSec;
-        serverConn->transportSettings.egressPolicerConfig.burstMs = burstMs;
-        serverConn->transportSettings.egressPolicerConfig.delayMs = delayMs;
-
-        if (rateBytesPerSec > 0) {
-          serverConn->transportSettings.egressPolicerConfig.enabled = true;
-          double burstBytes =
-              static_cast<double>(rateBytesPerSec) * burstMs / 1000.0;
-          if (burstBytes < kDefaultMaxUDPPayload) {
-            burstBytes = kDefaultMaxUDPPayload;
-          }
-          serverConn->egressPolicer = std::make_unique<folly::TokenBucket>(
-              static_cast<double>(rateBytesPerSec), burstBytes);
-          serverConn->egressPolicerActivationTime =
-              Clock::now() + std::chrono::milliseconds(delayMs);
-        } else {
-          serverConn->transportSettings.egressPolicerConfig.enabled = false;
-          serverConn->egressPolicer.reset();
-          serverConn->egressPolicerActivationTime.reset();
-        }
-        MVVLOG(3) << fmt::format(
-            "EGRESS_POLICER_CONFIG KnobParam received, "
-            "rateBytesPerSec={}, burstMs={}, delayMs={}, raw knob={}",
-            rateBytesPerSec,
-            burstMs,
-            delayMs,
-            *valPtr);
+        serverConn->transportSettings.useAdaptiveLossReorderingThresholds =
+            *val == 1;
+        MVVLOG(3) << "ADAPTIVE_LOSS_REORDERING_THRESHOLDS KnobParam received: "
+                  << *val;
         return {};
       });
-
   registerTransportKnobParamHandler(
       static_cast<uint64_t>(TransportKnobParamId::SCONE_KNOB),
       [](QuicServerTransport& serverTransport,

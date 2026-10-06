@@ -126,6 +126,9 @@ void QuicServerWorker::bind(
   if (transportSettings_.readEcnOnIngress) {
     socket_->setRecvTos(true);
   }
+  if (transportSettings_.readTtlOnIngress) {
+    socket_->setRecvTtl(true);
+  }
   socket_->bind(address, bindOptions);
   if (socketOptions_) {
     (void)applySocketOptions(
@@ -419,6 +422,11 @@ void QuicServerWorker::onDataAvailable(
         QuicAsyncUDPSocket::convertToSocketTimestampExt(*params.ts);
   }
 
+  OptionalIntegral<uint8_t> packetTtl;
+  if (params.ttl.has_value()) {
+    packetTtl = *params.ttl;
+  }
+
   if (params.gro <= 0) {
     if (truncated) {
       // This is an error, drop the packet.
@@ -431,6 +439,7 @@ void QuicServerWorker::onDataAvailable(
     udpPacket.timings.receiveTimePoint = packetReceiveTime;
     udpPacket.timings.maybeSoftwareTs = maybeSockTsExt;
     udpPacket.tosValue = params.tos;
+    udpPacket.ttlValue = packetTtl;
     udpPacket.peerAddress = client;
     handleNetworkData(udpPacket);
   } else {
@@ -456,6 +465,7 @@ void QuicServerWorker::onDataAvailable(
         ReceivedUdpPacket udpPacket(std::move(data));
         udpPacket.timings.receiveTimePoint = packetReceiveTime;
         udpPacket.tosValue = params.tos;
+        udpPacket.ttlValue = packetTtl;
         udpPacket.timings.maybeSoftwareTs = maybeSockTsExt;
         udpPacket.peerAddress = client;
         handleNetworkData(udpPacket);
@@ -473,6 +483,7 @@ void QuicServerWorker::onDataAvailable(
       ReceivedUdpPacket udpPacket(std::move(tmp));
       udpPacket.timings.receiveTimePoint = packetReceiveTime;
       udpPacket.tosValue = params.tos;
+      udpPacket.ttlValue = packetTtl;
       udpPacket.timings.maybeSoftwareTs = maybeSockTsExt;
       udpPacket.peerAddress = client;
       handleNetworkData(udpPacket);

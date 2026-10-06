@@ -8,7 +8,10 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <string_view>
+#include <utility>
 
 #include <quic/api/test/Mocks.h>
 #include <quic/api/test/QuicTypedTransportTestUtil.h>
@@ -45,14 +48,36 @@ class TransportTypeNames {
 };
 
 bool hasStreamFrame(const quic::RegularQuicWritePacket::Vec& frames) {
-  return std::any_of(frames.begin(), frames.end(), [](const auto& frame) {
+  return std::ranges::any_of(frames, [](const auto& frame) {
     return frame.type() == quic::QuicWriteFrame::Type::WriteStreamFrame;
   });
 }
 
+bool hasRstStreamFrame(const quic::RegularQuicWritePacket::Vec& frames) {
+  return std::ranges::any_of(frames, [](const auto& frame) {
+    return frame.type() == quic::QuicWriteFrame::Type::RstStreamFrame;
+  });
+}
+
 bool hasDatagramFrame(const quic::RegularQuicWritePacket::Vec& frames) {
-  return std::any_of(frames.begin(), frames.end(), [](const auto& frame) {
+  return std::ranges::any_of(frames, [](const auto& frame) {
     return frame.type() == quic::QuicWriteFrame::Type::DatagramFrame;
+  });
+}
+
+const quic::TimestampFrame* findTimestampFrame(
+    const quic::RegularQuicWritePacket::Vec& frames) {
+  for (const auto& frame : frames) {
+    if (const auto* timestampFrame = frame.asTimestampFrame()) {
+      return timestampFrame;
+    }
+  }
+  return nullptr;
+}
+
+size_t countTimestampFrames(const quic::RegularQuicWritePacket::Vec& frames) {
+  return std::ranges::count_if(frames, [](const auto& frame) {
+    return frame.asTimestampFrame() != nullptr;
   });
 }
 
@@ -68,6 +93,10 @@ using DatagramTransportTypes = testing::Types<
     DatagramTransportConfig<quic::test::QuicClientTransportTestBase, false>,
     DatagramTransportConfig<quic::test::QuicClientTransportTestBase, true>,
     DatagramTransportConfig<quic::test::QuicServerTransportTestBase, false>,
+    DatagramTransportConfig<quic::test::QuicServerTransportTestBase, true>>;
+
+using DatagramWithStreamsTransportTypes = testing::Types<
+    DatagramTransportConfig<quic::test::QuicClientTransportTestBase, true>,
     DatagramTransportConfig<quic::test::QuicServerTransportTestBase, true>>;
 
 class DatagramTransportTypeNames {
@@ -123,6 +152,56 @@ TYPED_TEST(QuicTypedTransportTest, TransportInfoConnectionTime) {
   this->destroyTransport();
 }
 
+TYPED_TEST(QuicTypedTransportTest, UnifiedSendBufferRetransmitsDeclaredLoss) {
+  TestFixture::startTransport();
+  auto& conn = this->getNonConstConn();
+  conn.outstandings.reset();
+  conn.transportSettings.useUnifiedAppStreamSendBuffer = true;
+
+  const auto streamId =
+      this->getTransport()->createBidirectionalStream().value();
+  auto* stream = conn.streamManager->findStream(streamId);
+  ASSERT_NE(stream, nullptr);
+  ASSERT_TRUE(stream->usesUnifiedSendBuffer());
+
+  constexpr std::string_view kData = "unified retransmission";
+  ASSERT_FALSE(this->getTransport()
+                   ->writeChain(streamId, IOBuf::copyBuffer(kData), false)
+                   .hasError());
+  ASSERT_TRUE(this->loopForWrites().has_value());
+
+  auto originalPacketIt =
+      getLastOutstandingPacket(conn, PacketNumberSpace::AppData);
+  ASSERT_NE(originalPacketIt, conn.outstandings.packets.rend());
+  ASSERT_TRUE(hasStreamFrame(originalPacketIt->packet.frames));
+  const auto originalPacketNum =
+      originalPacketIt->packet.header.getPacketSequenceNum();
+  const auto originalPathId = originalPacketIt->metadata.pathId;
+  const auto retransmittedBefore = conn.lossState.totalBytesRetransmitted;
+
+  EXPECT_CALL(*this->quicStats_, onPacketRetransmission()).Times(1);
+  auto lossResult =
+      markPacketLoss(conn, originalPathId, originalPacketIt->packet, false);
+  ASSERT_FALSE(lossResult.hasError());
+  ASSERT_TRUE(stream->streamSendBuffer->hasPendingLoss());
+
+  this->getTestTransport()->writeLooper()->run(true);
+  ASSERT_TRUE(this->loopForWrites().has_value());
+
+  const auto* retransmission = this->getNewestAppDataOutstandingPacket();
+  ASSERT_NE(retransmission, nullptr);
+  EXPECT_NE(
+      retransmission->packet.header.getPacketSequenceNum(), originalPacketNum);
+  EXPECT_TRUE(hasStreamFrame(retransmission->packet.frames));
+  EXPECT_FALSE(retransmission->maybeClonedPacketIdentifier.has_value());
+  EXPECT_FALSE(stream->streamSendBuffer->hasPendingLoss());
+  EXPECT_EQ(
+      conn.lossState.totalBytesRetransmitted - retransmittedBefore,
+      kData.size());
+
+  this->destroyTransport();
+}
+
 template <typename T>
 class QuicTypedTransportAfterStartTest : public QuicTypedTransportTest<T> {
  public:
@@ -131,6 +210,359 @@ class QuicTypedTransportAfterStartTest : public QuicTypedTransportTest<T> {
   void SetUp() override {
     QuicTypedTransportTest<T>::SetUp();
     QuicTypedTransportTestBase<T>::startTransport();
+  }
+};
+
+struct TimestampRetransmissionPolicy {
+  TimestampFrameWriteMode mode;
+  TimestampFramePacketSelection packetSelection;
+  bool peerCanReceive;
+  bool ackReceiveTimestamps;
+  bool suppressForAckReceiveTimestamps;
+  bool expectTimestamp;
+};
+
+struct TimestampRetransmissionCase {
+  const char* name;
+  bool clonePacket;
+  bool writeStreamData;
+  TimestampRetransmissionPolicy original;
+  TimestampRetransmissionPolicy retry;
+};
+
+constexpr auto kAllEligible = TimestampFramePacketSelection::AllEligiblePackets;
+constexpr auto kAckEliciting =
+    TimestampFramePacketSelection::AckElicitingPackets;
+constexpr auto kStream = TimestampFramePacketSelection::StreamPackets;
+constexpr auto kEnabled = TimestampFrameWriteMode::Prioritized;
+constexpr auto kDisabled = TimestampFrameWriteMode::Disabled;
+
+constexpr TimestampRetransmissionPolicy kAllEligibleEnabled{
+    .mode = kEnabled,
+    .packetSelection = kAllEligible,
+    .peerCanReceive = true,
+    .ackReceiveTimestamps = false,
+    .suppressForAckReceiveTimestamps = false,
+    .expectTimestamp = true};
+constexpr TimestampRetransmissionPolicy kAllEligibleDisabled{
+    .mode = kDisabled,
+    .packetSelection = kAllEligible,
+    .peerCanReceive = true,
+    .ackReceiveTimestamps = false,
+    .suppressForAckReceiveTimestamps = false,
+    .expectTimestamp = false};
+constexpr TimestampRetransmissionPolicy kAllEligiblePeerUnsupported{
+    .mode = kEnabled,
+    .packetSelection = kAllEligible,
+    .peerCanReceive = false,
+    .ackReceiveTimestamps = false,
+    .suppressForAckReceiveTimestamps = false,
+    .expectTimestamp = false};
+constexpr TimestampRetransmissionPolicy kAllEligibleAckAllowed{
+    .mode = kEnabled,
+    .packetSelection = kAllEligible,
+    .peerCanReceive = true,
+    .ackReceiveTimestamps = true,
+    .suppressForAckReceiveTimestamps = false,
+    .expectTimestamp = true};
+constexpr TimestampRetransmissionPolicy kAllEligibleAckSuppressed{
+    .mode = kEnabled,
+    .packetSelection = kAllEligible,
+    .peerCanReceive = true,
+    .ackReceiveTimestamps = true,
+    .suppressForAckReceiveTimestamps = true,
+    .expectTimestamp = false};
+constexpr TimestampRetransmissionPolicy kStreamIncluded{
+    .mode = kEnabled,
+    .packetSelection = kStream,
+    .peerCanReceive = true,
+    .ackReceiveTimestamps = false,
+    .suppressForAckReceiveTimestamps = false,
+    .expectTimestamp = true};
+constexpr TimestampRetransmissionPolicy kStreamExcluded{
+    .mode = kEnabled,
+    .packetSelection = kStream,
+    .peerCanReceive = true,
+    .ackReceiveTimestamps = false,
+    .suppressForAckReceiveTimestamps = false,
+    .expectTimestamp = false};
+constexpr TimestampRetransmissionPolicy kAckElicitingIncluded{
+    .mode = kEnabled,
+    .packetSelection = kAckEliciting,
+    .peerCanReceive = true,
+    .ackReceiveTimestamps = false,
+    .suppressForAckReceiveTimestamps = false,
+    .expectTimestamp = true};
+
+constexpr std::array kTimestampRetransmissionCases{
+    TimestampRetransmissionCase{
+        .name = "CloneEnabledToEnabled",
+        .clonePacket = true,
+        .writeStreamData = true,
+        .original = kAllEligibleEnabled,
+        .retry = kAllEligibleEnabled},
+    TimestampRetransmissionCase{
+        .name = "LossEnabledToEnabled",
+        .clonePacket = false,
+        .writeStreamData = true,
+        .original = kAllEligibleEnabled,
+        .retry = kAllEligibleEnabled},
+    TimestampRetransmissionCase{
+        .name = "CloneEnabledToDisabled",
+        .clonePacket = true,
+        .writeStreamData = true,
+        .original = kAllEligibleEnabled,
+        .retry = kAllEligibleDisabled},
+    TimestampRetransmissionCase{
+        .name = "LossEnabledToDisabled",
+        .clonePacket = false,
+        .writeStreamData = true,
+        .original = kAllEligibleEnabled,
+        .retry = kAllEligibleDisabled},
+    TimestampRetransmissionCase{
+        .name = "CloneEnabledToPeerUnsupported",
+        .clonePacket = true,
+        .writeStreamData = true,
+        .original = kAllEligibleEnabled,
+        .retry = kAllEligiblePeerUnsupported},
+    TimestampRetransmissionCase{
+        .name = "LossEnabledToPeerUnsupported",
+        .clonePacket = false,
+        .writeStreamData = true,
+        .original = kAllEligibleEnabled,
+        .retry = kAllEligiblePeerUnsupported},
+    TimestampRetransmissionCase{
+        .name = "CloneDisabledToEnabled",
+        .clonePacket = true,
+        .writeStreamData = true,
+        .original = kAllEligibleDisabled,
+        .retry = kAllEligibleEnabled},
+    TimestampRetransmissionCase{
+        .name = "LossDisabledToEnabled",
+        .clonePacket = false,
+        .writeStreamData = true,
+        .original = kAllEligibleDisabled,
+        .retry = kAllEligibleEnabled},
+    TimestampRetransmissionCase{
+        .name = "CloneAckAllowedToSuppressed",
+        .clonePacket = true,
+        .writeStreamData = true,
+        .original = kAllEligibleAckAllowed,
+        .retry = kAllEligibleAckSuppressed},
+    TimestampRetransmissionCase{
+        .name = "LossAckAllowedToSuppressed",
+        .clonePacket = false,
+        .writeStreamData = true,
+        .original = kAllEligibleAckAllowed,
+        .retry = kAllEligibleAckSuppressed},
+    TimestampRetransmissionCase{
+        .name = "CloneAckSuppressedToAllowed",
+        .clonePacket = true,
+        .writeStreamData = true,
+        .original = kAllEligibleAckSuppressed,
+        .retry = kAllEligibleAckAllowed},
+    TimestampRetransmissionCase{
+        .name = "LossAckSuppressedToAllowed",
+        .clonePacket = false,
+        .writeStreamData = true,
+        .original = kAllEligibleAckSuppressed,
+        .retry = kAllEligibleAckAllowed},
+    TimestampRetransmissionCase{
+        .name = "CloneStreamSelectionIncludesStream",
+        .clonePacket = true,
+        .writeStreamData = true,
+        .original = kStreamIncluded,
+        .retry = kStreamIncluded},
+    TimestampRetransmissionCase{
+        .name = "LossStreamSelectionIncludesStream",
+        .clonePacket = false,
+        .writeStreamData = true,
+        .original = kStreamIncluded,
+        .retry = kStreamIncluded},
+    TimestampRetransmissionCase{
+        .name = "CloneStreamSelectionExcludesReset",
+        .clonePacket = true,
+        .writeStreamData = false,
+        .original = kAllEligibleEnabled,
+        .retry = kStreamExcluded},
+    TimestampRetransmissionCase{
+        .name = "LossAckElicitingSelectionIncludesReset",
+        .clonePacket = false,
+        .writeStreamData = false,
+        .original = kStreamExcluded,
+        .retry = kAckElicitingIncluded},
+};
+
+template <typename Transport, size_t CaseIndex>
+struct TimestampRetransmissionConfig {
+  using TransportType = Transport;
+  static constexpr size_t caseIndex = CaseIndex;
+};
+
+template <typename T>
+class TimestampRetransmissionTypedTest
+    : public QuicTypedTransportTest<typename T::TransportType> {
+ public:
+  using TransportType = typename T::TransportType;
+
+  void SetUp() override {
+    QuicTypedTransportTest<TransportType>::SetUp();
+    QuicTypedTransportTestBase<TransportType>::startTransport();
+  }
+
+  void runCase(const TimestampRetransmissionCase& testCase) {
+    auto& conn = this->getNonConstConn();
+    conn.outstandings.reset();
+    conn.transportSettings.timestampFrameTimestampExponent = 3;
+    conn.connectionTime = Clock::now() - 1s;
+
+    auto applyPolicy = [&](const TimestampRetransmissionPolicy& policy) {
+      conn.transportSettings.oneRttTimestampFrameWriteMode = policy.mode;
+      conn.transportSettings.oneRttTimestampFramePacketSelection =
+          policy.packetSelection;
+      conn.transportSettings
+          .suppressOneRttTimestampFrameWhenAckReceiveTimestampsWritten =
+          policy.suppressForAckReceiveTimestamps;
+      conn.peerTimestampFrameState.canReceive = policy.peerCanReceive;
+    };
+    auto scheduleTimestampedAck = [&] {
+      auto& ackState = getAckState(conn, PacketNumberSpace::AppData);
+      ackState.acks.insert(10);
+      WriteAckFrameState::ReceivedPacket receivedPacket;
+      receivedPacket.pktNum = 10;
+      receivedPacket.timings.receiveTimePoint = Clock::now();
+      const auto receiveTime = receivedPacket.timings.receiveTimePoint;
+      ackState.recvdPacketInfos.emplace_back(std::move(receivedPacket));
+      ackState.largestRecvdPacketNum = 10;
+      ackState.largestRecvdPacketTime = receiveTime;
+      ackState.needsToSendAckImmediately = true;
+      conn.transportSettings.maybeAckReceiveTimestampsConfigSentToPeer =
+          AckReceiveTimestampsConfig();
+      conn.maybePeerReceiveTimestampsConfig = PeerReceiveTimestampsConfig{
+          .version = AckReceiveTimestampsVersion::LegacyMvfst,
+          .maxReceiveTimestampsPerAck = kMaxReceivedPktsTimestampsStored,
+          .exponent = 0};
+      conn.negotiatedAckReceiveTimestampSupport = true;
+    };
+
+    applyPolicy(testCase.original);
+    if (testCase.original.ackReceiveTimestamps) {
+      scheduleTimestampedAck();
+    }
+
+    const auto streamId =
+        this->getTransport()->createBidirectionalStream().value();
+    if (testCase.writeStreamData) {
+      ASSERT_FALSE(
+          this->getTransport()
+              ->writeChain(streamId, IOBuf::copyBuffer("timestamp"), false)
+              .hasError());
+    } else {
+      ASSERT_FALSE(
+          this->getTransport()
+              ->resetStream(streamId, GenericApplicationErrorCode::UNKNOWN)
+              .hasError());
+    }
+    ASSERT_TRUE(this->loopForWrites().has_value());
+
+    const auto* originalPacket = this->getNewestAppDataOutstandingPacket();
+    ASSERT_NE(originalPacket, nullptr);
+    if (originalPacket == nullptr) {
+      return;
+    }
+    EXPECT_EQ(
+        hasStreamFrame(originalPacket->packet.frames),
+        testCase.writeStreamData);
+    EXPECT_EQ(
+        hasRstStreamFrame(originalPacket->packet.frames),
+        !testCase.writeStreamData);
+    const auto originalPacketNum =
+        originalPacket->packet.header.getPacketSequenceNum();
+    const auto originalPathId = originalPacket->metadata.pathId;
+    const auto* originalTimestampFrame =
+        findTimestampFrame(originalPacket->packet.frames);
+    EXPECT_EQ(
+        originalTimestampFrame != nullptr, testCase.original.expectTimestamp);
+    const auto originalTimestamp = originalTimestampFrame
+        ? Optional<uint64_t>(originalTimestampFrame->timestamp)
+        : std::nullopt;
+
+    conn.connectionTime -= std::chrono::microseconds(uint64_t{2} << 3);
+    applyPolicy(testCase.retry);
+    if (testCase.retry.ackReceiveTimestamps) {
+      auto& ackState = getAckState(conn, PacketNumberSpace::AppData);
+      ackState.largestAckScheduled = std::nullopt;
+      ackState.needsToSendAckImmediately = true;
+      if (!testCase.original.ackReceiveTimestamps) {
+        scheduleTimestampedAck();
+      }
+    }
+    const auto minFreshTimestamp =
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                Clock::now() - conn.connectionTime)
+                .count()) >>
+        3;
+
+    if (testCase.clonePacket) {
+      conn.pendingEvents.numProbePackets[PacketNumberSpace::AppData] = 1;
+    } else {
+      auto originalPacketIt =
+          getLastOutstandingPacket(conn, PacketNumberSpace::AppData);
+      ASSERT_NE(originalPacketIt, conn.outstandings.packets.rend());
+      auto lossResult =
+          markPacketLoss(conn, originalPathId, originalPacketIt->packet, false);
+      ASSERT_FALSE(lossResult.hasError());
+    }
+    this->getTestTransport()->writeLooper()->run(true);
+    ASSERT_TRUE(this->loopForWrites().has_value());
+
+    const auto* retransmission = this->getNewestAppDataOutstandingPacket();
+    ASSERT_NE(retransmission, nullptr);
+    if (retransmission == nullptr) {
+      return;
+    }
+    const auto maxFreshTimestamp =
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                Clock::now() - conn.connectionTime)
+                .count()) >>
+        3;
+    EXPECT_NE(
+        retransmission->packet.header.getPacketSequenceNum(),
+        originalPacketNum);
+    EXPECT_EQ(
+        hasStreamFrame(retransmission->packet.frames),
+        testCase.writeStreamData);
+    EXPECT_EQ(
+        hasRstStreamFrame(retransmission->packet.frames),
+        !testCase.writeStreamData);
+    if (testCase.clonePacket) {
+      ASSERT_TRUE(retransmission->maybeClonedPacketIdentifier.has_value());
+      EXPECT_EQ(
+          *retransmission->maybeClonedPacketIdentifier,
+          ClonedPacketIdentifier(
+              PacketNumberSpace::AppData, originalPacketNum));
+    } else {
+      EXPECT_FALSE(retransmission->maybeClonedPacketIdentifier.has_value());
+    }
+
+    EXPECT_EQ(
+        countTimestampFrames(retransmission->packet.frames),
+        testCase.retry.expectTimestamp ? 1 : 0);
+    if (testCase.retry.expectTimestamp) {
+      const auto* timestampFrame =
+          findTimestampFrame(retransmission->packet.frames);
+      ASSERT_NE(timestampFrame, nullptr);
+      if (timestampFrame == nullptr) {
+        return;
+      }
+      EXPECT_GE(timestampFrame->timestamp, minFreshTimestamp);
+      EXPECT_LE(timestampFrame->timestamp, maxFreshTimestamp);
+      if (originalTimestamp) {
+        EXPECT_NE(timestampFrame->timestamp, *originalTimestamp);
+      }
+    }
   }
 };
 
@@ -150,6 +582,109 @@ TYPED_TEST_SUITE(
     QuicTypedTransportAfterStartTest,
     ::TransportTypes,
     ::TransportTypeNames);
+
+template <typename IndexSequence>
+struct TimestampRetransmissionConfigs;
+
+template <size_t... CaseIndexes>
+struct TimestampRetransmissionConfigs<std::index_sequence<CaseIndexes...>> {
+  using type = Types<
+      TimestampRetransmissionConfig<
+          QuicClientTransportTestBase,
+          CaseIndexes>...,
+      TimestampRetransmissionConfig<
+          QuicServerTransportTestBase,
+          CaseIndexes>...>;
+};
+
+using TimestampRetransmissionTypes = typename TimestampRetransmissionConfigs<
+    std::make_index_sequence<kTimestampRetransmissionCases.size()>>::type;
+
+class TimestampRetransmissionTypeNames {
+ public:
+  template <typename T>
+  static std::string GetName(int) {
+    return ::TransportTypeNames::GetName<typename T::TransportType>(0) + "_" +
+        kTimestampRetransmissionCases[T::caseIndex].name;
+  }
+};
+
+TYPED_TEST_SUITE(
+    TimestampRetransmissionTypedTest,
+    TimestampRetransmissionTypes,
+    TimestampRetransmissionTypeNames);
+
+TYPED_TEST(
+    QuicTypedTransportAfterStartTest,
+    TimestampFrameAcceptedWithoutLocalAdvertisement) {
+  auto& ackState = this->getNonConstConn().ackStates.appDataAckState;
+  ackState.numRxPacketsRecvd = 0;
+  ackState.numNonRxPacketsRecvd = 0;
+  ackState.needsToSendAckImmediately = false;
+  this->getNonConstConn().pendingEvents.scheduleAckTimeout = false;
+
+  this->deliverPacket(
+      this->buildPeerPacketWithTimestampFrame(1234), Clock::now(), 0, false);
+
+  EXPECT_FALSE(this->getConn().localConnectionError.has_value());
+  EXPECT_EQ(ackState.numRxPacketsRecvd, 0);
+  EXPECT_EQ(ackState.numNonRxPacketsRecvd, 1);
+  EXPECT_FALSE(ackState.needsToSendAckImmediately);
+  EXPECT_FALSE(this->getConn().pendingEvents.scheduleAckTimeout);
+  this->destroyTransport();
+}
+
+TYPED_TEST(
+    QuicTypedTransportAfterStartTest,
+    TimestampFrameWrittenWithStreamDataUsesConnectionClock) {
+  this->getNonConstConn().outstandings.reset();
+  this->getNonConstConn().transportSettings.oneRttTimestampFrameWriteMode =
+      TimestampFrameWriteMode::Opportunistic;
+  this->getNonConstConn().peerTimestampFrameState.canReceive = true;
+  this->getNonConstConn().connectionTime = Clock::now() - 5ms;
+  const auto minTimestamp = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          Clock::now() - this->getConn().connectionTime)
+          .count());
+
+  const auto streamId =
+      this->getTransport()->createBidirectionalStream().value();
+  ASSERT_FALSE(this->getTransport()
+                   ->writeChain(streamId, IOBuf::copyBuffer("hello"), false)
+                   .hasError());
+
+  const auto maybeWrittenPackets = this->loopForWrites();
+  const auto maxTimestamp = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          Clock::now() - this->getConn().connectionTime)
+          .count());
+  ASSERT_TRUE(maybeWrittenPackets.has_value());
+  EXPECT_EQ(1, this->getNumPacketsWritten(maybeWrittenPackets));
+
+  const auto* packet = this->getNewestAppDataOutstandingPacket();
+  ASSERT_NE(packet, nullptr);
+  if (packet == nullptr) {
+    return;
+  }
+  const auto* timestampFrame = findTimestampFrame(packet->packet.frames);
+  ASSERT_NE(timestampFrame, nullptr);
+  if (timestampFrame == nullptr) {
+    return;
+  }
+  EXPECT_GE(timestampFrame->timestamp, minTimestamp);
+  EXPECT_LE(timestampFrame->timestamp, maxTimestamp);
+
+  this->destroyTransport();
+}
+
+TYPED_TEST(
+    TimestampRetransmissionTypedTest,
+    ReappliesCurrentPolicyForCloneAndLoss) {
+  const auto& testCase = kTimestampRetransmissionCases[TypeParam::caseIndex];
+  SCOPED_TRACE(testCase.name);
+  this->runCase(testCase);
+  this->destroyTransport();
+}
 
 /**
  * Verify that RTT signals are properly passed through to TransportInfo.
@@ -5784,6 +6319,18 @@ TYPED_TEST_SUITE(
     ::DatagramTransportTypes,
     ::DatagramTransportTypeNames);
 
+template <typename T>
+class QuicTypedTransportAfterStartTestDatagramWithStreams
+    : public QuicTypedTransportAfterStartTestDatagram<T> {
+ public:
+  ~QuicTypedTransportAfterStartTestDatagramWithStreams() override = default;
+};
+
+TYPED_TEST_SUITE(
+    QuicTypedTransportAfterStartTestDatagramWithStreams,
+    ::DatagramWithStreamsTransportTypes,
+    ::DatagramTransportTypeNames);
+
 /**
  * Test DATAGRAM congestion control mode.
  *
@@ -6264,12 +6811,8 @@ TYPED_TEST(
  *                       WriteStreamFrame(lowStream)
  */
 TYPED_TEST(
-    QuicTypedTransportAfterStartTestDatagram,
+    QuicTypedTransportAfterStartTestDatagramWithStreams,
     DatagramFlowPriorityScheduledBetweenStreams) {
-  if (!TypeParam::scheduleDatagramsWithStreams) {
-    GTEST_SKIP();
-  }
-
   this->getNonConstConn().transportSettings.datagramConfig.trackingMode =
       DatagramConfig::CongestionControlMode::ConstrainedAndTracked;
   this->setWritableBytes(2000);
@@ -6347,10 +6890,6 @@ TYPED_TEST(
 TYPED_TEST(
     QuicTypedTransportAfterStartTestDatagram,
     SetPriorityBeforeFirstWrite) {
-  if (!TypeParam::scheduleDatagramsWithStreams) {
-    GTEST_SKIP();
-  }
-
   // Create a datagram flow
   auto maybeFlowId = this->getTransport()->createDatagramFlowId();
   ASSERT_TRUE(maybeFlowId.has_value());
@@ -6371,15 +6910,150 @@ TYPED_TEST(
 TYPED_TEST(
     QuicTypedTransportAfterStartTestDatagram,
     WriteToUncreatedFlowReturnsError) {
-  if (!TypeParam::scheduleDatagramsWithStreams) {
-    GTEST_SKIP();
-  }
-
   // Write to a flowId that was never created
   auto result = this->getTransport()->writeDatagram(
       12345, folly::IOBuf::copyBuffer("payload"));
   ASSERT_TRUE(result.hasError());
   EXPECT_EQ(LocalErrorCode::INVALID_OPERATION, result.error());
+
+  this->destroyTransport();
+}
+
+/**
+ * The default flow backs writeDatagram(BufPtr) and has no id for the caller to
+ * discard, so closing it is refused. Erasing it would only invite the next
+ * default-flow write to reopen it.
+ */
+TYPED_TEST(
+    QuicTypedTransportAfterStartTestDatagram,
+    CloseDefaultDatagramFlowReturnsError) {
+  ASSERT_TRUE(this->getTransport()
+                  ->writeDatagram(folly::IOBuf::copyBuffer("Default"))
+                  .has_value());
+
+  auto closeResult =
+      this->getTransport()->closeDatagramFlow(kDefaultDatagramFlowId);
+  ASSERT_TRUE(closeResult.hasError());
+  EXPECT_EQ(LocalErrorCode::INVALID_OPERATION, closeResult.error());
+
+  auto closeNowResult =
+      this->getTransport()->closeDatagramFlowNow(kDefaultDatagramFlowId);
+  ASSERT_TRUE(closeNowResult.hasError());
+  EXPECT_EQ(LocalErrorCode::INVALID_OPERATION, closeNowResult.error());
+
+  // The default flow is untouched, so the queued datagram still goes out.
+  EXPECT_EQ(
+      1, this->getNonConstConn().datagramState.flowManager.getDatagramCount());
+
+  this->destroyTransport();
+}
+
+/**
+ * With sendDropOldDataFirst, a write into a full buffer drops the oldest
+ * queued datagram. When that datagram is the only one on an ephemeral flow,
+ * the flow manager retires the flow -- so the flow id must come out of the
+ * write queue too. Left behind, the scheduler picks it up and pops from a flow
+ * that no longer exists.
+ */
+TYPED_TEST(
+    QuicTypedTransportAfterStartTestDatagramWithStreams,
+    DropOldestRetiresEphemeralFlowFromWriteQueue) {
+  auto& conn = this->getNonConstConn();
+  conn.transportSettings.datagramConfig.sendDropOldDataFirst = true;
+  conn.datagramState.maxWriteBufferSize = 1;
+
+  // Ephemeral flow, urgency 1: one datagram, and the flow goes away with it.
+  ASSERT_TRUE(this->getTransport()
+                  ->writeDatagram(
+                      HTTPPriorityQueue::Priority(1, false),
+                      folly::IOBuf::copyBuffer("Ephemeral"))
+                  .has_value());
+  ASSERT_EQ(1, conn.datagramState.flowManager.getFlowCount());
+
+  // The buffer is full, so this write drops the ephemeral datagram, which
+  // empties and retires the ephemeral flow.
+  ASSERT_TRUE(this->getTransport()
+                  ->writeDatagram(folly::IOBuf::copyBuffer("Default"))
+                  .has_value());
+  ASSERT_TRUE(
+      this->getTransport()
+          ->setDatagramFlowPriority(
+              kDefaultDatagramFlowId, HTTPPriorityQueue::Priority(3, false))
+          .has_value());
+
+  ASSERT_EQ(1, conn.datagramState.flowManager.getDatagramCount());
+  ASSERT_TRUE(conn.datagramState.flowManager.hasDatagramsForFlow(
+      kDefaultDatagramFlowId));
+  // The ephemeral flow is gone; only the default flow is left.
+  EXPECT_EQ(1, conn.datagramState.flowManager.getFlowCount());
+
+  // The default flow is the only writable one, so it has to be what the
+  // scheduler sees next. The retired ephemeral flow outranks it (urgency 1 vs
+  // 3), so a leftover queue entry surfaces here.
+  const auto nextId = conn.streamManager->writeQueue().peekNextScheduledID();
+  ASSERT_TRUE(nextId.isDatagramFlowID());
+  EXPECT_EQ(kDefaultDatagramFlowId, nextId.asDatagramFlowID())
+      << "write queue still schedules the retired ephemeral flow";
+
+  // A stale entry makes this pop from a flow that is not in the write buffer.
+  this->loopForWrites();
+
+  EXPECT_EQ(0, conn.datagramState.flowManager.getDatagramCount());
+  EXPECT_TRUE(conn.streamManager->writeQueue().empty());
+
+  this->destroyTransport();
+}
+
+/**
+ * A gracefully closed flow stays in the write buffer while it drains, so a
+ * write to it has to be refused up front. Left to addDatagram, a full buffer
+ * would first drop another flow's datagram to make room for a write that then
+ * fails anyway.
+ */
+TYPED_TEST(
+    QuicTypedTransportAfterStartTestDatagram,
+    WriteToDrainingFlowDropsNothing) {
+  auto& conn = this->getNonConstConn();
+  conn.transportSettings.datagramConfig.sendDropOldDataFirst = true;
+  conn.datagramState.maxWriteBufferSize = 2;
+
+  auto flowId = this->getTransport()->createDatagramFlowId();
+  ASSERT_TRUE(flowId.has_value());
+  ASSERT_TRUE(this->getTransport()
+                  ->writeDatagram(*flowId, folly::IOBuf::copyBuffer("Draining"))
+                  .has_value());
+  ASSERT_TRUE(this->getTransport()
+                  ->writeDatagram(folly::IOBuf::copyBuffer("Default"))
+                  .has_value());
+  ASSERT_TRUE(this->getTransport()->closeDatagramFlow(*flowId).has_value());
+  ASSERT_EQ(2, conn.datagramState.flowManager.getDatagramCount());
+
+  auto result = this->getTransport()->writeDatagram(
+      *flowId, folly::IOBuf::copyBuffer("Rejected"));
+  ASSERT_TRUE(result.hasError());
+  EXPECT_EQ(LocalErrorCode::INVALID_OPERATION, result.error());
+  // Both queued datagrams survive the rejected write.
+  EXPECT_EQ(2, conn.datagramState.flowManager.getDatagramCount());
+
+  this->destroyTransport();
+}
+
+/**
+ * A zero-sized write buffer is full with nothing in it, so the drop-oldest
+ * path has no victim to find.
+ */
+TYPED_TEST(
+    QuicTypedTransportAfterStartTestDatagram,
+    WriteWithZeroSizedBufferFails) {
+  auto& conn = this->getNonConstConn();
+  conn.transportSettings.datagramConfig.sendDropOldDataFirst = true;
+  conn.datagramState.maxWriteBufferSize = 0;
+
+  auto result =
+      this->getTransport()->writeDatagram(folly::IOBuf::copyBuffer("Nowhere"));
+  ASSERT_TRUE(result.hasError());
+  EXPECT_EQ(LocalErrorCode::INVALID_WRITE_DATA, result.error());
+  EXPECT_EQ(0, conn.datagramState.flowManager.getDatagramCount());
 
   this->destroyTransport();
 }

@@ -26,6 +26,8 @@ class QuicAsyncUDPSocketMock : public QuicAsyncUDPSocket {
   MOCK_METHOD((quic::Expected<void, QuicError>), close, ());
   MOCK_METHOD((void), resumeRead, (ReadCallback*));
   MOCK_METHOD((void), pauseRead, ());
+  MOCK_METHOD((void), pauseWrite, ());
+  MOCK_METHOD((bool), isWritableCallbackSet, (), (const));
   MOCK_METHOD(
       (ssize_t),
       write,
@@ -100,6 +102,8 @@ class QuicAsyncUDPSocketMock : public QuicAsyncUDPSocket {
   MOCK_METHOD((int), getFD, ());
   MOCK_METHOD((quic::Expected<void, QuicError>), setRecvTos, (bool));
   MOCK_METHOD((quic::Expected<bool, QuicError>), getRecvTos, ());
+  MOCK_METHOD((quic::Expected<void, QuicError>), setRecvTtl, (bool));
+  MOCK_METHOD((quic::Expected<bool, QuicError>), getRecvTtl, ());
   MOCK_METHOD(
       (quic::Expected<void, QuicError>),
       setTosOrTrafficClass,

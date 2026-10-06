@@ -19,6 +19,8 @@
 #include <quic/common/BufUtil.h>
 #include <quic/common/CircularDeque.h>
 #include <quic/common/test/TestUtils.h>
+#include <quic/state/AckHandlers.h>
+#include <quic/state/QuicStateFunctions.h>
 #include <quic/state/TransportSettings.h>
 #include <algorithm>
 #include <chrono>
@@ -43,14 +45,12 @@ QuicFrame parseQuicFrame(
         .maxReceiveTimestampsPerAck = 5, .receiveTimestampsExponent = 3};
   }
 
-  auto result = quic::parseFrame(
-      queue,
-      buildTestShortHeader(),
-      CodecParameters(
-          kDefaultAckDelayExponent,
-          QuicVersion::MVFST,
-          receiveTimeStampsConfig,
-          extendedAckSupport));
+  CodecParameters codecParams(
+      kDefaultAckDelayExponent,
+      QuicVersion::MVFST,
+      receiveTimeStampsConfig,
+      extendedAckSupport);
+  auto result = quic::parseFrame(queue, buildTestShortHeader(), codecParams);
 
   if (!result.has_value()) {
     throw QuicTransportException(
@@ -3427,6 +3427,75 @@ TEST_F(QuicWriteCodecTest, LegacyAckEqualTimestampsOutOfOrderEmitsAll) {
   EXPECT_EQ(totalDeltas, 5);
 }
 
+TEST_F(
+    QuicWriteCodecTest,
+    LegacyAckOutOfOrderRoundTripsPacketReceiveTimestamps) {
+  MockQuicPacketBuilder pktBuilder;
+  setupCommonExpects(pktBuilder);
+
+  constexpr uint64_t kMaxReceiveTimestamps = 5;
+  constexpr uint64_t kReceiveTimestampsExponent = 3;
+  const TimePoint connTime = Clock::now();
+  const TimePoint receiveTime = connTime + std::chrono::microseconds(104);
+
+  QuicConnectionStateBase receiver(QuicNodeType::Client);
+  receiver.transportSettings.maxReceiveTimestampsPerAckStored =
+      kMaxReceiveTimestamps;
+  auto& ackState = receiver.ackStates.appDataAckState;
+  for (const PacketNum packetNum : {1u, 2u, 3u, 5u, 4u}) {
+    ReceivedUdpPacket packet;
+    packet.timings.receiveTimePoint = receiveTime;
+    auto addResult = addPacketToAckState(receiver, ackState, packetNum, packet);
+    ASSERT_TRUE(addResult.has_value());
+    ASSERT_FALSE(addResult->isDuplicate);
+  }
+  ASSERT_EQ(ackState.acks.back().end, 5);
+  ASSERT_TRUE(ackState.lastRecvdPacketInfo.has_value());
+  ASSERT_EQ(ackState.lastRecvdPacketInfo->pktNum, 4);
+
+  const AckReceiveTimestampsConfig timestampsConfig{
+      .maxReceiveTimestampsPerAck = kMaxReceiveTimestamps,
+      .receiveTimestampsExponent = kReceiveTimestampsExponent};
+  const WriteAckFrameMetaData metaData{
+      .ackState = ackState,
+      .ackDelay = 0us,
+      .ackDelayExponent = static_cast<uint8_t>(kDefaultAckDelayExponent),
+      .connTime = connTime,
+  };
+  auto writeResult = writeAckFrame(
+      metaData,
+      pktBuilder,
+      FrameType::ACK_RECEIVE_TIMESTAMPS,
+      timestampsConfig,
+      kMaxReceiveTimestamps);
+  ASSERT_FALSE(writeResult.hasError());
+  ASSERT_TRUE(writeResult.value().has_value());
+
+  auto builtPacket = std::move(pktBuilder).buildTestPacket();
+  BufQueue queue;
+  queue.append(builtPacket.second->clone());
+  QuicFrame decodedFrame =
+      parseQuicFrame(queue, /*isAckReceiveTimestampsSupported=*/true);
+  const auto& decodedAck = *decodedFrame.asReadAckFrame();
+  ASSERT_EQ(decodedAck.largestAcked, 5);
+  ASSERT_TRUE(decodedAck.maybeLatestRecvdPacketNum.has_value());
+  ASSERT_EQ(decodedAck.maybeLatestRecvdPacketNum.value(), PacketNum{4});
+
+  QuicConnectionStateBase sender(QuicNodeType::Server);
+  sender.transportSettings.maybeAckReceiveTimestampsConfigSentToPeer =
+      timestampsConfig;
+  UnorderedMap<PacketNum, uint64_t> decodedTimestamps;
+  auto parseResult = parseAckReceiveTimestamps(
+      sender, decodedAck, decodedTimestamps, /*firstPacketNum=*/0);
+  ASSERT_FALSE(parseResult.hasError());
+
+  UnorderedMap<PacketNum, uint64_t> expectedTimestamps;
+  for (PacketNum packetNum = 1; packetNum <= 5; ++packetNum) {
+    expectedTimestamps.emplace(packetNum, 104);
+  }
+  EXPECT_EQ(decodedTimestamps, expectedTimestamps);
+}
+
 // Locks the legacy encoder's wire output for in-order receive storage
 // against unrelated refactors of the storage layer.
 TEST_F(QuicWriteCodecTest, LegacyAckInOrderStorageWireOutputUnchanged) {
@@ -3948,6 +4017,40 @@ TEST_F(QuicWriteCodecTest, WriteDraft02AckFirstDeltaClampedWhenBeforeConnTime) {
   const auto& range = decoded.draft02RecvdPacketsTimestampRanges[0];
   ASSERT_EQ(range.deltas.size(), 1);
   EXPECT_EQ(range.deltas[0], 0);
+}
+
+TEST_F(QuicWriteCodecTest, WriteTimestampFrame) {
+  MockQuicPacketBuilder pktBuilder;
+  pktBuilder.remaining_ = 1300;
+  setupCommonExpects(pktBuilder);
+
+  TimestampFrame frame(1234);
+
+  auto bytesWritten = writeFrame(QuicWriteFrame(frame), pktBuilder);
+  ASSERT_FALSE(bytesWritten.hasError());
+  EXPECT_EQ(bytesWritten.value(), 4);
+
+  auto outputBuf = pktBuilder.data_->clone();
+  EXPECT_EQ(outputBuf->computeChainDataLength(), 4);
+
+  auto builtOut = std::move(pktBuilder).buildTestPacket();
+  auto regularPacket = builtOut.first;
+  ASSERT_EQ(regularPacket.frames.size(), 1);
+  auto resultFrame = regularPacket.frames[0].asTimestampFrame();
+  ASSERT_TRUE(resultFrame);
+  EXPECT_EQ(resultFrame->timestamp, frame.timestamp);
+
+  auto wireBuf = std::move(builtOut.second);
+  BufQueue queue;
+  queue.append(wireBuf->clone());
+  auto parsedFrameExpected = quic::parseFrame(
+      queue,
+      regularPacket.header,
+      CodecParameters(kDefaultAckDelayExponent, QuicVersion::MVFST));
+  ASSERT_TRUE(parsedFrameExpected.has_value());
+  auto decodedFrame = parsedFrameExpected->asTimestampFrame();
+  ASSERT_TRUE(decodedFrame);
+  EXPECT_EQ(decodedFrame->timestamp, frame.timestamp);
 }
 
 INSTANTIATE_TEST_SUITE_P(

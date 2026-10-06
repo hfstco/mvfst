@@ -145,6 +145,112 @@ auto getNumAckReceiveTimestamps(const AckEvent& ackEvent) {
   return numTimestamps;
 }
 
+TEST_P(AckHandlersTest, SpuriousOnlyAckNotifiesCongestionController) {
+  QuicServerConnectionState conn(
+      FizzServerQuicHandshakeContext::Builder().build());
+  auto mockCongestionController = std::make_unique<MockCongestionController>();
+  auto* rawCongestionController = mockCongestionController.get();
+  conn.congestionController = std::move(mockCongestionController);
+  auto mockPacketProcessor = std::make_unique<MockPacketProcessor>();
+  auto* rawPacketProcessor = mockPacketProcessor.get();
+  conn.packetProcessors.push_back(std::move(mockPacketProcessor));
+
+  constexpr PacketNum kPacketNum = 7;
+  auto packet = createNewPacket(kPacketNum, GetParam().pnSpace);
+  conn.outstandings.packets.emplace_back(
+      std::move(packet),
+      Clock::now() - 1ms,
+      0,
+      1,
+      0,
+      1,
+      0,
+      LossState(),
+      0,
+      OutstandingPacketMetadata::DetailsPerStream());
+  conn.outstandings.packets.back().declaredLost = true;
+  conn.outstandings.declaredLostCount = 1;
+  getAckState(conn, GetParam().pnSpace).nextPacketNum = kPacketNum + 1;
+
+  EXPECT_CALL(*rawCongestionController, onPacketAckOrLoss(_, IsNull()))
+      .WillOnce([expectedPacketNumberSpace = GetParam().pnSpace](
+                    const AckEvent* ack, const LossEvent*) {
+        ASSERT_NE(nullptr, ack);
+        EXPECT_FALSE(ack->largestNewlyAckedPacket.has_value());
+        EXPECT_EQ(expectedPacketNumberSpace, ack->packetNumberSpace);
+        EXPECT_EQ(1, ack->numPacketsSpuriouslyAcked);
+      });
+  EXPECT_CALL(*rawPacketProcessor, onPacketAck(_)).Times(0);
+  EXPECT_CALL(*rawPacketProcessor, onPacketAckOrLoss(_, _)).Times(0);
+
+  ReadAckFrame ackFrame;
+  ackFrame.largestAcked = kPacketNum;
+  ackFrame.ackBlocks.emplace_back(kPacketNum, kPacketNum);
+  auto result = processAckFrame(
+      conn,
+      GetParam().pnSpace,
+      ackFrame,
+      [](auto&) -> quic::Expected<void, quic::QuicError> { return {}; },
+      [](const auto&, const auto&) -> quic::Expected<void, quic::QuicError> {
+        return {};
+      },
+      [](auto&, auto, auto&, bool) -> quic::Expected<void, quic::QuicError> {
+        return {};
+      },
+      Clock::now());
+
+  ASSERT_FALSE(result.hasError());
+  EXPECT_EQ(1, result.value().numPacketsSpuriouslyAcked);
+  EXPECT_EQ(0, conn.outstandings.declaredLostCount);
+}
+
+TEST_P(AckHandlersTest, ImplicitAckIsNotSpuriousLossProof) {
+  QuicServerConnectionState conn(
+      FizzServerQuicHandshakeContext::Builder().build());
+  auto mockCongestionController = std::make_unique<MockCongestionController>();
+  auto* rawCongestionController = mockCongestionController.get();
+  conn.congestionController = std::move(mockCongestionController);
+
+  constexpr PacketNum kPacketNum = 7;
+  auto packet = createNewPacket(kPacketNum, GetParam().pnSpace);
+  conn.outstandings.packets.emplace_back(
+      std::move(packet),
+      Clock::now() - 1ms,
+      0,
+      1,
+      0,
+      1,
+      0,
+      LossState(),
+      0,
+      OutstandingPacketMetadata::DetailsPerStream());
+  conn.outstandings.packets.back().declaredLost = true;
+  conn.outstandings.declaredLostCount = 1;
+  getAckState(conn, GetParam().pnSpace).nextPacketNum = kPacketNum + 1;
+
+  EXPECT_CALL(*rawCongestionController, onPacketAckOrLoss(_, _)).Times(0);
+  ReadAckFrame ackFrame;
+  ackFrame.largestAcked = kPacketNum;
+  ackFrame.ackBlocks.emplace_back(kPacketNum, kPacketNum);
+  ackFrame.implicit = true;
+  auto result = processAckFrame(
+      conn,
+      GetParam().pnSpace,
+      ackFrame,
+      [](auto&) -> quic::Expected<void, quic::QuicError> { return {}; },
+      [](const auto&, const auto&) -> quic::Expected<void, quic::QuicError> {
+        return {};
+      },
+      [](auto&, auto, auto&, bool) -> quic::Expected<void, quic::QuicError> {
+        return {};
+      },
+      Clock::now());
+
+  ASSERT_FALSE(result.hasError());
+  EXPECT_EQ(0, result.value().numPacketsSpuriouslyAcked);
+  EXPECT_EQ(0, conn.outstandings.declaredLostCount);
+}
+
 // Build a timestamp map of received packets with relative timestamps using a
 // given timestamp range for later matching.
 uint64_t buildExpectedReceiveTimestamps(
@@ -4423,6 +4529,11 @@ class AckEventForAppDataTest : public Test {
                     << ackedSMHandlerResult.error();
               }
             } break;
+            case QuicWriteFrame::Type::WriteCryptoFrame: {
+              const auto& frame = *packetFrame.asWriteCryptoFrame();
+              return processCryptoStreamAck(
+                  conn_->cryptoState->oneRttStream, frame.offset, frame.len);
+            }
             default:
               CHECK(false);
           }
@@ -4454,6 +4565,184 @@ class AckEventForAppDataTest : public Test {
   std::unique_ptr<PacketNumberCipher> headerCipher_;
   std::unique_ptr<QuicServerConnectionState> conn_;
 };
+
+TEST_F(AckEventForAppDataTest, SpuriousAckProcessesUnifiedStreamData) {
+  getConn()->transportSettings.useUnifiedAppStreamSendBuffer = true;
+  auto* stream =
+      getConn()->streamManager->createNextBidirectionalStream().value();
+  ASSERT_NE(nullptr, stream);
+  ASSERT_TRUE(stream->streamSendBuffer.has_value());
+
+  const auto frame =
+      writeDataToQuicStreamAndGetFrame(stream->id, "data", false);
+  auto packet = buildEmptyPacket(PacketNumberSpace::AppData);
+  packet.packet.frames.emplace_back(frame);
+  sendAppDataPacket(packet);
+  const auto packetNum = packet.packet.header.getPacketSequenceNum();
+
+  auto& outstanding = getConn()->outstandings.packets.back();
+  outstanding.declaredLost = true;
+  ++getConn()->outstandings.declaredLostCount;
+  --getConn()->outstandings.packetCount[PacketNumberSpace::AppData];
+  EXPECT_TRUE(
+      stream->streamSendBuffer->markLoss({frame.offset, frame.len, frame.fin}));
+  EXPECT_TRUE(stream->streamSendBuffer->hasPendingLoss());
+
+  const auto ack = deliverAckForAppDataPackets(packetNum, packetNum);
+
+  EXPECT_EQ(1, ack.numPacketsSpuriouslyAcked);
+  EXPECT_FALSE(stream->streamSendBuffer->hasPendingLoss());
+  EXPECT_EQ(0, stream->streamSendBuffer->outstandingBytes());
+  EXPECT_EQ(frame.offset + frame.len - 1, getLargestDeliverableOffset(*stream));
+  EXPECT_TRUE(getConn()->streamManager->deliverableContains(stream->id));
+}
+
+TEST_F(AckEventForAppDataTest, SpuriousAckProcessesUnifiedCryptoData) {
+  getConn()->transportSettings.useUnifiedAppStreamSendBuffer = true;
+  getConn()->transportSettings.useNonCloningPto = true;
+  auto& cryptoStream = getConn()->cryptoState->oneRttStream;
+  writeDataToQuicStream(
+      *getConn(), cryptoStream, folly::IOBuf::copyBuffer("ticket"));
+  auto packet = buildEmptyPacket(PacketNumberSpace::AppData, true);
+  packet.packet.frames.emplace_back(WriteCryptoFrame(0, 6));
+  sendAppDataPacket(packet);
+  const auto packetNum = packet.packet.header.getPacketSequenceNum();
+
+  auto& outstanding = getConn()->outstandings.packets.back();
+  outstanding.declaredLost = true;
+  ++getConn()->outstandings.declaredLostCount;
+  --getConn()->outstandings.packetCount[PacketNumberSpace::AppData];
+  ASSERT_TRUE(cryptoStream.streamSendBuffer->markLoss({0, 6, false}));
+
+  const auto ack = deliverAckForAppDataPackets(packetNum, packetNum);
+
+  EXPECT_EQ(ack.numPacketsSpuriouslyAcked, 1);
+  EXPECT_FALSE(cryptoStream.streamSendBuffer->hasPendingLoss());
+  EXPECT_EQ(cryptoStream.streamSendBuffer->outstandingBytes(), 0);
+}
+
+TEST_F(AckEventForAppDataTest, DuplicateSpuriousAckIsIdempotent) {
+  getConn()->transportSettings.useUnifiedAppStreamSendBuffer = true;
+  auto* stream =
+      getConn()->streamManager->createNextBidirectionalStream().value();
+  ASSERT_NE(nullptr, stream);
+  ASSERT_TRUE(stream->streamSendBuffer.has_value());
+
+  const auto frame =
+      writeDataToQuicStreamAndGetFrame(stream->id, "data", false);
+  auto firstPacket = buildEmptyPacket(PacketNumberSpace::AppData);
+  firstPacket.packet.frames.emplace_back(frame);
+  sendAppDataPacket(firstPacket);
+  const auto firstPacketNum = firstPacket.packet.header.getPacketSequenceNum();
+  auto& firstOutstanding = getConn()->outstandings.packets.back();
+  firstOutstanding.declaredLost = true;
+  ++getConn()->outstandings.declaredLostCount;
+  --getConn()->outstandings.packetCount[PacketNumberSpace::AppData];
+  ASSERT_TRUE(
+      stream->streamSendBuffer->markLoss({frame.offset, frame.len, frame.fin}));
+
+  auto secondPacket = buildEmptyPacket(PacketNumberSpace::AppData);
+  secondPacket.packet.frames.emplace_back(frame);
+  sendAppDataPacket(secondPacket);
+  const auto secondPacketNum =
+      secondPacket.packet.header.getPacketSequenceNum();
+  auto& secondOutstanding = getConn()->outstandings.packets.back();
+  secondOutstanding.declaredLost = true;
+  ++getConn()->outstandings.declaredLostCount;
+  --getConn()->outstandings.packetCount[PacketNumberSpace::AppData];
+  ASSERT_TRUE(
+      stream->streamSendBuffer->markLoss({frame.offset, frame.len, frame.fin}));
+
+  deliverAckForAppDataPackets(firstPacketNum, firstPacketNum);
+  const auto versionAfterFirstAck =
+      stream->streamSendBuffer->ackInsertVersion();
+  deliverAckForAppDataPackets(secondPacketNum, secondPacketNum);
+
+  EXPECT_EQ(versionAfterFirstAck, stream->streamSendBuffer->ackInsertVersion());
+  EXPECT_EQ(0, stream->streamSendBuffer->outstandingBytes());
+  EXPECT_FALSE(stream->streamSendBuffer->hasPendingLoss());
+}
+
+TEST_F(AckEventForAppDataTest, SpuriousAckProcessesUnifiedFinOnly) {
+  getConn()->transportSettings.useUnifiedAppStreamSendBuffer = true;
+  auto* stream =
+      getConn()->streamManager->createNextBidirectionalStream().value();
+  ASSERT_NE(nullptr, stream);
+  ASSERT_TRUE(stream->streamSendBuffer.has_value());
+
+  const auto frame =
+      writeDataToQuicStreamAndGetFrame(stream->id, std::string(), true);
+  ASSERT_EQ(0, frame.len);
+  auto packet = buildEmptyPacket(PacketNumberSpace::AppData);
+  packet.packet.frames.emplace_back(frame);
+  sendAppDataPacket(packet);
+  const auto packetNum = packet.packet.header.getPacketSequenceNum();
+
+  auto& outstanding = getConn()->outstandings.packets.back();
+  outstanding.declaredLost = true;
+  ++getConn()->outstandings.declaredLostCount;
+  --getConn()->outstandings.packetCount[PacketNumberSpace::AppData];
+  EXPECT_TRUE(
+      stream->streamSendBuffer->markLoss({frame.offset, frame.len, frame.fin}));
+  EXPECT_TRUE(stream->streamSendBuffer->finLost());
+
+  deliverAckForAppDataPackets(packetNum, packetNum);
+
+  EXPECT_TRUE(stream->streamSendBuffer->finAcked());
+  EXPECT_FALSE(stream->streamSendBuffer->finLost());
+  EXPECT_EQ(StreamSendState::Closed, stream->sendState);
+}
+
+TEST_F(AckEventForAppDataTest, SpuriousAckDoesNotReplayControlFrames) {
+  getConn()->transportSettings.useUnifiedAppStreamSendBuffer = true;
+  auto* stream =
+      getConn()->streamManager->createNextBidirectionalStream().value();
+  ASSERT_NE(nullptr, stream);
+  ASSERT_TRUE(stream->streamSendBuffer.has_value());
+
+  const auto frame =
+      writeDataToQuicStreamAndGetFrame(stream->id, "data", false);
+  auto packet = buildEmptyPacket(PacketNumberSpace::AppData);
+  packet.packet.frames.emplace_back(frame);
+  packet.packet.frames.emplace_back(PingFrame());
+  sendAppDataPacket(packet);
+  const auto packetNum = packet.packet.header.getPacketSequenceNum();
+
+  auto& outstanding = getConn()->outstandings.packets.back();
+  outstanding.declaredLost = true;
+  ++getConn()->outstandings.declaredLostCount;
+  --getConn()->outstandings.packetCount[PacketNumberSpace::AppData];
+  ASSERT_TRUE(
+      stream->streamSendBuffer->markLoss({frame.offset, frame.len, frame.fin}));
+
+  uint64_t streamFramesVisited = 0;
+  uint64_t controlFramesVisited = 0;
+  ReadAckFrame ackFrame;
+  ackFrame.largestAcked = packetNum;
+  ackFrame.ackBlocks.emplace_back(packetNum, packetNum);
+  auto result = processAckFrame(
+      *getConn(),
+      PacketNumberSpace::AppData,
+      ackFrame,
+      [](const auto&) -> quic::Expected<void, QuicError> { return {}; },
+      [&](const auto&,
+          const QuicWriteFrame& ackedFrame) -> quic::Expected<void, QuicError> {
+        if (const auto* streamFrame = ackedFrame.asWriteStreamFrame()) {
+          ++streamFramesVisited;
+          return sendAckSMHandler(*stream, *streamFrame);
+        }
+        ++controlFramesVisited;
+        return {};
+      },
+      [](auto&, auto, auto&, bool) -> quic::Expected<void, QuicError> {
+        return {};
+      },
+      Clock::now());
+
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(1, streamFramesVisited);
+  EXPECT_EQ(0, controlFramesVisited);
+}
 
 /**
  * Check AckEvent::ackTime, adjustedAckTime, and rttSample.
@@ -7632,6 +7921,31 @@ void setReceiveTimestampsConfig(
           .receiveTimestampsExponent = 0};
 }
 
+struct LegacyAckFrameSpec {
+  PacketNum largestAcked;
+  PacketNum latestRecvdPacketNum;
+  RecvdPacketsTimestampsRangeVec ranges;
+};
+
+ReadAckFrame makeLegacyAckFrame(LegacyAckFrameSpec spec) {
+  ReadAckFrame frame;
+  frame.frameType = FrameType::ACK_RECEIVE_TIMESTAMPS;
+  frame.largestAcked = spec.largestAcked;
+  frame.ackBlocks.emplace_back(0, spec.largestAcked);
+  frame.timestampsVersion = AckReceiveTimestampsVersion::LegacyMvfst;
+  frame.maybeLatestRecvdPacketNum = spec.latestRecvdPacketNum;
+  frame.maybeLatestRecvdPacketTime = 500us;
+  frame.recvdPacketsTimestampRanges = std::move(spec.ranges);
+  return frame;
+}
+
+UnorderedMap<PacketNum, uint64_t> timestampsByPacketNum(
+    std::initializer_list<std::pair<const PacketNum, uint64_t>> entries) {
+  UnorderedMap<PacketNum, uint64_t> timestamps;
+  timestamps.insert(entries);
+  return timestamps;
+}
+
 } // namespace
 
 TEST(Draft02AckProcessing, UsesDraft02ParserAndComputesPktNumsFromDelta) {
@@ -7824,6 +8138,52 @@ TEST(Draft02AckProcessing, RejectsTimestampUnderflow) {
   auto res = parseAckReceiveTimestamps(conn, frame, out, /*firstPacketNum=*/0);
   ASSERT_TRUE(res.hasError());
   EXPECT_EQ(res.error().code, TransportErrorCode::FRAME_ENCODING_ERROR);
+}
+
+TEST(LegacyAckProcessing, AnchorsRangesOnLargestAcked) {
+  QuicServerConnectionState conn(
+      FizzServerQuicHandshakeContext::Builder().build());
+  setReceiveTimestampsConfig(conn, 10);
+  // Packets 99 and 100 overtook packet 98, so the last packet to arrive is not
+  // the highest-numbered one and `maybeLatestRecvdPacketNum` trails Largest
+  // Acknowledged. The peer still seeds the walk at Largest Acknowledged, so the
+  // timestamped run starts at 100 - gap == 98.
+  auto frame = makeLegacyAckFrame(
+      {.largestAcked = 100,
+       .latestRecvdPacketNum = 98,
+       .ranges = {
+           {.gap = 2, .timestamp_delta_count = 3, .deltas = {500, 10, 20}}}});
+  UnorderedMap<PacketNum, uint64_t> out;
+  auto res = parseAckReceiveTimestamps(conn, frame, out, /*firstPacketNum=*/0);
+  ASSERT_FALSE(res.hasError());
+  EXPECT_EQ(out, timestampsByPacketNum({{98, 500}, {97, 490}, {96, 470}}));
+}
+
+TEST(LegacyAckProcessing, DecodesTwoRangesTheEncoderWould) {
+  QuicServerConnectionState conn(
+      FizzServerQuicHandshakeContext::Builder().build());
+  setReceiveTimestampsConfig(conn, 10);
+  // Gaps as `fillFrameWithPacketReceiveTimestamps()` computes them for
+  // timestamped runs [97,98] and [91,92] under Largest Acknowledged 100:
+  //   range 1 is seeded from largestAcked:   gap = 100 - 98        == 2
+  //   range 2 chains off the previous
+  //   range's start, less the implicit -1
+  //   on each side of the boundary:          gap = 97 - 2 - 92     == 3
+  // `latestRecvdPacketNum` is the last packet to *arrive*, picked
+  // independently of the first range's end, and the parser only checks it for
+  // presence -- so its value does not affect the expectation below.
+  // Decoding those two gaps must land back on 98 and 92.
+  auto frame = makeLegacyAckFrame(
+      {.largestAcked = 100,
+       .latestRecvdPacketNum = 98,
+       .ranges = {
+           {.gap = 2, .timestamp_delta_count = 2, .deltas = {500, 10}},
+           {.gap = 3, .timestamp_delta_count = 2, .deltas = {40, 20}}}});
+  UnorderedMap<PacketNum, uint64_t> out;
+  auto res = parseAckReceiveTimestamps(conn, frame, out, /*firstPacketNum=*/0);
+  ASSERT_FALSE(res.hasError());
+  EXPECT_EQ(
+      out, timestampsByPacketNum({{98, 500}, {97, 490}, {92, 450}, {91, 430}}));
 }
 
 } // namespace quic::test

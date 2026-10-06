@@ -46,15 +46,13 @@ void populateAckFrequencyConfig(
     }
   }
 
-  // Parse known uint32 fields
-  const std::array<std::pair<std::string_view, uint32_t&>, 1> uint32Fields = {{
-      {"minRttDivisor", dstCcaConfig.ackFrequencyConfig->minRttDivisor},
-  }};
-
-  for (const auto& [name, field] : uint32Fields) {
-    if (auto val = srcAckFrequencyConfigDyn.get_ptr(name)) {
-      field = folly::to<uint32_t>(val->asString());
+  if (auto val = srcAckFrequencyConfigDyn.get_ptr("minRttDivisor")) {
+    auto minRttDivisor = folly::to<uint32_t>(val->asString());
+    if (minRttDivisor == 0) {
+      throw std::range_error(
+          "CC_CONFIG field 'ackFrequencyConfig.minRttDivisor' value out of range");
     }
+    dstCcaConfig.ackFrequencyConfig->minRttDivisor = minRttDivisor;
   }
 }
 
@@ -68,7 +66,7 @@ quic::CongestionControlConfig parseCongestionControlConfig(
   quic::CongestionControlConfig ccaConfig;
 
   // Parse known boolean fields
-  const std::array<std::pair<std::string_view, bool&>, 18> boolFields = {{
+  const std::array<std::pair<std::string_view, bool&>, 20> boolFields = {{
       {"conservativeRecovery", ccaConfig.conservativeRecovery},
       {"largeProbeRttCwnd", ccaConfig.largeProbeRttCwnd},
       {"enableAckAggregationInStartup",
@@ -79,12 +77,15 @@ quic::CongestionControlConfig parseCongestionControlConfig(
       {"hystartEnabled", ccaConfig.hystartEnabled},
       {"onlyGrowCwndWhenLimited", ccaConfig.onlyGrowCwndWhenLimited},
       {"leaveHeadroomForCwndLimited", ccaConfig.leaveHeadroomForCwndLimited},
+      {"enableSpuriousLossRecovery", ccaConfig.enableSpuriousLossRecovery},
       {"ignoreInflightHi", ccaConfig.ignoreInflightLongTerm},
       {"ignoreLoss", ccaConfig.ignoreShortTerm},
       {"enableRecoveryInStartup", ccaConfig.enableRecoveryInStartup},
       {"enableRecoveryInProbeStates", ccaConfig.enableRecoveryInProbeStates},
       {"exitStartupOnLoss", ccaConfig.exitStartupOnLoss},
       {"enableRenoCoexistence", ccaConfig.enableRenoCoexistence},
+      {"enablePrecautionaryBandwidthProbing",
+       ccaConfig.enablePrecautionaryBandwidthProbing},
       {"paceInitCwnd", ccaConfig.paceInitCwnd},
       {"ignoreInflightLongTerm", ccaConfig.ignoreInflightLongTerm},
       {"ignoreShortTerm", ccaConfig.ignoreShortTerm},

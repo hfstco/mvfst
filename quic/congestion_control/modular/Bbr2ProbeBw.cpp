@@ -30,6 +30,7 @@ Bbr2ProbeBw::Bbr2ProbeBw(
     std::shared_ptr<Bbr2Shared> shared)
     : conn_(conn), shared_(std::move(shared)) {
   resetShortTermModel();
+  resetFullBw();
   startProbeBwDown();
 }
 
@@ -47,14 +48,16 @@ void Bbr2ProbeBw::onPacketSent(const OutstandingPacketWrapper& packet) {
 void Bbr2ProbeBw::onPacketAckOrLoss(
     const AckEvent* FOLLY_NULLABLE ackEvent,
     const LossEvent* FOLLY_NULLABLE lossEvent) {
-  if (lossEvent && lossEvent->lostPackets > 0) {
-    if (conn_.transportSettings.ccaConfig.enableRecoveryInProbeStates) {
-      auto ackedBytes = ackEvent ? ackEvent->ackedBytes : 0;
-      shared_->onPacketLoss(*lossEvent, ackedBytes);
-    }
+  auto inflightBeforeEvent = conn_.lossState.inflightBytes;
+  if (ackEvent) {
+    inflightBeforeEvent += ackEvent->ackedBytes;
+  }
+  if (lossEvent) {
+    inflightBeforeEvent += lossEvent->lostBytes;
   }
 
-  // Handle return from ProbeRtt - restart the ProbeBw cycle
+  // Handle return from ProbeRtt before processing this event so spurious-only
+  // ACKs use the ProbeBw state and model bounds.
   // TODO(jbeshay): This handover mechanism from ProbeBw is hacky. Refactor it
   // to a more generalizable mechanism.
   if (shared_->returnedFromProbeRtt_) {
@@ -62,6 +65,23 @@ void Bbr2ProbeBw::onPacketAckOrLoss(
     resetShortTermModel();
     startProbeBwDown();
     startProbeBwCruise();
+    previousProbePrecautionary_ = false;
+  }
+
+  if (shared_->resolveSpuriousLossUndo(ackEvent, lossEvent)) {
+    finishSpuriousLossUndo();
+  }
+  if (ackEvent && !ackEvent->largestNewlyAckedPacket && !lossEvent) {
+    return;
+  }
+  if (lossEvent && lossEvent->lostPackets > 0) {
+    const bool recoveryEnabled =
+        conn_.transportSettings.ccaConfig.enableRecoveryInProbeStates;
+    shared_->updateSpuriousLossUndoOnLoss(*lossEvent);
+    if (recoveryEnabled) {
+      auto ackedBytes = ackEvent ? ackEvent->ackedBytes : 0;
+      shared_->onPacketLoss(*lossEvent, ackedBytes);
+    }
   }
 
   if (ackEvent) {
@@ -82,7 +102,7 @@ void Bbr2ProbeBw::onPacketAckOrLoss(
 
     // Module-specific: congestion signals and state machine
     updateCongestionSignals();
-    updateProbeBwCyclePhase();
+    updateProbeBwCyclePhase(inflightBeforeEvent);
 
     shared_->finalizeMinRttAndDeliverySignals();
     if (shared_->shouldEnterProbeRtt()) {
@@ -102,9 +122,9 @@ void Bbr2ProbeBw::onPacketAckOrLoss(
 void Bbr2ProbeBw::finishAckProcessing(const AckEvent& ackEvent) {
   // Bound bandwidth with short-term limit if available
   Optional<Bandwidth> bwUpperBound;
-  if (bandwidthShortTerm_.has_value() &&
+  if (shared_->bandwidthShortTerm_.has_value() &&
       !conn_.transportSettings.ccaConfig.ignoreShortTerm) {
-    bwUpperBound = bandwidthShortTerm_;
+    bwUpperBound = shared_->bandwidthShortTerm_;
   }
   shared_->boundBwForModel(std::move(bwUpperBound));
 
@@ -115,15 +135,15 @@ void Bbr2ProbeBw::finishAckProcessing(const AckEvent& ackEvent) {
       calculateCwnd(),
       ackEvent,
       shared_->inflightLongTerm_.value_or(0),
-      inflightShortTerm_.value_or(0),
-      bandwidthShortTerm_);
+      shared_->inflightShortTerm_.value_or(0),
+      shared_->bandwidthShortTerm_);
 }
 
 // Short-term model
 
 void Bbr2ProbeBw::resetShortTermModel() {
-  bandwidthShortTerm_.reset();
-  inflightShortTerm_.reset();
+  shared_->bandwidthShortTerm_.reset();
+  shared_->inflightShortTerm_.reset();
 }
 
 void Bbr2ProbeBw::updateCongestionSignals() {
@@ -137,7 +157,7 @@ void Bbr2ProbeBw::updateCongestionSignals() {
       (state == Bbr2State::ProbeBw_Up || state == Bbr2State::ProbeBw_Refill);
   if (shared_->lossPctInLastRound_ > 0 && !isProbingBw) {
     shared_->updateShortTermModelOnLoss(
-        bandwidthShortTerm_, inflightShortTerm_);
+        shared_->bandwidthShortTerm_, shared_->inflightShortTerm_);
   }
 }
 
@@ -157,6 +177,10 @@ uint64_t Bbr2ProbeBw::calculateCwnd() const {
     cwndBytes = std::min(cwndBytes, shared_->recoveryWindow_);
   }
 
+  return boundCwndForModel(cwndBytes);
+}
+
+uint64_t Bbr2ProbeBw::boundCwndForModel(uint64_t cwndBytes) const {
   cwndBytes = std::max(cwndBytes, kMinCwndInMssForBbr * conn_.udpSendPacketLen);
 
   // BBRBoundCwndForModel() - Apply ProbeBw model bounds
@@ -169,13 +193,25 @@ uint64_t Bbr2ProbeBw::calculateCwnd() const {
       cap = getTargetInflightWithHeadroom();
     }
   }
-  if (inflightShortTerm_.has_value() &&
+  if (shared_->inflightShortTerm_.has_value() &&
       !conn_.transportSettings.ccaConfig.ignoreShortTerm) {
-    cap = std::min(cap, *inflightShortTerm_);
+    cap = std::min(cap, *shared_->inflightShortTerm_);
   }
   cwndBytes = std::min(cwndBytes, cap);
 
   return cwndBytes;
+}
+
+void Bbr2ProbeBw::finishSpuriousLossUndo() {
+  Optional<Bandwidth> bwUpperBound;
+  if (shared_->bandwidthShortTerm_.has_value() &&
+      !conn_.transportSettings.ccaConfig.ignoreShortTerm) {
+    bwUpperBound = shared_->bandwidthShortTerm_;
+  }
+  shared_->boundBwForModel(std::move(bwUpperBound));
+  shared_->setSendQuantum();
+  shared_->setPacing(conn_.transportSettings.defaultRttFactor);
+  shared_->applyCwnd(boundCwndForModel(shared_->cwndBytes_));
 }
 
 uint64_t Bbr2ProbeBw::addQuantizationBudget(uint64_t input) const {
@@ -225,8 +261,19 @@ void Bbr2ProbeBw::updatePacingAndCwndGain() {
 
 // ProbeBw cycle control
 
-void Bbr2ProbeBw::updateProbeBwCyclePhase() {
+void Bbr2ProbeBw::updateProbeBwCyclePhase(uint64_t inflightBeforeEvent) {
+  const bool precautionaryProbingEnabled =
+      conn_.transportSettings.ccaConfig.enablePrecautionaryBandwidthProbing;
+  if (!precautionaryProbingEnabled) {
+    previousProbeTooHigh_ = false;
+    previousProbePrecautionary_ = false;
+  }
+  const bool wasProbeBwUp = shared_->state_ == Bbr2State::ProbeBw_Up;
   adaptLongTermModel();
+  if (precautionaryProbingEnabled && wasProbeBwUp &&
+      shared_->state_ == Bbr2State::ProbeBw_Down) {
+    return;
+  }
   checkFullBwReached();
 
   switch (shared_->state_) {
@@ -251,9 +298,12 @@ void Bbr2ProbeBw::updateProbeBwCyclePhase() {
       }
       break;
     case Bbr2State::ProbeBw_Up:
-      if (checkTimeToGoDown()) {
+      if (shouldStopForPrecautionaryProbe(inflightBeforeEvent)) {
         canUpdateLongtermLossModel_ = false;
-        startProbeBwDown();
+        finishProbeBwUp(false, true);
+      } else if (checkTimeToGoDown()) {
+        canUpdateLongtermLossModel_ = false;
+        finishProbeBwUp(false, false);
       }
       break;
     case Bbr2State::Startup:
@@ -297,6 +347,7 @@ void Bbr2ProbeBw::startProbeBwRefill() {
   resetShortTermModel();
   probeUpRounds_ = 0;
   probeUpAcks_ = 0;
+  previousProbePrecautionary_ = false;
   shared_->state_ = Bbr2State::ProbeBw_Refill;
   updatePacingAndCwndGain();
   shared_->startRound();
@@ -311,8 +362,21 @@ void Bbr2ProbeBw::startProbeBwUp() {
   raiseInflightLongTermSlope();
 }
 
+void Bbr2ProbeBw::finishProbeBwUp(bool probeTooHigh, bool precautionary) {
+  if (conn_.transportSettings.ccaConfig.enablePrecautionaryBandwidthProbing) {
+    previousProbeTooHigh_ = probeTooHigh;
+    previousProbePrecautionary_ = precautionary;
+  }
+  startProbeBwDown();
+}
+
 bool Bbr2ProbeBw::checkTimeToProbeBW() {
-  if (hasElapsedInPhase(bwProbeWait_) || isRenoCoexistenceProbeTime()) {
+  const bool fastFollowupAfterPrecautionaryProbe =
+      conn_.transportSettings.ccaConfig.enablePrecautionaryBandwidthProbing &&
+      previousProbePrecautionary_ && !previousProbeTooHigh_ &&
+      shared_->roundStart_;
+  if (fastFollowupAfterPrecautionaryProbe || hasElapsedInPhase(bwProbeWait_) ||
+      isRenoCoexistenceProbeTime()) {
     startProbeBwRefill();
     return true;
   }
@@ -341,10 +405,18 @@ bool Bbr2ProbeBw::checkTimeToGoDown() {
   return false;
 }
 
+bool Bbr2ProbeBw::shouldStopForPrecautionaryProbe(
+    uint64_t inflightBeforeEvent) const {
+  return conn_.transportSettings.ccaConfig
+             .enablePrecautionaryBandwidthProbing &&
+      previousProbeTooHigh_ && shared_->inflightLongTerm_.has_value() &&
+      inflightBeforeEvent >= *shared_->inflightLongTerm_;
+}
+
 void Bbr2ProbeBw::resetFullBw() {
   fullBw_ = Bandwidth();
   fullBwNow_ = false;
-  fullBwCount_ = 0;
+  shared_->fullBwCount_ = 0;
 }
 
 void Bbr2ProbeBw::checkFullBwReached() {
@@ -364,8 +436,8 @@ void Bbr2ProbeBw::checkFullBwReached() {
     fullBw_ = shared_->maxBwFilter_.GetBest();
     return;
   }
-  fullBwCount_++;
-  fullBwNow_ = (fullBwCount_ >= 3);
+  shared_->fullBwCount_++;
+  fullBwNow_ = (shared_->fullBwCount_ >= 3);
 }
 
 bool Bbr2ProbeBw::hasElapsedInPhase(std::chrono::microseconds interval) {
@@ -430,7 +502,7 @@ void Bbr2ProbeBw::handleInFlightTooHigh() {
             static_cast<float>(shared_->getTargetInflightWithGain()) * kBeta));
   }
   if (shared_->state_ == Bbr2State::ProbeBw_Up) {
-    startProbeBwDown();
+    finishProbeBwUp(true, false);
   }
 }
 

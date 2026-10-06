@@ -168,7 +168,6 @@ QUIC_ENUM(
     INVALID_SRC_PORT,
     UNKNOWN_CID_VERSION,
     CANNOT_FORWARD_DATA,
-    EGRESS_POLICER_DROP,
     DUPLICATE_PACKET)
 
 QUIC_ENUM(
@@ -183,8 +182,6 @@ QUIC_ENUM(
     FORCIBLY_SET_UDP_PAYLOAD_SIZE = 0xba92,
     // Set congestion control algorithm
     CC_ALGORITHM_KNOB = 0xccaa,
-    // Enable experimental CC settings
-    CC_EXPERIMENTAL = 0xccac,
     // Change congestion control config struct
     CC_CONFIG = 0xccad,
     // Set pacing rtt factor used only during startup phase
@@ -194,12 +191,8 @@ QUIC_ENUM(
     // Set max pacing rate in bytes per second to be used if pacing
     // is enabled
     MAX_PACING_RATE_KNOB = 0x4444,
-    // Enable experimental pacer settings
-    PACER_EXPERIMENTAL = 0x5557,
-    // Set short header padding modulo size
-    SHORT_HEADER_PADDING_KNOB = 0x6666,
-    // Set fixed short header padding size
-    FIXED_SHORT_HEADER_PADDING_KNOB = 0x6667,
+    // DEPRECATED: 0x6666 (do not reuse value).
+    // DEPRECATED: 0x6667 (do not reuse value).
     // Keepalive timer enabled. The value is interpreted as follows:
     // - [1,4999] mean keep alive is enabled with the defaut
     // interval of 0.85 * idle timeout
@@ -208,12 +201,9 @@ QUIC_ENUM(
     KEEPALIVE_ENABLED = 0x7777,
     // Knob for setting max pacing rate, with sequence number
     MAX_PACING_RATE_KNOB_SEQUENCED = 0x9999,
-    // Control ACK_FREQUENCY policy
-    ACK_FREQUENCY_POLICY = 0x10000,
     // Controls the timer tick used for pacing
     PACING_TIMER_TICK = 0x10002,
-    // Controls default stream priority
-    DEFAULT_STREAM_PRIORITY = 0x10003,
+    // DEPRECATED: DEFAULT_STREAM_PRIORITY = 0x10003 (do not reuse value).
     // Control connection migration
     CONNECTION_MIGRATION = 0x10006,
     // Control server-initiated key update interval
@@ -238,13 +228,14 @@ QUIC_ENUM(
     // Controls the max number of PTOs to send before closing the
     // connection
     MAX_PTO = 0x10012,
-    // Egress policer config: rate_bytes_per_sec,burst_ms,delay_ms
-    EGRESS_POLICER_CONFIG = 0x20001,
+    // DEPRECATED: 0x20001 (do not reuse value).
     // Enable SCONE and set the rate signal from a bps value
     SCONE_KNOB = 0x5C0E,
     // Controls rx packets before ack thresholds
     // (beforeInit,afterInit)
-    RX_PACKETS_BEFORE_ACK = 0x10013)
+    RX_PACKETS_BEFORE_ACK = 0x10013,
+    // Controls adaptive packet loss reordering thresholds
+    ADAPTIVE_LOSS_REORDERING_THRESHOLDS = 0x10014)
 
 #if defined(__GNUC__) || defined(__clang__)
 _Pragma("GCC diagnostic pop")
@@ -294,6 +285,7 @@ enum class FrameType : uint64_t {
   ACK_FREQUENCY = 0xAF,
   ACK_RECEIVE_TIMESTAMPS = 0xB0,
   ACK_EXTENDED = 0xB1,
+  TIMESTAMP = 0xB2,
   // draft-ietf-quic-receive-ts-02 frame types.
   ACK_RECEIVE_TIMESTAMPS_DRAFT_02 = 0x03178307,
   ACK_RECEIVE_TIMESTAMPS_DRAFT_02_ECN = 0x03178308,
@@ -598,6 +590,10 @@ constexpr float kMaxGainOverride = 10.0f;
 // Default flow control window for HTTP/2 + 1K for headers
 constexpr uint64_t kDefaultStreamFlowControlWindow = (64 + 1) * 1024;
 constexpr uint64_t kDefaultConnectionFlowControlWindow = 1024 * 1024;
+constexpr uint64_t kDefaultMaxAutotunedReceiveStreamFlowControlWindow =
+    16 * 1024 * 1024;
+constexpr uint64_t kDefaultMaxAutotunedReceiveConnFlowControlWindow =
+    32 * 1024 * 1024;
 
 /* Stream Limits */
 constexpr uint64_t kDefaultMaxStreamsBidirectional = 2048;
@@ -645,6 +641,11 @@ constexpr uint32_t kDefaultMaxBufferedPackets = 20;
 // Default exponent to use while computing ack delay.
 constexpr uint64_t kDefaultAckDelayExponent = 3;
 constexpr uint64_t kMaxAckDelayExponent = 20;
+constexpr uint64_t kDefaultTimestampFrameTimestampExponent = 0;
+// TIMESTAMP values are microseconds >> exponent on write and restored as
+// encoded * 2^exponent microseconds on read. Cap the private extension at the
+// same coarse 2^20 microsecond resolution accepted for ACK delay.
+constexpr uint64_t kMaxTimestampFrameTimestampExponent = 20;
 
 // Default connection id size of the connection id we will send.
 constexpr size_t kDefaultConnectionIdSize = 8;
