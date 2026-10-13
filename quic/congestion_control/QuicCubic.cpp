@@ -406,13 +406,14 @@ void Cubic::setAppIdle(bool idle, TimePoint eventTime) noexcept {
 }
 
 void Cubic::setAppLimited() {
-  // we use app-idle for Cubic
+  // App-limited is derived from isCwndBlocked_ (updated on every send) and
+  // app-idle; the transport signal is not needed.
 }
 
 bool Cubic::isAppLimited() const noexcept {
-  // Or maybe always false. This doesn't really matter for Cubic. Channeling
-  // isAppIdle() makes testing easier.
-  return isAppIdle();
+  return isAppIdle() ||
+      (conn_.transportSettings.ccaConfig.onlyGrowCwndWhenLimited &&
+       !isCwndBlocked_);
 }
 
 bool Cubic::isAppIdle() const noexcept {
@@ -867,7 +868,8 @@ void Cubic::onPacketAckedInHystart(const AckEvent& ack) {
  * Theoretically, both paper and Linux/Chromium should result to the same cwnd.
  */
 void Cubic::onPacketAckedInSteady(const AckEvent& ack) {
-  if (isAppLimited()) {
+  // App-idle only; the cwnd-limited check is below, after ECN handling.
+  if (isAppIdle()) {
     QLOG(
         conn_,
         addMetricUpdate,

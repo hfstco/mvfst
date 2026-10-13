@@ -40,6 +40,8 @@ TEST_F(CubicHystartTest, SendAndAck) {
 
 TEST_F(CubicHystartTest, CwndLargerThanSSThresh) {
   QuicConnectionStateBase conn(QuicNodeType::Client);
+  // Not cwnd limited in this test; exercise growth regardless.
+  conn.transportSettings.ccaConfig.onlyGrowCwndWhenLimited = false;
   Cubic cubic(conn, 0, 0);
   auto initCwnd = cubic.getWritableBytes();
   // Packet 0 is sent:
@@ -125,6 +127,7 @@ TEST_F(CubicHystartTest, AckTrain) {
 
 TEST_F(CubicHystartTest, NoAckTrainNoDelayIncrease) {
   QuicConnectionStateBase conn(QuicNodeType::Client);
+  conn.transportSettings.ccaConfig.onlyGrowCwndWhenLimited = false;
   Cubic cubic(conn, 0, std::numeric_limits<uint64_t>::max(), true, true);
   auto initCwnd = cubic.getWritableBytes();
   // Packet 0 is sent:
@@ -148,6 +151,7 @@ TEST_F(CubicHystartTest, NoAckTrainNoDelayIncrease) {
 
 TEST_F(CubicHystartTest, DelayIncrease) {
   QuicConnectionStateBase conn(QuicNodeType::Client);
+  conn.transportSettings.ccaConfig.onlyGrowCwndWhenLimited = false;
   Cubic cubic(conn);
   PacketNum packetNum = 0;
   // get kLowSsthresh out of the way for exit condition
@@ -255,6 +259,7 @@ TEST_F(CubicHystartTest, DelayIncrease) {
 
 TEST_F(CubicHystartTest, DelayIncreaseCwndTooSmall) {
   QuicConnectionStateBase conn(QuicNodeType::Client);
+  conn.transportSettings.ccaConfig.onlyGrowCwndWhenLimited = false;
   Cubic cubic(conn);
   auto realNow = quic::Clock::now();
 
@@ -332,6 +337,72 @@ TEST_F(CubicHystartTest, DelayIncreaseCwndTooSmall) {
   // Cwnd < kLowSsthresh, won't exit Hystart state:
   ASSERT_LT(expectedCwnd, kLowSsthreshInMss * conn.udpSendPacketLen);
   EXPECT_EQ(expectedCwnd, cubic.getWritableBytes());
+  EXPECT_EQ(CubicStates::Hystart, cubic.state());
+}
+
+// RFC 9002 Section 7.8: cwnd SHOULD NOT grow while the sender is not
+// utilizing the congestion window (app-limited).
+TEST_F(CubicHystartTest, NoGrowthWhenNotCwndLimited) {
+  QuicConnectionStateBase conn(QuicNodeType::Client);
+  conn.udpSendPacketLen = 100;
+  Cubic cubic(conn);
+  auto initCwnd = cubic.getWritableBytes();
+  conn.lossState.largestSent = 0;
+  conn.lossState.lrtt = 100us;
+
+  // Send half the cwnd: inflight < cwnd -> not cwnd limited.
+  auto packet = makeTestingWritePacket(0, initCwnd / 2, initCwnd / 2);
+  quic::test::onPacketsSentWrapper(&conn, &cubic, packet);
+  quic::test::onPacketAckOrLossWrapper(
+      &conn,
+      &cubic,
+      makeAck(0, initCwnd / 2, Clock::now(), packet.metadata.time),
+      std::nullopt);
+
+  EXPECT_EQ(initCwnd, cubic.getWritableBytes());
+  EXPECT_EQ(CubicStates::Hystart, cubic.state());
+}
+
+TEST_F(CubicHystartTest, GrowthWhenCwndLimited) {
+  QuicConnectionStateBase conn(QuicNodeType::Client);
+  conn.udpSendPacketLen = 100;
+  Cubic cubic(conn);
+  auto initCwnd = cubic.getWritableBytes();
+  conn.lossState.largestSent = 0;
+  conn.lossState.lrtt = 100us;
+
+  // Fill the cwnd: inflight == cwnd -> cwnd limited.
+  auto packet = makeTestingWritePacket(0, initCwnd, initCwnd);
+  quic::test::onPacketsSentWrapper(&conn, &cubic, packet);
+  quic::test::onPacketAckOrLossWrapper(
+      &conn,
+      &cubic,
+      makeAck(0, initCwnd, Clock::now(), packet.metadata.time),
+      std::nullopt);
+
+  EXPECT_EQ(initCwnd * 2, cubic.getWritableBytes());
+  EXPECT_EQ(CubicStates::Hystart, cubic.state());
+}
+
+TEST_F(CubicHystartTest, GrowthWithHeadroomWhenHalfCwndInflight) {
+  QuicConnectionStateBase conn(QuicNodeType::Client);
+  conn.udpSendPacketLen = 100;
+  conn.transportSettings.ccaConfig.leaveHeadroomForCwndLimited = true;
+  Cubic cubic(conn);
+  auto initCwnd = cubic.getWritableBytes();
+  conn.lossState.largestSent = 0;
+  conn.lossState.lrtt = 100us;
+
+  // inflight == cwnd / 2 counts as cwnd limited with headroom enabled.
+  auto packet = makeTestingWritePacket(0, initCwnd / 2, initCwnd / 2);
+  quic::test::onPacketsSentWrapper(&conn, &cubic, packet);
+  quic::test::onPacketAckOrLossWrapper(
+      &conn,
+      &cubic,
+      makeAck(0, initCwnd / 2, Clock::now(), packet.metadata.time),
+      std::nullopt);
+
+  EXPECT_EQ(initCwnd + initCwnd / 2, cubic.getWritableBytes());
   EXPECT_EQ(CubicStates::Hystart, cubic.state());
 }
 

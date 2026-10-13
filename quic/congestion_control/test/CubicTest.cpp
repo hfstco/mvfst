@@ -28,6 +28,8 @@ TEST_F(CubicTest, SentReduceWritable) {
 
 TEST_F(CubicTest, AckIncreaseWritable) {
   QuicConnectionStateBase conn(QuicNodeType::Client);
+  // Not cwnd limited in this test; exercise growth regardless.
+  conn.transportSettings.ccaConfig.onlyGrowCwndWhenLimited = false;
   Cubic cubic(conn);
   auto initCwnd = cubic.getWritableBytes();
   auto packet = makeTestingWritePacket(0, 100, 100);
@@ -91,6 +93,7 @@ TEST_F(CubicTest, PersistentCongestion) {
 
 TEST_F(CubicTest, CwndIncreaseAfterReduction) {
   QuicConnectionStateBase conn(QuicNodeType::Client);
+  conn.transportSettings.ccaConfig.onlyGrowCwndWhenLimited = false;
   auto qLogger = std::make_shared<FileQLogger>(VantagePoint::Client);
   conn.qLogger = qLogger;
   conn.udpSendPacketLen = 200;
@@ -160,6 +163,7 @@ TEST_F(CubicTest, CwndIncreaseAfterReduction) {
 
 TEST_F(CubicTest, AppIdle) {
   QuicConnectionStateBase conn(QuicNodeType::Client);
+  conn.transportSettings.ccaConfig.onlyGrowCwndWhenLimited = false;
   auto qLogger = std::make_shared<FileQLogger>(VantagePoint::Client);
   conn.qLogger = qLogger;
   conn.udpSendPacketLen = 1500;
