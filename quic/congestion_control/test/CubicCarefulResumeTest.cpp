@@ -141,7 +141,8 @@ TEST_F(CubicCarefulResumeTest, RateLimitedStaysInReconnaissance) {
   packets = send(5, t0_ + 101ms);
   ack(packets, 0, 5, t0_ + 200ms);
   EXPECT_EQ(CarefulResumePhase::Reconnaissance, cubic_->carefulResumePhase());
-  EXPECT_EQ(2 * kIw, cubic_->getCongestionWindow());
+  // Not cwnd-limited: cwnd does not grow (onlyGrowCwndWhenLimited).
+  EXPECT_EQ(kIw, cubic_->getCongestionWindow());
 }
 
 TEST_F(CubicCarefulResumeTest, LossInReconnaissanceFallsBackToNormal) {
