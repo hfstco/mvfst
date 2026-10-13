@@ -44,8 +44,10 @@ struct CongestionControlConfig {
   bool additiveIncreaseAfterHystart{false};
 
   // Used by: Cubic
-  // Whether to clamp the cwnd growth when the connection is not cwnd limited.
-  bool onlyGrowCwndWhenLimited{false};
+  // Whether to clamp the cwnd growth when the connection is not cwnd limited
+  // (app-limited). RFC 9002 Section 7.8: the congestion window SHOULD NOT be
+  // increased while it is underutilized.
+  bool onlyGrowCwndWhenLimited{true};
 
   // Used by: Cubic
   // Whether to leave headroom when deciding that the connection is cwnd

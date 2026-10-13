@@ -18,6 +18,8 @@ class CubicSteadyTest : public Test {};
 
 TEST_F(CubicSteadyTest, CubicReduction) {
   QuicConnectionStateBase conn(QuicNodeType::Client);
+  // Not cwnd limited in this test; exercise growth regardless.
+  conn.transportSettings.ccaConfig.onlyGrowCwndWhenLimited = false;
   // initCwnd > initSsthresh: an ack will immediately make the state machine
   // transit to Steady state:
   conn.udpSendPacketLen = 200; // initCwnd = 2000, minCwnd = 400

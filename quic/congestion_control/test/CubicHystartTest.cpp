@@ -40,6 +40,8 @@ TEST_F(CubicHystartTest, SendAndAck) {
 
 TEST_F(CubicHystartTest, CwndLargerThanSSThresh) {
   QuicConnectionStateBase conn(QuicNodeType::Client);
+  // Not cwnd limited in this test; exercise growth regardless.
+  conn.transportSettings.ccaConfig.onlyGrowCwndWhenLimited = false;
   Cubic cubic(conn, 0, 0);
   auto initCwnd = cubic.getWritableBytes();
   // Packet 0 is sent:
@@ -125,6 +127,7 @@ TEST_F(CubicHystartTest, AckTrain) {
 
 TEST_F(CubicHystartTest, NoAckTrainNoDelayIncrease) {
   QuicConnectionStateBase conn(QuicNodeType::Client);
+  conn.transportSettings.ccaConfig.onlyGrowCwndWhenLimited = false;
   Cubic cubic(conn, 0, std::numeric_limits<uint64_t>::max(), true, true);
   auto initCwnd = cubic.getWritableBytes();
   // Packet 0 is sent:
@@ -148,6 +151,7 @@ TEST_F(CubicHystartTest, NoAckTrainNoDelayIncrease) {
 
 TEST_F(CubicHystartTest, DelayIncrease) {
   QuicConnectionStateBase conn(QuicNodeType::Client);
+  conn.transportSettings.ccaConfig.onlyGrowCwndWhenLimited = false;
   Cubic cubic(conn);
   PacketNum packetNum = 0;
   // get kLowSsthresh out of the way for exit condition
@@ -255,6 +259,7 @@ TEST_F(CubicHystartTest, DelayIncrease) {
 
 TEST_F(CubicHystartTest, DelayIncreaseCwndTooSmall) {
   QuicConnectionStateBase conn(QuicNodeType::Client);
+  conn.transportSettings.ccaConfig.onlyGrowCwndWhenLimited = false;
   Cubic cubic(conn);
   auto realNow = quic::Clock::now();
 
