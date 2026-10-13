@@ -392,6 +392,8 @@ void Cubic::setAppIdle(bool idle, TimePoint eventTime) noexcept {
   QLOG(conn_, addAppIdleUpdate, kAppIdle, idle);
   bool currentAppIdle = isAppIdle();
   if (!currentAppIdle && idle) {
+    // Do not count the time twice: close the app-limited stretch first.
+    closeAppLimitedInterval(eventTime);
     quiescenceStart_ = eventTime;
   }
   if (!idle && currentAppIdle && *quiescenceStart_ <= eventTime &&
@@ -687,6 +689,22 @@ void Cubic::startHystartRttRound(TimePoint time) noexcept {
   hystartState_.found = HystartFound::No;
 }
 
+void Cubic::closeAppLimitedInterval(TimePoint now) noexcept {
+  if (!appLimitedStart_) {
+    return;
+  }
+  // Only shift if the epoch is still the one seen when the stretch started;
+  // a reduction or reset in between already defined a fresh epoch.
+  if (steadyState_.lastReductionTime &&
+      steadyState_.lastReductionTime == appLimitedEpoch_ &&
+      *appLimitedStart_ <= now) {
+    *steadyState_.lastReductionTime +=
+        folly::chrono::ceil<std::chrono::milliseconds>(now - *appLimitedStart_);
+  }
+  appLimitedStart_.reset();
+  appLimitedEpoch_.reset();
+}
+
 bool Cubic::isRecovered(TimePoint packetSentTime) noexcept {
   MVCHECK(recoveryState_.endOfRecovery.has_value());
   return packetSentTime > *recoveryState_.endOfRecovery;
@@ -904,8 +922,15 @@ void Cubic::onPacketAckedInSteady(const AckEvent& ack) {
 
   if (conn_.transportSettings.ccaConfig.onlyGrowCwndWhenLimited &&
       !isCwndBlocked_) {
+    // (Re)start the stretch if none is open or the epoch changed meanwhile.
+    if (!appLimitedStart_ ||
+        appLimitedEpoch_ != steadyState_.lastReductionTime) {
+      appLimitedStart_ = ack.ackTime;
+      appLimitedEpoch_ = steadyState_.lastReductionTime;
+    }
     return;
   }
+  closeAppLimitedInterval(ack.ackTime);
   // TODO: There is a tradeoff between getting an accurate Cwnd by frequently
   // calculating it, and the CPU usage cost. This is worth experimenting. E.g.,
   // Chromium has an option to skips the cwnd calculation if it's configured to

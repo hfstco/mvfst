@@ -96,3 +96,80 @@ TEST_F(CubicSteadyTest, NoGrowthWhenNotCwndLimited) {
   EXPECT_GT(cubic.getWritableBytes(), cwnd);
   EXPECT_EQ(CubicStates::Steady, cubic.state());
 }
+
+// Time spent not cwnd-limited must not count towards the Cubic epoch: when
+// growth resumes, cwnd must be W_cubic(time spent cwnd-limited), not
+// W_cubic(wall-clock time since the last reduction).
+TEST_F(CubicSteadyTest, AppLimitedTimeShiftsEpoch) {
+  auto now = Clock::now();
+  // Brings a Cubic into Steady with the epoch set, cwnd = 4000 (+ 100ms).
+  auto enterSteady = [&](QuicConnectionStateBase& conn, Cubic& cubic) {
+    auto packet0 = makeTestingWritePacket(0, 2000, 2000, now);
+    conn.lossState.largestSent = 0;
+    quic::test::onPacketsSentWrapper(&conn, &cubic, packet0);
+    quic::test::onPacketAckOrLossWrapper(
+        &conn,
+        &cubic,
+        makeAck(0, 2000, now + 10ms, packet0.metadata.time),
+        std::nullopt);
+    ASSERT_EQ(CubicStates::Steady, cubic.state());
+    ASSERT_EQ(4000, cubic.getWritableBytes());
+    // First cwnd-limited Steady ack sets lastReductionTime = now + 110ms.
+    auto packet1 = makeTestingWritePacket(1, 4000, 6000, now + 100ms);
+    conn.lossState.largestSent = 1;
+    quic::test::onPacketsSentWrapper(&conn, &cubic, packet1);
+    quic::test::onPacketAckOrLossWrapper(
+        &conn,
+        &cubic,
+        makeAck(1, 4000, now + 110ms, packet1.metadata.time),
+        std::nullopt);
+  };
+  // Sends a full cwnd at sentTime and acks it 10ms later.
+  auto limitedAck = [&](QuicConnectionStateBase& conn,
+                        Cubic& cubic,
+                        PacketNum num,
+                        TimePoint sentTime) {
+    auto cwnd = cubic.getWritableBytes();
+    auto packet = makeTestingWritePacket(num, cwnd, 0, sentTime);
+    conn.lossState.largestSent = num;
+    quic::test::onPacketsSentWrapper(&conn, &cubic, packet);
+    quic::test::onPacketAckOrLossWrapper(
+        &conn,
+        &cubic,
+        makeAck(num, cwnd, sentTime + 10ms, packet.metadata.time),
+        std::nullopt);
+  };
+
+  // Reference: stays cwnd-limited, next ack at now + 1s + 10ms (900ms after
+  // the epoch).
+  QuicConnectionStateBase refConn(QuicNodeType::Client);
+  refConn.udpSendPacketLen = 200;
+  Cubic ref(refConn, 0, 1000);
+  enterSteady(refConn, ref);
+  limitedAck(refConn, ref, 2, now + 1s);
+
+  // Test: 9s of not-cwnd-limited acks, then cwnd-limited again.
+  QuicConnectionStateBase conn(QuicNodeType::Client);
+  conn.udpSendPacketLen = 200;
+  Cubic cubic(conn, 0, 1000);
+  enterSteady(conn, cubic);
+  auto cwnd = cubic.getWritableBytes();
+  PacketNum num = 2;
+  for (int k = 1; k <= 9; k++, num++) {
+    auto packet = makeTestingWritePacket(num, 1000, 0, now + k * 1s);
+    conn.lossState.largestSent = num;
+    quic::test::onPacketsSentWrapper(&conn, &cubic, packet);
+    quic::test::onPacketAckOrLossWrapper(
+        &conn,
+        &cubic,
+        makeAck(num, 1000, now + k * 1s + 10ms, packet.metadata.time),
+        std::nullopt);
+    EXPECT_EQ(cwnd, cubic.getWritableBytes());
+  }
+  // Resumes at now + 10s: the 9s between the first skipped ack (now + 1s +
+  // 10ms) and this ack are not counted, leaving 900ms since the epoch.
+  limitedAck(conn, cubic, num, now + 10s);
+
+  EXPECT_GT(cubic.getWritableBytes(), cwnd);
+  EXPECT_EQ(ref.getWritableBytes(), cubic.getWritableBytes());
+}
