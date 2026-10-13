@@ -129,6 +129,17 @@ void Cubic::onPacketSent(const OutstandingPacketWrapper& packet) {
   } else {
     isCwndBlocked_ = conn_.lossState.inflightBytes >= cwndBytes_;
   }
+  // The app-limited stretch is bounded by send events: it begins with a send
+  // that leaves the cwnd underutilized and ends with the send that fills it,
+  // so the RTT until the first ack of a burst is accounted as well.
+  if (state_ == CubicStates::Steady &&
+      conn_.transportSettings.ccaConfig.onlyGrowCwndWhenLimited) {
+    if (isCwndBlocked_) {
+      closeAppLimitedInterval(packet.metadata.time);
+    } else {
+      openAppLimitedInterval(packet.metadata.time);
+    }
+  }
   if (crPhase_ == CarefulResumePhase::Unvalidated ||
       crPhase_ == CarefulResumePhase::Validating) {
     crLastSentTime_ = packet.metadata.time;
@@ -689,6 +700,15 @@ void Cubic::startHystartRttRound(TimePoint time) noexcept {
   hystartState_.found = HystartFound::No;
 }
 
+void Cubic::openAppLimitedInterval(TimePoint start) noexcept {
+  // (Re)start the stretch if none is open or the epoch changed meanwhile.
+  if (!appLimitedStart_ ||
+      appLimitedEpoch_ != steadyState_.lastReductionTime) {
+    appLimitedStart_ = start;
+    appLimitedEpoch_ = steadyState_.lastReductionTime;
+  }
+}
+
 void Cubic::closeAppLimitedInterval(TimePoint now) noexcept {
   if (!appLimitedStart_) {
     return;
@@ -922,12 +942,7 @@ void Cubic::onPacketAckedInSteady(const AckEvent& ack) {
 
   if (conn_.transportSettings.ccaConfig.onlyGrowCwndWhenLimited &&
       !isCwndBlocked_) {
-    // (Re)start the stretch if none is open or the epoch changed meanwhile.
-    if (!appLimitedStart_ ||
-        appLimitedEpoch_ != steadyState_.lastReductionTime) {
-      appLimitedStart_ = ack.ackTime;
-      appLimitedEpoch_ = steadyState_.lastReductionTime;
-    }
+    openAppLimitedInterval(ack.ackTime);
     return;
   }
   closeAppLimitedInterval(ack.ackTime);
