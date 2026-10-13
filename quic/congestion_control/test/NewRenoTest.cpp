@@ -233,6 +233,71 @@ TEST_F(NewRenoTest, TestSteadyStateAck) {
           ((kDefaultUDPSendPacketLen * ackedSize) / newWritableBytes2));
 }
 
+// RFC 9002 Section 7.8: cwnd SHOULD NOT grow while the sender is not
+// utilizing the congestion window (app-limited).
+TEST_F(NewRenoTest, SlowStartNoGrowthWhenNotCwndLimited) {
+  QuicServerConnectionState conn(
+      FizzServerQuicHandshakeContext::Builder().build());
+  NewReno reno(conn);
+  EXPECT_TRUE(reno.inSlowStart());
+
+  auto originalWritableBytes = reno.getWritableBytes();
+  auto packet = createPacket(1, 10, Clock::now());
+  quic::test::onPacketsSentWrapper(&conn, &reno, packet);
+  quic::test::onPacketAckOrLossWrapper(
+      &conn, &reno, createAckEvent(1, 10, packet.metadata.time), std::nullopt);
+  EXPECT_TRUE(reno.inSlowStart());
+  EXPECT_EQ(reno.getWritableBytes(), originalWritableBytes);
+}
+
+TEST_F(NewRenoTest, SlowStartGrowthWhenCwndLimited) {
+  QuicServerConnectionState conn(
+      FizzServerQuicHandshakeContext::Builder().build());
+  NewReno reno(conn);
+  EXPECT_TRUE(reno.inSlowStart());
+
+  auto originalWritableBytes = reno.getWritableBytes();
+  auto packet = createPacket(1, originalWritableBytes, Clock::now());
+  quic::test::onPacketsSentWrapper(&conn, &reno, packet);
+  quic::test::onPacketAckOrLossWrapper(
+      &conn,
+      &reno,
+      createAckEvent(1, originalWritableBytes, packet.metadata.time),
+      std::nullopt);
+  EXPECT_TRUE(reno.inSlowStart());
+  EXPECT_EQ(reno.getWritableBytes(), originalWritableBytes * 2);
+}
+
+TEST_F(NewRenoTest, CongestionAvoidanceNoGrowthWhenNotCwndLimited) {
+  QuicServerConnectionState conn(
+      FizzServerQuicHandshakeContext::Builder().build());
+  NewReno reno(conn);
+
+  // Leave slow start via a loss.
+  conn.lossState.largestSent = 1;
+  quic::test::onPacketsSentWrapper(
+      &conn, &reno, createPacket(1, 10, Clock::now()));
+  quic::test::onPacketAckOrLossWrapper(
+      &conn, &reno, std::nullopt, createLossEvent({std::make_pair(1, 10)}));
+  ASSERT_FALSE(reno.inSlowStart());
+  auto cwnd = reno.getWritableBytes();
+
+  // Small packet sent after recovery ended: not cwnd limited -> no growth.
+  auto packet2 = createPacket(2, 10, Clock::now() + 1s);
+  quic::test::onPacketsSentWrapper(&conn, &reno, packet2);
+  quic::test::onPacketAckOrLossWrapper(
+      &conn, &reno, createAckEvent(2, 10, packet2.metadata.time), std::nullopt);
+  EXPECT_EQ(reno.getWritableBytes(), cwnd);
+
+  // Full cwnd sent: cwnd limited -> additive increase.
+  auto packet3 = createPacket(3, cwnd, Clock::now() + 2s);
+  quic::test::onPacketsSentWrapper(&conn, &reno, packet3);
+  quic::test::onPacketAckOrLossWrapper(
+      &conn, &reno, createAckEvent(3, cwnd, packet3.metadata.time), std::nullopt);
+  EXPECT_EQ(
+      reno.getWritableBytes(), cwnd + (kDefaultUDPSendPacketLen * cwnd) / cwnd);
+}
+
 TEST_F(NewRenoTest, TestWritableBytes) {
   QuicServerConnectionState conn(
       FizzServerQuicHandshakeContext::Builder().build());

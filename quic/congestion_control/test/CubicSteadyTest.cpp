@@ -48,3 +48,49 @@ TEST_F(CubicSteadyTest, CubicReduction) {
   EXPECT_EQ(2100, cubic.getWritableBytes());
   EXPECT_EQ(CubicStates::FastRecovery, cubic.state());
 }
+
+// RFC 9002 Section 7.8: cwnd SHOULD NOT grow in congestion avoidance while
+// the sender is not utilizing the congestion window (app-limited).
+TEST_F(CubicSteadyTest, NoGrowthWhenNotCwndLimited) {
+  QuicConnectionStateBase conn(QuicNodeType::Client);
+  conn.udpSendPacketLen = 200; // initCwnd = 2000
+  Cubic cubic(conn, 0, 1000);
+  auto now = Clock::now();
+
+  // Fill the cwnd and ack: moves to Steady, cwnd = 4000, inflight = 0.
+  auto packet0 = makeTestingWritePacket(0, 2000, 2000, now);
+  conn.lossState.largestSent = 0;
+  quic::test::onPacketsSentWrapper(&conn, &cubic, packet0);
+  quic::test::onPacketAckOrLossWrapper(
+      &conn,
+      &cubic,
+      makeAck(0, 2000, now + 10ms, packet0.metadata.time),
+      std::nullopt);
+  ASSERT_EQ(CubicStates::Steady, cubic.state());
+  auto cwnd = cubic.getWritableBytes();
+  ASSERT_EQ(4000, cwnd);
+
+  // Send a quarter of the cwnd: not cwnd limited -> no growth even after 1s.
+  auto packet1 = makeTestingWritePacket(1, 1000, 3000, now + 1s);
+  conn.lossState.largestSent = 1;
+  quic::test::onPacketsSentWrapper(&conn, &cubic, packet1);
+  quic::test::onPacketAckOrLossWrapper(
+      &conn,
+      &cubic,
+      makeAck(1, 1000, now + 1s + 10ms, packet1.metadata.time),
+      std::nullopt);
+  EXPECT_EQ(cwnd, cubic.getWritableBytes());
+  EXPECT_EQ(CubicStates::Steady, cubic.state());
+
+  // Fill the cwnd: cwnd limited -> grows.
+  auto packet2 = makeTestingWritePacket(2, cwnd, 3000 + cwnd, now + 2s);
+  conn.lossState.largestSent = 2;
+  quic::test::onPacketsSentWrapper(&conn, &cubic, packet2);
+  quic::test::onPacketAckOrLossWrapper(
+      &conn,
+      &cubic,
+      makeAck(2, cwnd, now + 2s + 10ms, packet2.metadata.time),
+      std::nullopt);
+  EXPECT_GT(cubic.getWritableBytes(), cwnd);
+  EXPECT_EQ(CubicStates::Steady, cubic.state());
+}
