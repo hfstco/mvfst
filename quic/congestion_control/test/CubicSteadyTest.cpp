@@ -173,3 +173,85 @@ TEST_F(CubicSteadyTest, AppLimitedTimeShiftsEpoch) {
   EXPECT_GT(cubic.getWritableBytes(), cwnd);
   EXPECT_EQ(ref.getWritableBytes(), cubic.getWritableBytes());
 }
+
+// DASH-like pattern: a small burst is sent, its acks arrive one RTT later,
+// the stream closes (app idle) and the next request opens a new one. The
+// RTT between a burst and its first ack must count as app-limited too.
+TEST_F(CubicSteadyTest, AppLimitedBurstRttShiftsEpoch) {
+  auto now = Clock::now();
+  const auto rtt = 600ms;
+  auto enterSteady = [&](QuicConnectionStateBase& conn, Cubic& cubic) {
+    auto packet0 = makeTestingWritePacket(0, 2000, 2000, now);
+    conn.lossState.largestSent = 0;
+    quic::test::onPacketsSentWrapper(&conn, &cubic, packet0);
+    quic::test::onPacketAckOrLossWrapper(
+        &conn,
+        &cubic,
+        makeAck(0, 2000, now + 10ms, packet0.metadata.time),
+        std::nullopt);
+    ASSERT_EQ(CubicStates::Steady, cubic.state());
+    ASSERT_EQ(4000, cubic.getWritableBytes());
+    // First cwnd-limited Steady ack sets lastReductionTime = now + 110ms.
+    auto packet1 = makeTestingWritePacket(1, 4000, 6000, now + 100ms);
+    conn.lossState.largestSent = 1;
+    quic::test::onPacketsSentWrapper(&conn, &cubic, packet1);
+    quic::test::onPacketAckOrLossWrapper(
+        &conn,
+        &cubic,
+        makeAck(1, 4000, now + 110ms, packet1.metadata.time),
+        std::nullopt);
+  };
+  // Sends a full cwnd at sentTime and acks it one RTT later.
+  auto limitedAck = [&](QuicConnectionStateBase& conn,
+                        Cubic& cubic,
+                        PacketNum num,
+                        TimePoint sentTime) {
+    auto cwnd = cubic.getWritableBytes();
+    auto packet = makeTestingWritePacket(num, cwnd, 0, sentTime);
+    conn.lossState.largestSent = num;
+    quic::test::onPacketsSentWrapper(&conn, &cubic, packet);
+    quic::test::onPacketAckOrLossWrapper(
+        &conn,
+        &cubic,
+        makeAck(num, cwnd, sentTime + rtt, packet.metadata.time),
+        std::nullopt);
+  };
+
+  // Reference: cwnd-limited burst sent at now + 1s, acked one RTT later.
+  QuicConnectionStateBase refConn(QuicNodeType::Client);
+  refConn.udpSendPacketLen = 200;
+  Cubic ref(refConn, 0, 1000);
+  enterSteady(refConn, ref);
+  limitedAck(refConn, ref, 2, now + 1s);
+
+  // Test: 10 request cycles of 1.5s, each a quarter-cwnd burst at the cycle
+  // start, acks one RTT later, then app idle until the next cycle.
+  QuicConnectionStateBase conn(QuicNodeType::Client);
+  conn.udpSendPacketLen = 200;
+  Cubic cubic(conn, 0, 1000);
+  enterSteady(conn, cubic);
+  auto cwnd = cubic.getWritableBytes();
+  PacketNum num = 2;
+  for (int k = 0; k < 10; k++, num++) {
+    auto start = now + 1s + k * 1500ms;
+    cubic.setAppIdle(false, start);
+    auto packet = makeTestingWritePacket(num, 1000, 0, start);
+    conn.lossState.largestSent = num;
+    quic::test::onPacketsSentWrapper(&conn, &cubic, packet);
+    quic::test::onPacketAckOrLossWrapper(
+        &conn,
+        &cubic,
+        makeAck(num, 1000, start + rtt, packet.metadata.time),
+        std::nullopt);
+    EXPECT_EQ(cwnd, cubic.getWritableBytes());
+    cubic.setAppIdle(true, start + rtt + 50ms);
+  }
+  // Next request fills the cwnd: only the time before the first burst
+  // (now + 1s) plus one RTT counts, exactly like the reference.
+  auto resume = now + 1s + 10 * 1500ms;
+  cubic.setAppIdle(false, resume);
+  limitedAck(conn, cubic, num, resume);
+
+  EXPECT_GT(cubic.getWritableBytes(), cwnd);
+  EXPECT_EQ(ref.getWritableBytes(), cubic.getWritableBytes());
+}

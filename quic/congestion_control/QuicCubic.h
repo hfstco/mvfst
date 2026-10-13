@@ -132,6 +132,7 @@ class Cubic : public CongestionController {
   [[nodiscard]] float pacingGain() const noexcept;
 
   void startHystartRttRound(TimePoint time) noexcept;
+  void openAppLimitedInterval(TimePoint start) noexcept;
   void closeAppLimitedInterval(TimePoint now) noexcept;
 
   void cubicReduction(TimePoint lossTime) noexcept;
@@ -207,9 +208,9 @@ class Cubic : public CongestionController {
 
   // if quiescenceStart_ has a value, then the connection is app limited
   Optional<TimePoint> quiescenceStart_;
-  // Start of the current not-cwnd-limited stretch in Steady (acks skipped) and
-  // the Cubic epoch at that time. On resume the epoch is shifted by the
-  // skipped time so W_cubic does not jump; see closeAppLimitedInterval().
+  // Start of the current not-cwnd-limited stretch in Steady and the Cubic
+  // epoch at that time. When the cwnd is filled again the epoch is shifted by
+  // the stretch so W_cubic does not jump; see closeAppLimitedInterval().
   Optional<TimePoint> appLimitedStart_;
   Optional<TimePoint> appLimitedEpoch_;
 
