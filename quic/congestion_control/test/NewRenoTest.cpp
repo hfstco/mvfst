@@ -162,6 +162,8 @@ TEST_F(NewRenoTest, SendMoreThanWritable) {
 TEST_F(NewRenoTest, TestSlowStartAck) {
   QuicServerConnectionState conn(
       FizzServerQuicHandshakeContext::Builder().build());
+  // Not cwnd limited in this test; exercise growth regardless.
+  conn.transportSettings.ccaConfig.onlyGrowCwndWhenLimited = false;
   NewReno reno(conn);
   EXPECT_TRUE(reno.inSlowStart());
 
@@ -187,6 +189,7 @@ TEST_F(NewRenoTest, TestSlowStartAck) {
 TEST_F(NewRenoTest, TestSteadyStateAck) {
   QuicServerConnectionState conn(
       FizzServerQuicHandshakeContext::Builder().build());
+  conn.transportSettings.ccaConfig.onlyGrowCwndWhenLimited = false;
   NewReno reno(conn);
   EXPECT_TRUE(reno.inSlowStart());
 

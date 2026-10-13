@@ -58,6 +58,12 @@ void NewReno::onRemoveBytesFromInflight(uint64_t /* bytes */) {
 }
 
 void NewReno::onPacketSent(const OutstandingPacketWrapper& packet) {
+  if (conn_.transportSettings.ccaConfig.leaveHeadroomForCwndLimited) {
+    // Consider cwndBlocked if inflight bytes >= 0.5 * cwnd
+    isCwndBlocked_ = conn_.lossState.inflightBytes >= (cwndBytes_ >> 1);
+  } else {
+    isCwndBlocked_ = conn_.lossState.inflightBytes >= cwndBytes_;
+  }
   MVVLOG(10) << __func__ << " writable=" << getWritableBytes()
              << " cwnd=" << cwndBytes_
              << " inflight=" << conn_.lossState.inflightBytes
@@ -138,6 +144,10 @@ void NewReno::onPacketAcked(
     const CongestionController::AckEvent::AckPacket& packet) {
   if (endOfRecovery_ &&
       packet.outstandingPacketMetadata.time < *endOfRecovery_) {
+    return;
+  }
+  // RFC 9002 Section 7.8: do not grow cwnd while app-limited.
+  if (isAppLimited()) {
     return;
   }
   if (cwndBytes_ < ssthresh_) {
@@ -284,10 +294,13 @@ uint64_t NewReno::getBytesInFlight() const noexcept {
 
 void NewReno::setAppIdle(bool, TimePoint) noexcept { /* unsupported */ }
 
-void NewReno::setAppLimited() { /* unsupported */ }
+void NewReno::setAppLimited() {
+  // App-limited is derived from isCwndBlocked_, updated on every send.
+}
 
 bool NewReno::isAppLimited() const noexcept {
-  return false; // unsupported
+  return conn_.transportSettings.ccaConfig.onlyGrowCwndWhenLimited &&
+      !isCwndBlocked_;
 }
 
 } // namespace quic

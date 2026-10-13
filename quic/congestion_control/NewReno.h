@@ -56,5 +56,7 @@ class NewReno : public CongestionController {
   uint64_t ssthresh_;
   uint64_t cwndBytes_;
   Optional<TimePoint> endOfRecovery_;
+  // Whether inflight reached cwnd at the last send; false means app-limited.
+  bool isCwndBlocked_{true};
 };
 } // namespace quic

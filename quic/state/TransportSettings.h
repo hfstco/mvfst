@@ -43,13 +43,13 @@ struct CongestionControlConfig {
   //  congestion avoidance, similar to Linux kernel behavior.
   bool additiveIncreaseAfterHystart{false};
 
-  // Used by: Cubic
+  // Used by: Cubic, NewReno
   // Whether to clamp the cwnd growth when the connection is not cwnd limited
   // (app-limited). RFC 9002 Section 7.8: the congestion window SHOULD NOT be
   // increased while it is underutilized.
   bool onlyGrowCwndWhenLimited{true};
 
-  // Used by: Cubic
+  // Used by: Cubic, NewReno
   // Whether to leave headroom when deciding that the connection is cwnd
   // limited.
   bool leaveHeadroomForCwndLimited{false};
